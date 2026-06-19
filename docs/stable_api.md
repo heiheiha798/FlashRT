@@ -39,7 +39,7 @@ def load_model(
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,
-    # Pi0.5 torch-specific:
+    # Pi0.5-specific:
     use_fp4: bool = False,
     fp4_layers: tuple[int, ...] | None = None,
     use_awq: bool | None = None,
@@ -49,6 +49,8 @@ def load_model(
     vision_pool_factor: int | None = None,
     vision_num_layers: int | None = None,
     cache_frames: int | None = None,
+    state_prompt_mode: str = "exact",
+    state_prompt_fixed_max_len: int | None = None,
     # Frontends with an FP8/BF16 switch:
     use_fp8: bool = True,
     # Pi0.5 torch RTX SM120/SM89 opt-in:
@@ -69,6 +71,20 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   parameters today. The Pi0.5 torch RTX/Orin frontend validates
   `vision_pool_factor in {1, 2, 4}`, `vision_num_layers in [1, 27]`, and
   `cache_frames >= 1`.
+- `state_prompt_mode` applies to Pi0.5 RTX/Thor state-in-prompt
+  execution. `"exact"` tracks the exact token length (RTX caches recurring
+  lengths; Thor reuses same-length updates). `"fixed"` captures one max-length
+  graph and masks padded state-prompt tokens with a device-side valid length;
+  use it when live robot state changes make token lengths drift. The default
+  remains `"exact"`, so existing calls keep the exact-length path and the
+  50-step Pi0.5 action graph is unchanged.
+- `state_prompt_fixed_max_len` applies only to Pi0.5 Thor fixed mode. `None`
+  keeps the default 200-token state-prompt cap; serving code can lower it when
+  it knows the live state-prompt bound. The cap must cover the actual token
+  length. On Thor, a close cap such as 120 for a 117-token prompt measured
+  roughly a 1 ms normal overhead versus a warmed exact graph, while larger caps
+  pay for the extra padded tokens. It can also be set with
+  `FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN`.
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
   BF16 fallback; unsupported frontends ignore it.
 - `use_fp16=True` selects the opt-in Pi0.5 torch RTX SM120/SM89 full-FP16
@@ -141,8 +157,9 @@ class VLAModel:
     convention: normalized in-range values usually become 0..255, while
     values below -1 become -1. RTX/Thor torch frontends and the JAX Thor
     Pi0.5 frontend accept `state` in `set_prompt()` and through `predict()`.
-    Same-length state prompt updates reuse the captured graph; recurring
-    RTX prompt lengths reuse the cached pipeline instead of rebuilding.
+    Same-length state prompt updates reuse the captured graph. RTX exact mode
+    reuses cached recurring prompt lengths; RTX/Thor fixed mode uses one
+    max-length graph for drifting state-token lengths.
   - Pi0-FAST encodes state in the FAST token prefix.
   - GROOT N1.6 consumes proprioceptive state from `obs["state"]`; if omitted,
     the backend uses zeros.
