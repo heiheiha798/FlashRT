@@ -52,6 +52,21 @@ The MCP server returns "not initialized." Ask the user: *"I notice this project 
 - kernel binding / CMake 改动的 build/import 验证要求
 - 未覆盖项和限制必须明确写进 PR 描述
 
+PR 前必须重新 review 本分支相对目标 base 的所有新增 commits。开发分支可以
+保存探索过程，但 PR 分支必须重新整理成可维护、可审查的历史：
+
+- 开发是一回事，PR 是另一回事；不要直接把探索分支的 commit stack 原样提交。
+- `AGENTS.md`、本地 runbook、Thor 登录/同步脚本、临时 benchmark 输出、个人机器
+  路径等默认只留在本地，除非用户明确要求把它们作为 PR 内容。
+- 被证伪的实验代码、诊断 harness、临时 CUTLASS patch、一次性 probe 文件必须逐项
+  判断：只在能解释最终实现或复现实验结论时才进入 PR，否则留在本地分支。
+- 如果多个 commit 只是同一功能的迭代修修补补，PR 前需要 squash；如果 commit
+  边界不对应可 review 的逻辑单元，需要重新拆分或重排。
+- PR commit 应围绕最终行为、build/binding 变更、测试/benchmark 证据组织；不要让
+  review 者从失败尝试和本地操作记录里推断最终方案。
+- 开 PR 前必须检查 `git log --oneline <base>..HEAD` 和
+  `git diff --name-status <base>...HEAD`，确认没有把本地-only 文件或过时实验误带入。
+
 ## Current Branch PR Runbook: Pi0.5 Thor Decoder FP4
 
 本 branch 的工作目标是评估并实现 Pi0.5 action-expert decoder 在 Thor
