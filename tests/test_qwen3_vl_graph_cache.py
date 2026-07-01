@@ -191,3 +191,148 @@ def test_qwen3_vl_graph_cache_stats_and_clear_graphs():
     assert fe._prefill_graphs == collections.OrderedDict()
     assert fe._pg_buffers == collections.OrderedDict()
     assert fe._decode_graphs == collections.OrderedDict()
+
+
+def test_qwen3_vl_sm89_text_decode_graph_cache_is_lru_bounded(monkeypatch):
+    import torch
+
+    from flash_rt.frontends.torch.qwen3_vl_fp8_sm89 import (
+        Qwen3VlFp8Sm89TextFrontend,
+    )
+
+    class _FakeStream:
+        cuda_stream = 0
+
+        def wait_stream(self, _other):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class _FakeGraph:
+        def replay(self):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "current_stream",
+                        lambda: _FakeStream(), raising=False)
+    monkeypatch.setattr(torch.cuda, "stream",
+                        lambda _stream: contextlib.nullcontext(),
+                        raising=False)
+    monkeypatch.setattr(torch.cuda, "graph",
+                        lambda _graph, stream=None: contextlib.nullcontext(),
+                        raising=False)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph",
+                        lambda: _FakeGraph(), raising=False)
+    monkeypatch.setattr(torch, "inference_mode",
+                        lambda: contextlib.nullcontext())
+
+    fe = Qwen3VlFp8Sm89TextFrontend.__new__(
+        Qwen3VlFp8Sm89TextFrontend)
+    fe.max_decode_graphs = 2
+    fe._decode_graphs = collections.OrderedDict()
+    fe._graph_stream = _FakeStream()
+    fe._static_token_id = object()
+    fe._rope_cos_sin = lambda pos: (object(), object())
+    fe.forward_own_decode_fp8 = lambda token, cos, sin, pos: None
+
+    for cur_pos in range(5):
+        fe._ensure_decode_graph(cur_pos)
+
+    assert len(fe._decode_graphs) == fe.max_decode_graphs
+    assert list(fe._decode_graphs) == [3, 4]
+    stats = fe.graph_cache_stats()
+    assert stats["decode"]["graph_count"] == 2
+    fe.clear_graphs()
+    assert fe._decode_graphs == collections.OrderedDict()
+
+
+def test_qwen3_vl_sm89_multimodal_graph_caches_are_lru_bounded(monkeypatch):
+    import torch
+
+    from flash_rt.frontends.torch.qwen3_vl_fp8_sm89_multimodal import (
+        Qwen3VlFp8Sm89Frontend,
+    )
+
+    class _FakeStream:
+        cuda_stream = 0
+
+        def wait_stream(self, _other):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class _FakeGraph:
+        def replay(self):
+            pass
+
+    class _FakeLLM:
+        def __init__(self):
+            self._graph_stream = _FakeStream()
+            self._static_token_id = object()
+            self._logits_buf = object()
+            self.clear_count = 0
+
+        def _rope_cos_sin(self, rope_pos):
+            return object(), object()
+
+        def forward_own_decode_fp8(self, token, cos, sin, cache_pos):
+            pass
+
+        def clear_graphs(self):
+            self.clear_count += 1
+
+        def graph_cache_stats(self):
+            return {"decode": {"graph_count": 0}}
+
+    monkeypatch.setattr(torch.cuda, "current_stream",
+                        lambda: _FakeStream(), raising=False)
+    monkeypatch.setattr(torch.cuda, "stream",
+                        lambda _stream: contextlib.nullcontext(),
+                        raising=False)
+    monkeypatch.setattr(torch.cuda, "graph",
+                        lambda _graph, stream=None: contextlib.nullcontext(),
+                        raising=False)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph",
+                        lambda: _FakeGraph(), raising=False)
+    monkeypatch.setattr(torch, "inference_mode",
+                        lambda: contextlib.nullcontext())
+
+    fe = Qwen3VlFp8Sm89Frontend.__new__(Qwen3VlFp8Sm89Frontend)
+    fe.max_prefill_graphs = 2
+    fe.max_decode_graphs = 2
+    fe._prefill_graphs = collections.OrderedDict()
+    fe._pg_buffers = collections.OrderedDict()
+    fe._decode_graphs = collections.OrderedDict()
+    fe.llm = _FakeLLM()
+
+    for i in range(3):
+        fe._prompt = {k: _TensorStub(f"{k}_{i}") for k in fe._PG_KEYS}
+        key = fe._stage_prefill_inputs(P=10 + i, S=20 + i, span=(i, i + 10))
+        fe._prefill_graphs[key] = object()
+        fe._trim_lru_graph_cache(
+            fe._prefill_graphs, fe.max_prefill_graphs,
+            lambda old_key: fe._pg_buffers.pop(old_key, None))
+
+    assert len(fe._prefill_graphs) == fe.max_prefill_graphs
+    assert len(fe._pg_buffers) == fe.max_prefill_graphs
+    assert list(fe._prefill_graphs) == list(fe._pg_buffers)
+    assert list(fe._prefill_graphs) == [(11, 21, 1, 11), (12, 22, 2, 12)]
+
+    for i in range(5):
+        fe._ensure_decode_graph(cache_pos=i, rope_pos=100 + i)
+
+    assert len(fe._decode_graphs) == fe.max_decode_graphs
+    assert list(fe._decode_graphs) == [(3, 103), (4, 104)]
+    stats = fe.graph_cache_stats()
+    assert stats["prefill"]["graph_count"] == 2
+    assert stats["prefill"]["buffer_count"] == 2
+    assert stats["decode"]["graph_count"] == 2
+    assert stats["text"]["decode"]["graph_count"] == 0
+
+    fe.clear_graphs()
+
+    assert fe._prefill_graphs == collections.OrderedDict()
+    assert fe._pg_buffers == collections.OrderedDict()
+    assert fe._decode_graphs == collections.OrderedDict()
+    assert fe.llm.clear_count == 1
