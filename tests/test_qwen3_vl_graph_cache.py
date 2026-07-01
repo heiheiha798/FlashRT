@@ -8,6 +8,21 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import sys
+import types
+
+
+class _TensorStub:
+    def __init__(self, name):
+        self.name = name
+        self.copied_from = []
+
+    def clone(self):
+        return _TensorStub(self.name + "_clone")
+
+    def copy_(self, other):
+        self.copied_from.append(other)
+        return self
 
 
 def test_qwen3_vl_decode_graph_cache_is_lru_bounded(monkeypatch):
@@ -62,3 +77,117 @@ def test_qwen3_vl_decode_graph_cache_is_lru_bounded(monkeypatch):
 
     assert len(fe._decode_graphs) == fe.max_decode_graphs
     assert list(fe._decode_graphs) == [3, 4]
+
+
+def test_qwen3_vl_prefill_graph_cache_eviction_drops_static_buffers():
+    """Prefill graph eviction must also drop that graph's staged inputs."""
+    from flash_rt.frontends.torch.qwen3_vl_rtx import Qwen3VlTorchFrontendRtx
+
+    fe = Qwen3VlTorchFrontendRtx.__new__(Qwen3VlTorchFrontendRtx)
+    fe.max_prefill_graphs = 2
+    fe._prefill_graphs = collections.OrderedDict()
+    fe._pg_buffers = collections.OrderedDict()
+
+    for i in range(3):
+        fe._prompt = {k: _TensorStub(f"{k}_{i}") for k in fe._PG_KEYS}
+        key = fe._stage_prefill_inputs(P=10 + i, S=20 + i, span=(i, i + 10))
+        fe._prefill_graphs[key] = object()
+        fe._trim_lru_graph_cache(
+            fe._prefill_graphs, fe.max_prefill_graphs,
+            lambda old_key: fe._pg_buffers.pop(old_key, None))
+
+    assert len(fe._prefill_graphs) == fe.max_prefill_graphs
+    assert len(fe._pg_buffers) == fe.max_prefill_graphs
+    assert list(fe._prefill_graphs) == list(fe._pg_buffers)
+    assert list(fe._prefill_graphs) == [(11, 21, 1, 11), (12, 22, 2, 12)]
+
+
+def test_qwen3_vl_prefill_graph_restages_after_clear(monkeypatch):
+    """clear_graphs() should not force callers to rerun set_prompt()."""
+    from flash_rt.frontends.torch.qwen3_vl_rtx import Qwen3VlTorchFrontendRtx
+
+    fe = Qwen3VlTorchFrontendRtx.__new__(Qwen3VlTorchFrontendRtx)
+    fe.max_prefill_graphs = 2
+    fe._prefill_graphs = collections.OrderedDict()
+    fe._pg_buffers = collections.OrderedDict()
+    fe._decode_graphs = collections.OrderedDict()
+    fe._prompt = {k: _TensorStub(k) for k in fe._PG_KEYS}
+    fe._prompt.update({"S": 20, "pg_key": (10, 20, 3, 13)})
+
+    stale_graph = object()
+    fe._stage_prefill_inputs(P=10, S=20, span=(3, 13))
+    fe._prefill_graphs[(10, 20, 3, 13)] = stale_graph
+    fe.clear_graphs()
+    fe._prefill_graphs[(10, 20, 3, 13)] = stale_graph
+
+    class _FakeGraph:
+        def replay(self):
+            pass
+
+    graph = _FakeGraph()
+    monkeypatch.setattr(
+        Qwen3VlTorchFrontendRtx, "_capture_prefill_graph",
+        lambda self, st, P, S, a, b: graph)
+
+    class _FakeLLM:
+        _cfg = {"hidden_size": 1, "vocab_size": 1}
+        _weights = type(
+            "Weights", (), {"ptrs": {"lm_head_w": 0}})()
+
+    class _FakeTensor:
+        def __getitem__(self, _key):
+            return self
+
+        def contiguous(self):
+            return self
+
+        def data_ptr(self):
+            return 0
+
+    class _FakeStream:
+        cuda_stream = 0
+
+    fake_fvk = types.SimpleNamespace(
+        bf16_matmul_bf16=lambda *args: None,
+        bf16_matmul_qwen36_bf16=lambda *args: None)
+    import flash_rt
+    monkeypatch.setitem(sys.modules, "flash_rt.flash_rt_kernels", fake_fvk)
+    monkeypatch.setattr(flash_rt, "flash_rt_kernels", fake_fvk, raising=False)
+    import torch
+    monkeypatch.setattr(torch.cuda, "current_stream",
+                        lambda: _FakeStream(), raising=False)
+
+    fe.llm = _FakeLLM()
+    fe._pg_last_hidden = _FakeTensor()
+    fe._pg_logits = _FakeTensor()
+
+    assert fe.prefill_graph() is fe._pg_logits
+    assert list(fe._pg_buffers) == [(10, 20, 3, 13)]
+    assert list(fe._prefill_graphs) == [(10, 20, 3, 13)]
+    assert fe._prefill_graphs[(10, 20, 3, 13)] is graph
+
+
+def test_qwen3_vl_graph_cache_stats_and_clear_graphs():
+    from flash_rt.frontends.torch.qwen3_vl_rtx import Qwen3VlTorchFrontendRtx
+
+    fe = Qwen3VlTorchFrontendRtx.__new__(Qwen3VlTorchFrontendRtx)
+    fe.max_prefill_graphs = 7
+    fe.max_decode_graphs = 5
+    fe._prefill_graphs = collections.OrderedDict([(("p0",), object())])
+    fe._pg_buffers = collections.OrderedDict([(("p0",), object())])
+    fe._decode_graphs = collections.OrderedDict([(3, object()), (4, object())])
+
+    stats = fe.graph_cache_stats()
+    assert stats["prefill"]["max_graphs"] == 7
+    assert stats["prefill"]["graph_count"] == 1
+    assert stats["prefill"]["buffer_count"] == 1
+    assert stats["prefill"]["graph_keys"] == [("p0",)]
+    assert stats["decode"]["max_graphs"] == 5
+    assert stats["decode"]["graph_count"] == 2
+    assert stats["decode"]["graph_keys"] == [3, 4]
+
+    fe.clear_graphs()
+
+    assert fe._prefill_graphs == collections.OrderedDict()
+    assert fe._pg_buffers == collections.OrderedDict()
+    assert fe._decode_graphs == collections.OrderedDict()
