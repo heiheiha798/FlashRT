@@ -887,7 +887,7 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
                     int(weights["act_qkv_scale"][j_self]),
                     int(weights["w_qkv_scale"][j_self]), int(stream))
             else:
-                gemm.fp8_run_dev(
+                gemm.fp8_nn_dev(
                     int(bufs["qkv_xn_fp8"]), int(weights["qkv_w_fp8"][j_self]),
                     int(bufs["qkv_buf"]), Sa, 3 * D, D,
                     int(weights["act_qkv_scale"][j_self]),
@@ -973,7 +973,7 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
                     int(weights["act_fc1_scale"][li]),
                     int(weights["w_fc1_scale"][li]), int(stream))
             else:
-                gemm.fp8_run_dev(
+                gemm.fp8_nn_dev(
                     int(bufs["xn_fp8"]), int(weights["ff_proj_w_fp8"][li]),
                     ff_out_ptr, Sa, FF, D,
                     int(weights["act_fc1_scale"][li]),
@@ -989,7 +989,7 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
                     int(weights["act_fc2_scale"][li]),
                     int(weights["w_fc2_scale"][li]), int(stream))
             else:
-                gemm.fp8_run_dev(
+                gemm.fp8_nn_dev(
                     int(bufs["ff_fp8"]), int(weights["ff_down_w_fp8"][li]),
                     o_out_ptr, Sa, D, FF,
                     int(weights["act_fc2_scale"][li]),
