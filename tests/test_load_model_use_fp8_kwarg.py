@@ -787,12 +787,12 @@ def test_groot_n17_rtx_sm120_rejects_use_fp8_false_without_fp16():
         )
 
 
-def test_pi05_rtx_fp8_layout_selection():
-    from flash_rt.frontends.torch.pi05_rtx import _select_fp8_layout
+def test_frontend_fp8_layout_selection():
+    from flash_rt.frontends._fp8_layout import select_fp8_layout
 
-    assert _select_fp8_layout("rtx_sm89", None) == "nk"
-    assert _select_fp8_layout("rtx_sm120", None) == "kn"
-    assert _select_fp8_layout("rtx_sm120", "nk") == "nk"
+    assert select_fp8_layout("rtx_sm89", None) == "nk"
+    assert select_fp8_layout("rtx_sm120", None) == "kn"
+    assert select_fp8_layout("rtx_sm120", "nk") == "nk"
 
 
 def test_vla_frontend_constructors_accept_use_fp8():

@@ -25,6 +25,8 @@ from typing import Optional
 
 import torch
 
+from flash_rt.frontends._fp8_layout import select_fp8_layout
+
 
 class GrootN17TorchFrontendThor:
     """N1.7 Thor inference frontend.
@@ -621,9 +623,7 @@ class GrootN17TorchFrontendThor:
                 act_fc2[li] = max(act_fc2[li], float(ff_t[:Sa].abs().max().item()))
             post_fwd(step, 0)
 
-        from flash_rt.frontends.torch.pi05_rtx import _select_fp8_layout
-
-        fp8_layout = _select_fp8_layout(getattr(self, "hardware", None), None)
+        fp8_layout = select_fp8_layout(getattr(self, "hardware", None), None)
 
         # Quantize FFN weights to FP8 (per-tensor). The SM120-safe path keeps
         # the legacy descale+epilogue contract; the SM89 path carries explicit
