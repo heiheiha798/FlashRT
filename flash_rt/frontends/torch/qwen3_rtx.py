@@ -1947,3 +1947,28 @@ class Qwen3TorchFrontendRtx:
                         self._static_token_id, cos, sin, cur,
                     )
         return torch.tensor([ids_list], device=self.device)
+
+    def get_latency_stats(self) -> dict:
+        """Return summary statistics over recorded latencies (ms).
+
+        ``latency_records`` is populated by external callers (benchmarks,
+        servers) rather than internally, because adding
+        ``torch.cuda.synchronize()`` on every decode step would serialize
+        the pipeline and destroy throughput. Call
+        ``frontend.latency_records.append(dt_ms)`` from your timing loop,
+        then call this method to get the summary.
+        """
+        if not self.latency_records:
+            return {}
+        import numpy as np
+        lat = np.array(self.latency_records)
+        return {
+            "count": len(lat),
+            "mean_ms": float(np.mean(lat)),
+            "std_ms": float(np.std(lat)),
+            "min_ms": float(np.min(lat)),
+            "max_ms": float(np.max(lat)),
+            "p50_ms": float(np.percentile(lat, 50)),
+            "p95_ms": float(np.percentile(lat, 95)),
+            "hz": float(1000 / np.mean(lat)),
+        }
