@@ -12,6 +12,17 @@
 // Returns NULL when FlashRT was built without FLASHRT_CPP_WITH_JETSON_PI.
 // The pointer is valid for the process lifetime; do not release it.
 //
+// factory->create_pi0 is thread-safe (errors are reported through a
+// thread-local sink queried via factory->last_error). Each successful
+// create_pi0 yields one owned engine reference; the runtime-open wrapper
+// transfers it to the v2 runtime, which releases it on drop.
+//
+// Engine error codes (returned by set_input/run_infer/get_output, surfaced
+// through verbs_v2): 0 ok; -1 null self / precondition; -2 invalid config or
+// model; -5 action output buffer too small; -7 actions not ready (run_infer
+// did not complete since the last set_input); -8 generic infer failure.
+// last_error returns a non-null string describing the most recent failure.
+//
 
 #include "flashrt/providers/llama_cpp/c_api.h"
 
