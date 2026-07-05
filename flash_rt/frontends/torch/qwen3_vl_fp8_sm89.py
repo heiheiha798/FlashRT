@@ -19,16 +19,24 @@ class _MergedKernels:
     Qwen3-VL FP8 kernels live in their own .so (mirroring the SM120 split)
     while frontend call sites keep using a single ``fvk`` handle."""
 
-    __slots__ = ('_vl', '_core')
+    __slots__ = ('_vl', '_core', '_cache')
 
     def __init__(self, vl: Any, core: Any) -> None:
         self._vl = vl
         self._core = core
+        self._cache: dict[str, Any] = {}
 
     def __getattr__(self, name: str) -> Any:
-        if self._vl is not None and hasattr(self._vl, name):
-            return getattr(self._vl, name)
-        return getattr(self._core, name)
+        cache = self._cache
+        if name in cache:
+            return cache[name]
+        vl = self._vl
+        if vl is not None and hasattr(vl, name):
+            fn = getattr(vl, name)
+        else:
+            fn = getattr(self._core, name)
+        cache[name] = fn
+        return fn
 
 
 def _import_fvk() -> Any:
