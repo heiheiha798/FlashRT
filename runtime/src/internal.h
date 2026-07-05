@@ -40,9 +40,11 @@ struct Holder {
     std::deque<std::vector<uint32_t>> after_arrays;
     std::vector<frt_runtime_port_desc>  ports;
     std::vector<frt_runtime_stage_desc> stages;
+    std::vector<frt_runtime_stage_desc_v2> stages_v2;
 
     frt_runtime_export_v1 exp{};
     frt_model_runtime_v1  model{};
+    frt_model_runtime_v2  model_v2{};
 };
 
 extern "C" void frt_rt_holder_retain(void* owner);
@@ -56,6 +58,7 @@ struct frt_runtime_builder_s {
     frt_ctx ctx = nullptr;
     frt_rt::Holder* h = nullptr;  /* built up in place; adopted by finish */
     std::string identity_pairs;
+    bool provider_owned = false;
 };
 
 namespace frt_rt {

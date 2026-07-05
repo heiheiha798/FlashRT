@@ -17,6 +17,7 @@ Run from the repo root (after building exec/ and runtime/):
 
 import ctypes
 import gc
+import json
 import weakref
 
 import _flashrt_exec as ex
@@ -24,8 +25,9 @@ import _flashrt_runtime as rt
 
 import flash_rt.runtime.export as export_mod
 from flash_rt.runtime.export import (
-    BufferSpec, GraphSpec, PortSpec, RegionSpec, StageSpec, StreamSpec,
-    build_model_runtime, DTYPE, LAYOUT, MODALITY, UPDATE,
+    BufferSpec, CallbackStageSpec, GraphSpec, PortSpec, RegionSpec,
+    StageSpec, StreamSpec, build_model_runtime, build_provider_model_runtime_v2,
+    DTYPE, LAYOUT, MODALITY, STAGE_KIND, UPDATE,
 )
 from flash_rt.subgraphs.stage_plan import (
     StagePlan,
@@ -272,6 +274,99 @@ def check_vjp_guided_port_lowering(setup):
         mr.release()
 
 
+def check_provider_owned_v2():
+    calls = {"set_input": [], "run_stage": [], "step": 0}
+
+    def py_set_input(port, payload, stream):
+        calls["set_input"].append((port, bytes(payload), stream))
+        return 0
+
+    def py_run_stage(stage, stream):
+        calls["run_stage"].append((stage, stream))
+        return 0
+
+    def py_step():
+        calls["step"] += 1
+        return py_run_stage(0, -1)
+
+    mr = build_provider_model_runtime_v2(
+        ports=[
+            PortSpec("prompt", "text", "u8", "flat", "in", "staged",
+                     required=True, shape=(-1,)),
+            PortSpec("state", "state", "f32", "flat", "in", "staged",
+                     required=True, shape=(8,)),
+            PortSpec("actions", "action", "f32", "flat", "out", "staged",
+                     shape=(50, 32)),
+        ],
+        stages=[CallbackStageSpec("infer", 0)],
+        identity={"model": "pi0", "provider": "llama_cpp_test"},
+        manifest_extra={"provider": "llama_cpp", "model_family": "pi0"},
+        set_input=py_set_input,
+        step=py_step,
+        run_stage=py_run_stage,
+    )
+    try:
+        manifest = json.loads(mr.manifest)
+        ports = mr.ports()
+        stages = mr.stages()
+        check("provider-owned v2 exports staged ports", (
+            len(ports) == 3
+            and ports[0]["name"] == "prompt"
+            and ports[0]["modality"] == MODALITY["text"]
+            and ports[0]["update"] == UPDATE["staged"]
+            and ports[0]["buffer"] == 0))
+        check("provider-owned v2 exposes callback infer stage", (
+            stages == [{"name": "infer", "kind": STAGE_KIND["callback"],
+                        "graph": 0xFFFFFFFF, "callback": 0, "after": []}]))
+        check("provider-owned v2 identity carries callback stage", (
+            "stage_v2:0:infer:" in mr.identity
+            and "port:0:prompt:" in mr.identity))
+        check("provider-owned v2 has no exec graph manifest", (
+            "graphs" not in manifest
+            and manifest["provider"] == "llama_cpp"))
+        check("provider-owned v2 set_input reaches Python callable", (
+            rt.model_v2_set_input(mr.ptr, 0, b"pick cube", -1) == 0
+            and calls["set_input"] == [(0, b"pick cube", -1)]))
+        check("provider-owned v2 run_stage reaches Python callable", (
+            rt.model_v2_run_stage(mr.ptr, 0, -1) == 0
+            and calls["run_stage"][-1] == (0, -1)))
+        check("provider-owned v2 step can delegate to callback stage", (
+            rt.model_v2_step(mr.ptr) == 0 and calls["step"] == 1))
+    finally:
+        mr.release()
+    try:
+        build_provider_model_runtime_v2(
+            ports=[
+                PortSpec("bad_swap", "tensor", "f32", "flat", "in", "swap",
+                         shape=(1,)),
+            ],
+            stages=[CallbackStageSpec("infer", 0)],
+            identity={"model": "bad"},
+            run_stage=py_run_stage,
+        )
+    except ValueError as e:
+        rejected_swap = "staged updates" in str(e)
+    else:
+        rejected_swap = False
+    check("provider-owned v2 rejects non-staged ports", rejected_swap)
+    try:
+        build_provider_model_runtime_v2(
+            ports=[
+                PortSpec("bad_window", "tensor", "f32", "flat", "in",
+                         "staged", shape=(1,), nbytes=4),
+            ],
+            stages=[CallbackStageSpec("infer", 0)],
+            identity={"model": "bad"},
+            run_stage=py_run_stage,
+        )
+    except ValueError as e:
+        rejected_window = "raw windows" in str(e)
+    else:
+        rejected_window = False
+    check("provider-owned v2 rejects raw window declarations",
+          rejected_window)
+
+
 def main():
     CHECKS.clear()
     setup = make_setup()
@@ -333,6 +428,8 @@ def main():
     print("== stage plan registry ==")
     check_stage_plan_registry()
     check_vjp_guided_port_lowering(setup)
+    print("== provider-owned v2 callback stage ==")
+    check_provider_owned_v2()
 
     print("== verbs through the C function pointers ==")
     rc = rt.model_set_input(mr.ptr, 1, b"\xAA\xBB", -1)

@@ -29,6 +29,7 @@ int stub_get_output(void*, uint32_t, void*, uint64_t, uint64_t*, int) {
 }
 int stub_prepare(void*, uint32_t, frt_shape_key) { return -3; }
 int stub_step(void*) { return -3; }
+int stub_run_stage(void*, uint32_t, int) { return -3; }
 const char* stub_last_error(void*) {
     return "verb not provided by this producer";
 }
@@ -49,6 +50,55 @@ void copy_verbs(frt_model_runtime_v1* m, const frt_model_runtime_verbs* verbs,
     if (!m->verbs.step) m->verbs.step = stub_step;
     if (!m->verbs.last_error) m->verbs.last_error = stub_last_error;
     m->self = verbs_self;
+}
+
+void copy_verbs_v2(frt_model_runtime_v2* m,
+                   const frt_model_runtime_verbs_v2* verbs,
+                   void* verbs_self) {
+    m->verbs_v2.struct_size = (uint32_t)sizeof(frt_model_runtime_verbs_v2);
+    if (verbs && verbs->struct_size >= sizeof(frt_model_runtime_verbs_v2)) {
+        m->verbs_v2.set_input = verbs->set_input;
+        m->verbs_v2.get_output = verbs->get_output;
+        m->verbs_v2.prepare = verbs->prepare;
+        m->verbs_v2.step = verbs->step;
+        m->verbs_v2.last_error = verbs->last_error;
+        m->verbs_v2.run_stage = verbs->run_stage;
+    }
+    if (!m->verbs_v2.set_input) m->verbs_v2.set_input = stub_set_input;
+    if (!m->verbs_v2.get_output) m->verbs_v2.get_output = stub_get_output;
+    if (!m->verbs_v2.prepare) m->verbs_v2.prepare = stub_prepare;
+    if (!m->verbs_v2.step) m->verbs_v2.step = stub_step;
+    if (!m->verbs_v2.last_error) m->verbs_v2.last_error = stub_last_error;
+    if (!m->verbs_v2.run_stage) m->verbs_v2.run_stage = stub_run_stage;
+
+    m->verbs.struct_size = (uint32_t)sizeof(frt_model_runtime_verbs);
+    m->verbs.set_input = m->verbs_v2.set_input;
+    m->verbs.get_output = m->verbs_v2.get_output;
+    m->verbs.prepare = m->verbs_v2.prepare;
+    m->verbs.step = m->verbs_v2.step;
+    m->verbs.last_error = m->verbs_v2.last_error;
+    m->self = verbs_self;
+}
+
+int add_stage_v2(frt_runtime_builder b, const char* name, uint32_t kind,
+                 uint32_t graph, uint32_t callback, const uint32_t* after,
+                 uint32_t n_after) {
+    if (!b || !name || !name[0] || (n_after && !after)) return -1;
+    Holder* h = b->h;
+    if (kind == FRT_RT_STAGE_GRAPH && graph >= h->graphs.size()) return -1;
+    if (kind != FRT_RT_STAGE_GRAPH && kind != FRT_RT_STAGE_CALLBACK) return -1;
+    for (uint32_t i = 0; i < n_after; ++i)
+        if (after[i] >= h->stages_v2.size()) return -1;
+    h->after_arrays.emplace_back(after, after + n_after);
+    frt_runtime_stage_desc_v2 d{};
+    d.name = stored(h, name);
+    d.kind = kind;
+    d.graph = graph;
+    d.callback = callback;
+    d.after = h->after_arrays.back().data();
+    d.n_after = n_after;
+    h->stages_v2.push_back(d);
+    return 0;
 }
 
 }  // namespace
@@ -101,12 +151,27 @@ extern "C" int frt_runtime_builder_add_stage(frt_runtime_builder b,
     return 0;
 }
 
+extern "C" int frt_runtime_builder_add_graph_stage_v2(
+        frt_runtime_builder b, const char* name, uint32_t graph,
+        const uint32_t* after, uint32_t n_after) {
+    return add_stage_v2(b, name, FRT_RT_STAGE_GRAPH, graph, UINT32_MAX, after,
+                        n_after);
+}
+
+extern "C" int frt_runtime_builder_add_callback_stage_v2(
+        frt_runtime_builder b, const char* name, uint32_t callback,
+        const uint32_t* after, uint32_t n_after) {
+    return add_stage_v2(b, name, FRT_RT_STAGE_CALLBACK, UINT32_MAX, callback,
+                        after, n_after);
+}
+
 extern "C" frt_model_runtime_v1* frt_runtime_builder_finish_model(
         frt_runtime_builder b,
         const frt_model_runtime_verbs* verbs, void* verbs_self,
         void* owner, void (*retain_owner)(void*),
         void (*release_owner)(void*)) {
     if (!b) return nullptr;
+    if (b->provider_owned) return nullptr;
     Holder* h = b->h;
     frt_rt::finish_export_into(h, b, owner, retain_owner, release_owner);
 
@@ -123,6 +188,73 @@ extern "C" frt_model_runtime_v1* frt_runtime_builder_finish_model(
 
     delete b;  /* h lives on inside the model runtime */
     return &h->model;
+}
+
+extern "C" frt_model_runtime_v2* frt_runtime_builder_finish_model_v2(
+        frt_runtime_builder b,
+        const frt_model_runtime_verbs_v2* verbs, void* verbs_self,
+        void* owner, void (*retain_owner)(void*),
+        void (*release_owner)(void*)) {
+    if (!b) return nullptr;
+    Holder* h = b->h;
+    if (b->provider_owned &&
+        (!h->streams.empty() || !h->graphs.empty() || !h->buffers.empty() ||
+         !h->regions.empty() || h->stages_v2.empty())) {
+        return nullptr;
+    }
+    if (b->provider_owned) {
+        for (const auto& p : h->ports)
+            if (p.update != FRT_RT_PORT_STAGED || p.buffer || p.offset ||
+                p.bytes) {
+                return nullptr;
+            }
+    }
+    for (const auto& s : h->stages_v2) {
+        if (s.kind == FRT_RT_STAGE_GRAPH && s.graph >= h->graphs.size())
+            return nullptr;
+        if (s.kind == FRT_RT_STAGE_CALLBACK &&
+            (!verbs || verbs->struct_size < sizeof(frt_model_runtime_verbs_v2) ||
+             !verbs->run_stage)) {
+            return nullptr;
+        }
+    }
+    frt_rt::finish_export_into(h, b, owner, retain_owner, release_owner);
+
+    bool has_callback_stage = false;
+    for (const auto& st : h->stages_v2)
+        if (st.kind == FRT_RT_STAGE_CALLBACK) has_callback_stage = true;
+    if (has_callback_stage) h->stages.clear();
+
+    const bool graph_only_v2 = h->stages.empty() &&
+        !has_callback_stage && h->stages_v2.size() > 0;
+    if (graph_only_v2) {
+        for (const auto& st : h->stages_v2) {
+            if (st.kind != FRT_RT_STAGE_GRAPH) {
+                break;
+            }
+            frt_runtime_stage_desc d{};
+            d.graph = st.graph;
+            d.n_after = st.n_after;
+            d.after = st.after;
+            h->stages.push_back(d);
+        }
+        if (h->stages.size() != h->stages_v2.size()) h->stages.clear();
+    }
+
+    frt_model_runtime_v2& m = h->model_v2;
+    m.abi_version = FRT_MODEL_RUNTIME_ABI_VERSION_V2;
+    m.struct_size = (uint32_t)sizeof(frt_model_runtime_v2);
+    m.exp = &h->exp;
+    m.ports = h->ports.data();       m.n_ports = h->ports.size();
+    m.stages = h->stages.data();     m.n_stages = h->stages.size();
+    m.stages_v2 = h->stages_v2.data(); m.n_stages_v2 = h->stages_v2.size();
+    copy_verbs_v2(&m, verbs, verbs_self);
+    m.owner = h;
+    m.retain = frt_rt::frt_rt_holder_retain;
+    m.release = frt_rt::frt_rt_holder_release;
+
+    delete b;
+    return &h->model_v2;
 }
 
 /* ---- adapter path: wrap an existing export -------------------------------- */
