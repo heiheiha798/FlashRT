@@ -22,7 +22,7 @@ class Qwen3VlFp8Sm89Frontend:
                  max_pixels: int | None = None,
                  fuse_gate_up: bool = False,
                  fuse_qk_postproc: bool = True,
-                 use_fp8_lm_head: bool = False,
+                 use_fp8_lm_head: bool = True,
                  vision_bf16_first_blocks: int = 3,
                  vision_bf16_block_linears: dict[int, tuple[str, ...]]
                  | None = None,
@@ -188,7 +188,6 @@ class Qwen3VlFp8Sm89Frontend:
 
         from flash_rt.frontends.torch import _qwen3_vl_geometry as geo
 
-        self._decode_graphs.clear()
         inputs = self.processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors='pt',

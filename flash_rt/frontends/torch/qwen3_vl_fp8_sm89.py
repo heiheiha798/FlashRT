@@ -60,7 +60,7 @@ class Qwen3VlFp8Sm89TextFrontend:
                  max_prefill_seq: int | None = None,
                  fuse_gate_up: bool = False,
                  fuse_qk_postproc: bool = True,
-                 use_fp8_lm_head: bool = False,
+                 use_fp8_lm_head: bool = True,
                  max_decode_graphs: int | None = None) -> None:
         import json
 
