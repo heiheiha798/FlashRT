@@ -102,7 +102,7 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
         !config->mmproj_path || !config->mmproj_path[0] ||
         !config->backend || !config->backend[0] || !config->n_views ||
         !config->image_height || !config->image_width ||
-        !config->image_channels || !config->state_dim ||
+        !config->image_channels ||
         !config->action_steps || !config->action_dim) {
         return -1;
     }
@@ -123,7 +123,11 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
     owner->image_shape[1] = static_cast<int64_t>(config->image_height);
     owner->image_shape[2] = static_cast<int64_t>(config->image_width);
     owner->image_shape[3] = static_cast<int64_t>(config->image_channels);
-    owner->state_shape[0] = static_cast<int64_t>(config->state_dim);
+    // Pi0 state shares the model action_dim: llama_set_pi0_state requires
+    // n_values == hparams.action_dim, and the caller zero-pads real
+    // proprioception into that width. Exposing it on the state port keeps
+    // the host-visible shape honest.
+    owner->state_shape[0] = static_cast<int64_t>(config->action_dim);
     owner->action_shape[0] = static_cast<int64_t>(config->action_steps);
     owner->action_shape[1] = static_cast<int64_t>(config->action_dim);
 
@@ -212,7 +216,6 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
     bool seen_image_height = false;
     bool seen_image_width = false;
     bool seen_image_channels = false;
-    bool seen_state_dim = false;
     bool seen_action_steps = false;
     bool seen_action_dim = false;
     const char* p = config_json;
@@ -333,9 +336,6 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
                 return -1;
             }
             seen_image_channels = true;
-        } else if (key == "state_dim") {
-            if (seen_state_dim || !parse_u32(&config.state_dim)) return -1;
-            seen_state_dim = true;
         } else if (key == "action_steps") {
             if (seen_action_steps || !parse_u32(&config.action_steps)) {
                 return -1;
@@ -361,7 +361,7 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
     if (!seen_model_family || model_family != "pi0" || !seen_model_path ||
         !seen_mmproj_path || !seen_backend || !seen_n_views ||
         !seen_image_height || !seen_image_width || !seen_image_channels ||
-        !seen_state_dim || !seen_action_steps || !seen_action_dim) {
+        !seen_action_steps || !seen_action_dim) {
         return -1;
     }
     config.model_path = model_path.c_str();

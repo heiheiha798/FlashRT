@@ -35,7 +35,6 @@ extern "C" int frt_llama_cpp_jetson_pi_link_check(void) {
     cfg.image_height = 224;
     cfg.image_width = 224;
     cfg.image_channels = 3;
-    cfg.state_dim = 8;
     cfg.action_steps = 2;
     cfg.action_dim = 4;
 

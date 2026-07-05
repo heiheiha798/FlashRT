@@ -157,7 +157,6 @@ int main() {
     cfg.image_height = 224;
     cfg.image_width = 224;
     cfg.image_channels = 3;
-    cfg.state_dim = 8;
     cfg.action_steps = 2;
     cfg.action_dim = 2;
 
@@ -214,7 +213,7 @@ int main() {
                       "state") == 0 &&
               model->ports[FRT_LLAMA_CPP_PI0_PORT_STATE].dtype ==
                   FRT_RT_DTYPE_F32 &&
-              model->ports[FRT_LLAMA_CPP_PI0_PORT_STATE].shape[0] == 8,
+              model->ports[FRT_LLAMA_CPP_PI0_PORT_STATE].shape[0] == 2,
           "state port schema");
     CHECK(std::strcmp(model->ports[FRT_LLAMA_CPP_PI0_PORT_ACTIONS].name,
                       "actions") == 0 &&
@@ -292,7 +291,7 @@ int main() {
         "\"image_height\":224,"
         "\"image_width\":224,"
         "\"image_channels\":3,"
-        "\"state_dim\":8,"
+        ""
         "\"action_steps\":2,"
         "\"action_dim\":2"
         "}";
@@ -305,7 +304,6 @@ int main() {
               factory.seen_mmproj_path == "/models/pi0-mmproj.gguf" &&
               factory.seen_backend == "cpu" &&
               factory.seen.n_views == 2 &&
-              factory.seen.state_dim == 8 &&
               factory.seen.action_steps == 2 &&
               factory.seen.action_dim == 2,
           "factory receives parsed Pi0 config");
@@ -329,7 +327,7 @@ int main() {
               "{\"model_family\":\"pi0\",\"model_path\":\"/models/pi0.gguf\","
               "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
               "\"backend\":\"cpu\",\"n_views\":2,\"image_height\":224,"
-              "\"image_width\":224,\"image_channels\":3,\"state_dim\":8,"
+              "\"image_width\":224,\"image_channels\":3,"
               "\"action_steps\":2,\"action_dim\":2,\"unexpected\":1}",
               &factory_api, &missing) == -1 &&
               missing == nullptr,
@@ -339,7 +337,7 @@ int main() {
               "\"model_path\":\"/models/pi0.gguf\","
               "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
               "\"backend\":\"cpu\",\"n_views\":2,\"image_height\":224,"
-              "\"image_width\":224,\"image_channels\":3,\"state_dim\":8,"
+              "\"image_width\":224,\"image_channels\":3,"
               "\"action_steps\":2,\"action_dim\":2}",
               &factory_api, &missing) == -1 &&
               missing == nullptr,
@@ -348,7 +346,7 @@ int main() {
               "{\"model_family\":\"llm\",\"model_path\":\"/models/pi0.gguf\","
               "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
               "\"backend\":\"cpu\",\"n_views\":2,\"image_height\":224,"
-              "\"image_width\":224,\"image_channels\":3,\"state_dim\":8,"
+              "\"image_width\":224,\"image_channels\":3,"
               "\"action_steps\":2,\"action_dim\":2}",
               &factory_api, &missing) == -1 &&
               missing == nullptr,
@@ -357,7 +355,7 @@ int main() {
               "{\"model_family\":\"pi0\",\"model_path\":\"/models/pi0.gguf\","
               "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
               "\"backend\":\"cpu\",\"n_views\":0,\"image_height\":224,"
-              "\"image_width\":224,\"image_channels\":3,\"state_dim\":8,"
+              "\"image_width\":224,\"image_channels\":3,"
               "\"action_steps\":2,\"action_dim\":2}",
               &factory_api, &missing) == -1 &&
               missing == nullptr,
