@@ -20,7 +20,7 @@ class Qwen3VlFp8Sm89Frontend:
     def __init__(self, checkpoint_path: str, *, device: str = 'cuda:0',
                  max_seq: int = 4096, max_prefill_seq: int | None = None,
                  max_pixels: int | None = None,
-                 fuse_gate_up: bool = False,
+                 fuse_gate_up: bool = True,
                  fuse_qk_postproc: bool = True,
                  use_fp8_lm_head: bool = True,
                  vision_bf16_first_blocks: int = 3,

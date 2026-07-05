@@ -58,7 +58,7 @@ class Qwen3VlFp8Sm89TextFrontend:
     def __init__(self, checkpoint_path: str, *,
                  device: str = 'cuda:0', max_seq: int = 2048,
                  max_prefill_seq: int | None = None,
-                 fuse_gate_up: bool = False,
+                 fuse_gate_up: bool = True,
                  fuse_qk_postproc: bool = True,
                  use_fp8_lm_head: bool = True,
                  max_decode_graphs: int | None = None) -> None:
@@ -684,8 +684,7 @@ class Qwen3VlFp8Sm89TextFrontend:
                 L, h, cos_pos, sin_pos, cur_pos,
                 prequant=prequant, next_input_norm_w=next_norm)
             if deepstack_by_layer is not None and L in deepstack_by_layer:
-                h = h.clone()
-                torch.add(h, deepstack_by_layer[L].view(1, 1, hidden), out=h)
+                h.add_(deepstack_by_layer[L].view(1, 1, hidden))
                 prequant = None
 
         x_norm = self._h_b[:1].view(1, hidden)
