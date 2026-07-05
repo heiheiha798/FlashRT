@@ -421,9 +421,11 @@ class Qwen3VlFp8Sm89TextFrontend:
     def _layer_forward(self, L: int, h_in, cos, sin, cur_pos: int,
                        *,
                        prequant=None,
-                       next_input_norm_w: int = 0):
+                       next_input_norm_w: int = 0,
+                       final_norm_w: int = 0,
+                       final_norm_out=None):
         import torch
-        fvk = _import_fvk()
+        fvk = self._fvk
 
         cfg = self._cfg
         assert cfg is not None
@@ -520,14 +522,22 @@ class Qwen3VlFp8Sm89TextFrontend:
                 int(next_input_norm_w),
                 next_ap.data_ptr(), next_sc.data_ptr(), 1, hidden, eps, s)
             return h_out, (next_ap, next_sc)
+        if final_norm_w:
+            fvk.residual_add_rms_norm(
+                h_post.data_ptr(), mlp_out.data_ptr(),
+                final_norm_w, final_norm_out.data_ptr(),
+                1, hidden, eps, s)
+            return final_norm_out, None
         torch.add(h_post, mlp_out, out=h_out)
         return h_out, None
 
     def _layer_forward_prefill_fp8_blockscaled(self, L: int, h_in_S, cos_S,
-                                           sin_S, start_pos: int, S: int):
+                                           sin_S, start_pos: int, S: int,
+                                           final_norm_w: int = 0,
+                                           final_norm_out=None):
         import torch
 
-        fvk = _import_fvk()
+        fvk = self._fvk
 
         s = torch.cuda.current_stream().cuda_stream
         cfg = self._cfg
@@ -616,6 +626,13 @@ class Qwen3VlFp8Sm89TextFrontend:
             ap_dn, sc_dn, int(lw['mlp_down_w']), int(lw['mlp_down_s']),
             down_out, hidden, inter, S)
 
+        if final_norm_w:
+            fvk.residual_add_rms_norm(
+                h_post.data_ptr(),
+                down_out[:S].view(1, S, hidden).contiguous().data_ptr(),
+                final_norm_w, final_norm_out.data_ptr(),
+                S, hidden, eps, s)
+            return final_norm_out.view(1, S, hidden)
         h_out = (self._layer_out_a if (L % 2 == 0)
                  else self._layer_out_b)[:, :S]
         torch.add(h_post, down_out[:S].view(1, S, hidden), out=h_out)
@@ -641,23 +658,38 @@ class Qwen3VlFp8Sm89TextFrontend:
         if start_pos + S > self.max_seq:
             raise ValueError(
                 f'prefill end {start_pos + S} > max_seq {self.max_seq}')
+        n_layers = cfg['num_hidden_layers']
+        final_norm_ptr = int(self._weights.ptrs['final_norm_w'])
+        last_has_ds = (deepstack_by_layer is not None
+                       and (n_layers - 1) in deepstack_by_layer)
         h = h_S.view(1, S, hidden).to(torch.bfloat16).contiguous()
-        for L in range(cfg['num_hidden_layers']):
+        for L in range(n_layers):
+            fnw = 0
+            fno = None
+            if L + 1 == n_layers and not last_has_ds:
+                fnw = final_norm_ptr
+                fno = self._last_hidden_buf[:, :S].view(S, hidden)
             h = self._layer_forward_prefill_fp8_blockscaled(
-                L, h, cos_S, sin_S, start_pos, S)
+                L, h, cos_S, sin_S, start_pos, S,
+                final_norm_w=fnw, final_norm_out=fno)
             if deepstack_by_layer is not None and L in deepstack_by_layer:
                 for a, b, ds in deepstack_by_layer[L]:
                     self._fvk.residual_add(
                         h[0, a:b].data_ptr(), ds.data_ptr(),
                         (b - a) * hidden, s)
 
+        self._cur_pos = start_pos + S
+        if not last_has_ds:
+            if not run_lm_head:
+                return self._last_hidden_buf[:, :S]
+            return self._write_logits_from_hidden(
+                self._last_hidden_buf[0, S - 1:S])
         h2 = h.view(S, hidden).contiguous()
         x_norm = self._h_b[:S].view(S, hidden)
         self._fvk.rms_norm(
-            h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
+            h2.data_ptr(), final_norm_ptr,
             x_norm.data_ptr(), S, hidden, eps, s)
         self._last_hidden_buf[:, :S].copy_(x_norm.view(1, S, hidden))
-        self._cur_pos = start_pos + S
         if not run_lm_head:
             return self._last_hidden_buf[:, :S]
         return self._write_logits_from_hidden(
@@ -670,27 +702,39 @@ class Qwen3VlFp8Sm89TextFrontend:
         cfg = self._cfg
         assert cfg is not None
         hidden = cfg['hidden_size']
-        vocab = cfg['vocab_size']
         eps = float(cfg['rms_norm_eps'])
         s = torch.cuda.current_stream().cuda_stream
+        n_layers = cfg['num_hidden_layers']
+        final_norm_ptr = int(self._weights.ptrs['final_norm_w'])
+        last_has_ds = (deepstack_by_layer is not None
+                       and (n_layers - 1) in deepstack_by_layer)
         h = h.view(1, 1, hidden).contiguous()
         prequant = None
-        for L in range(cfg['num_hidden_layers']):
+        for L in range(n_layers):
             next_norm = 0
-            if L + 1 < cfg['num_hidden_layers']:
+            fnw = 0
+            fno = None
+            if L + 1 < n_layers:
                 next_norm = int(self._weights.ptrs['layers'][L + 1]
                                 ['input_norm_w'])
+            elif not last_has_ds:
+                fnw = final_norm_ptr
+                fno = self._last_hidden_buf[0, :1].view(1, hidden)
             h, prequant = self._layer_forward(
                 L, h, cos_pos, sin_pos, cur_pos,
-                prequant=prequant, next_input_norm_w=next_norm)
+                prequant=prequant, next_input_norm_w=next_norm,
+                final_norm_w=fnw, final_norm_out=fno)
             if deepstack_by_layer is not None and L in deepstack_by_layer:
                 h.add_(deepstack_by_layer[L].view(1, 1, hidden))
                 prequant = None
 
+        if not last_has_ds:
+            return self._write_logits_from_hidden(
+                self._last_hidden_buf[0, :1].view(1, hidden))
         x_norm = self._h_b[:1].view(1, hidden)
         self._fvk.rms_norm(
             h.view(1, hidden).contiguous().data_ptr(),
-            int(self._weights.ptrs['final_norm_w']), x_norm.data_ptr(),
+            final_norm_ptr, x_norm.data_ptr(),
             1, hidden, eps, s)
         self._last_hidden_buf[:, :1].copy_(x_norm.view(1, 1, hidden))
         return self._write_logits_from_hidden(x_norm)
