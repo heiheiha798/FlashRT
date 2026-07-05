@@ -98,7 +98,9 @@ int main() {
         add_ports_and_stages(b);
         CHECK(frt_runtime_builder_finish(b, nullptr, nullptr, nullptr) == nullptr,
               "plain finish refuses a builder that declared ports/stages");
-        /* the builder survives that refusal — finish_model consumes it */
+
+        b = make_builder();
+        add_ports_and_stages(b);
         frt_model_runtime_v1* m = frt_runtime_builder_finish_model(
             b, nullptr, nullptr, nullptr, nullptr, nullptr);
         CHECK(m != nullptr, "finish_model after refused finish");

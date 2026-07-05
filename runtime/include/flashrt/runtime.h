@@ -189,6 +189,7 @@ int frt_runtime_builder_add_region(frt_runtime_builder, const char* name,
 int frt_runtime_builder_add_identity(frt_runtime_builder, const char* key,
                                      const char* value);
 int frt_runtime_builder_set_manifest(frt_runtime_builder, const char* json);
+void frt_runtime_builder_discard(frt_runtime_builder);
 
 /* Finish: builds the canonical identity string, computes the fingerprint,
  * flattens everything into one export object, and consumes the builder
