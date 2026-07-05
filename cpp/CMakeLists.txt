@@ -22,12 +22,39 @@ include(CTest)
 option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
 option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality staging" ON)
 option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
+option(FLASHRT_CPP_WITH_JETSON_PI "Build optional Jetson-PI llama.cpp/mtmd integration checks" OFF)
+set(JETSON_PI_ROOT "" CACHE PATH "Jetson-PI llama.cpp fork root")
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   find_package(CUDAToolkit REQUIRED)
 endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+endif()
+if(FLASHRT_CPP_WITH_JETSON_PI AND NOT BUILD_TESTING)
+  message(FATAL_ERROR
+    "FLASHRT_CPP_WITH_JETSON_PI currently requires BUILD_TESTING=ON "
+    "(the Jetson-PI integration is exercised through a link-check test target).")
+endif()
+if(FLASHRT_CPP_WITH_JETSON_PI AND BUILD_TESTING)
+  if(NOT JETSON_PI_ROOT OR NOT EXISTS "${JETSON_PI_ROOT}/CMakeLists.txt")
+    message(FATAL_ERROR "FLASHRT_CPP_WITH_JETSON_PI requires -DJETSON_PI_ROOT=/path/to/Jetson-PI")
+  endif()
+  # FORCE: as a subdirectory embedding, FlashRT must own these Jetson-PI build
+  # options regardless of stale cache or conflicting -D flags from the caller,
+  # so the "mtmd without the full tools tree" isolation holds.
+  set(LLAMA_BUILD_COMMON ON CACHE BOOL "llama: build common utils library" FORCE)
+  set(LLAMA_CURL OFF CACHE BOOL "llama: use libcurl to download model from an URL" FORCE)
+  set(LLAMA_HTTPLIB OFF CACHE BOOL "llama: disable httplib (FlashRT link check needs no HTTP)" FORCE)
+  set(LLAMA_BUILD_TESTS OFF CACHE BOOL "llama: build tests" FORCE)
+  set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "llama: build tools" FORCE)
+  set(JETSON_PI_BUILD_MTMD ON CACHE BOOL "Jetson-PI: build the mtmd library without the full tools tree" FORCE)
+  set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "llama: build examples" FORCE)
+  set(LLAMA_BUILD_SERVER OFF CACHE BOOL "llama: build server example" FORCE)
+  set(LLAMA_TOOLS_INSTALL OFF CACHE BOOL "llama: install tools" FORCE)
+  add_subdirectory("${JETSON_PI_ROOT}"
+                   "${CMAKE_CURRENT_BINARY_DIR}/jetson-pi"
+                   EXCLUDE_FROM_ALL)
 endif()
 if(FLASHRT_CPP_WITH_EXEC AND NOT TARGET flashrt_exec)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../exec
@@ -101,6 +128,12 @@ target_link_libraries(flashrt_cpp_llama_cpp_provider
   PUBLIC flashrt_runtime)
 target_include_directories(flashrt_cpp_llama_cpp_provider
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/llama_cpp/include)
+if(FLASHRT_CPP_WITH_JETSON_PI AND BUILD_TESTING)
+  target_sources(flashrt_cpp_llama_cpp_provider
+    PRIVATE providers/llama_cpp/src/jetson_pi_link_check.cpp)
+  target_link_libraries(flashrt_cpp_llama_cpp_provider
+    PRIVATE mtmd llama)
+endif()
 
 if(BUILD_TESTING)
   add_executable(test_cpp_modalities tests/test_modalities.cpp)
@@ -136,4 +169,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_llama_cpp_provider
     PRIVATE flashrt_cpp_llama_cpp_provider flashrt_runtime)
   add_test(NAME llama_cpp_provider COMMAND test_llama_cpp_provider)
+
+  if(FLASHRT_CPP_WITH_JETSON_PI)
+    add_executable(test_llama_cpp_jetson_pi_link
+      tests/test_llama_cpp_jetson_pi_link.cpp)
+    target_link_libraries(test_llama_cpp_jetson_pi_link
+      PRIVATE flashrt_cpp_llama_cpp_provider)
+    add_test(NAME llama_cpp_jetson_pi_link
+      COMMAND test_llama_cpp_jetson_pi_link)
+  endif()
 endif()
