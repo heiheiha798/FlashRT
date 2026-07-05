@@ -1,6 +1,7 @@
 #include "flashrt/providers/llama_cpp/c_api.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <new>
 #include <string>
@@ -178,6 +179,212 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
         destroy_owner(owner);
         return -1;
     }
+    *out = model;
+    return 0;
+}
+
+extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+        const char* config_json,
+        const frt_llama_cpp_engine_factory_v1* factory,
+        frt_model_runtime_v2** out) {
+    if (!out) return -1;
+    *out = nullptr;
+    if (!factory ||
+        factory->struct_size < sizeof(frt_llama_cpp_engine_factory_v1) ||
+        !factory->create_pi0 || !factory->last_error) {
+        return -1;
+    }
+    if (!config_json) {
+        return -1;
+    }
+
+    frt_llama_cpp_pi0_config config{};
+    config.struct_size = sizeof(config);
+    std::string model_family;
+    std::string model_path;
+    std::string mmproj_path;
+    std::string backend;
+    bool seen_model_family = false;
+    bool seen_model_path = false;
+    bool seen_mmproj_path = false;
+    bool seen_backend = false;
+    bool seen_n_views = false;
+    bool seen_image_height = false;
+    bool seen_image_width = false;
+    bool seen_image_channels = false;
+    bool seen_state_dim = false;
+    bool seen_action_steps = false;
+    bool seen_action_dim = false;
+    const char* p = config_json;
+    auto skip_ws = [&p]() {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
+    };
+    auto parse_string = [&p](std::string* out) {
+        if (*p != '"') return false;
+        ++p;
+        out->clear();
+        while (*p && *p != '"') {
+            if (*p == '\\') {
+                ++p;
+                switch (*p) {
+                    case '"':
+                    case '\\':
+                    case '/':
+                        out->push_back(*p++);
+                        break;
+                    case 'b':
+                        out->push_back('\b');
+                        ++p;
+                        break;
+                    case 'f':
+                        out->push_back('\f');
+                        ++p;
+                        break;
+                    case 'n':
+                        out->push_back('\n');
+                        ++p;
+                        break;
+                    case 'r':
+                        out->push_back('\r');
+                        ++p;
+                        break;
+                    case 't':
+                        out->push_back('\t');
+                        ++p;
+                        break;
+                    default:
+                        return false;
+                }
+            } else {
+                const unsigned char ch = static_cast<unsigned char>(*p);
+                if (ch < 0x20) return false;
+                out->push_back(*p++);
+            }
+        }
+        if (*p != '"') return false;
+        ++p;
+        return true;
+    };
+    auto parse_u32 = [&p](uint32_t* out) {
+        uint32_t value = 0;
+        if (*p < '0' || *p > '9') return false;
+        if (*p == '0') {
+            ++p;
+        } else {
+            while (*p >= '0' && *p <= '9') {
+                const uint32_t digit = static_cast<uint32_t>(*p - '0');
+                if (value > (UINT32_MAX - digit) / 10u) return false;
+                value = value * 10u + digit;
+                ++p;
+            }
+        }
+        if (value == 0) return false;
+        *out = value;
+        return true;
+    };
+    skip_ws();
+    if (*p != '{') return -1;
+    ++p;
+    skip_ws();
+    if (*p == '}') return -1;
+    for (;;) {
+        std::string key;
+        if (!parse_string(&key)) return -1;
+        skip_ws();
+        if (*p != ':') return -1;
+        ++p;
+        skip_ws();
+        if (key == "model_family") {
+            if (seen_model_family || !parse_string(&model_family) ||
+                model_family.empty()) {
+                return -1;
+            }
+            seen_model_family = true;
+        } else if (key == "model_path") {
+            if (seen_model_path || !parse_string(&model_path) ||
+                model_path.empty()) {
+                return -1;
+            }
+            seen_model_path = true;
+        } else if (key == "mmproj_path") {
+            if (seen_mmproj_path || !parse_string(&mmproj_path) ||
+                mmproj_path.empty()) {
+                return -1;
+            }
+            seen_mmproj_path = true;
+        } else if (key == "backend") {
+            if (seen_backend || !parse_string(&backend) || backend.empty()) {
+                return -1;
+            }
+            seen_backend = true;
+        } else if (key == "n_views") {
+            if (seen_n_views || !parse_u32(&config.n_views)) return -1;
+            seen_n_views = true;
+        } else if (key == "image_height") {
+            if (seen_image_height || !parse_u32(&config.image_height)) {
+                return -1;
+            }
+            seen_image_height = true;
+        } else if (key == "image_width") {
+            if (seen_image_width || !parse_u32(&config.image_width)) return -1;
+            seen_image_width = true;
+        } else if (key == "image_channels") {
+            if (seen_image_channels || !parse_u32(&config.image_channels)) {
+                return -1;
+            }
+            seen_image_channels = true;
+        } else if (key == "state_dim") {
+            if (seen_state_dim || !parse_u32(&config.state_dim)) return -1;
+            seen_state_dim = true;
+        } else if (key == "action_steps") {
+            if (seen_action_steps || !parse_u32(&config.action_steps)) {
+                return -1;
+            }
+            seen_action_steps = true;
+        } else if (key == "action_dim") {
+            if (seen_action_dim || !parse_u32(&config.action_dim)) return -1;
+            seen_action_dim = true;
+        } else {
+            return -1;
+        }
+        skip_ws();
+        if (*p == '}') {
+            ++p;
+            break;
+        }
+        if (*p != ',') return -1;
+        ++p;
+        skip_ws();
+    }
+    skip_ws();
+    if (*p != '\0') return -1;
+    if (!seen_model_family || model_family != "pi0" || !seen_model_path ||
+        !seen_mmproj_path || !seen_backend || !seen_n_views ||
+        !seen_image_height || !seen_image_width || !seen_image_channels ||
+        !seen_state_dim || !seen_action_steps || !seen_action_dim) {
+        return -1;
+    }
+    config.model_path = model_path.c_str();
+    config.mmproj_path = mmproj_path.c_str();
+    config.backend = backend.c_str();
+
+    frt_llama_cpp_engine_v1 engine{};
+    const int rc = factory->create_pi0(factory->self, &config, &engine);
+    if (rc != 0) {
+        return rc;
+    }
+    if (engine.struct_size < sizeof(frt_llama_cpp_engine_v1) ||
+        !engine.self || !engine.retain || !engine.release ||
+        !engine.set_input || !engine.run_infer || !engine.get_output ||
+        !engine.last_error) {
+        return -1;
+    }
+    frt_model_runtime_v2* model = nullptr;
+    const int create_rc =
+        frt_llama_cpp_pi0_runtime_create_with_engine(&config, &engine,
+                                                     &model);
+    engine.release(engine.self);
+    if (create_rc != 0) return create_rc;
     *out = model;
     return 0;
 }

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
@@ -20,6 +21,22 @@ struct FakeEngine {
     uint32_t last_port = 999;
     float actions[4] = {1.0f, 2.0f, 3.0f, 4.0f};
     const char* last_error = "";
+};
+
+struct FakeFactory {
+    FakeEngine* engine = nullptr;
+    int creates = 0;
+    frt_llama_cpp_pi0_config seen{};
+    std::string seen_model_path;
+    std::string seen_mmproj_path;
+    std::string seen_backend;
+    const char* last_error = "";
+    bool return_borrowed = false;
+    bool return_retain_only = false;
+    bool return_undersized = false;
+    bool return_null_self = false;
+    bool return_missing_set_input = false;
+    bool fail_after_engine = false;
 };
 
 void retain_engine(void* p) {
@@ -73,6 +90,43 @@ const char* last_error(void* p) {
 
 const char* null_last_error(void*) {
     return nullptr;
+}
+
+int create_pi0_engine(void* p, const frt_llama_cpp_pi0_config* config,
+                      frt_llama_cpp_engine_v1* out) {
+    auto* factory = static_cast<FakeFactory*>(p);
+    factory->creates += 1;
+    if (!config || !out || !factory->engine) {
+        factory->last_error = "invalid factory input";
+        return -1;
+    }
+    if (factory->fail_after_engine) {
+        out->struct_size = sizeof(*out);
+        out->self = factory->engine;
+        out->retain = retain_engine;
+        out->release = release_engine;
+        factory->last_error = "factory failed";
+        return -7;
+    }
+    factory->seen = *config;
+    factory->seen_model_path = config->model_path ? config->model_path : "";
+    factory->seen_mmproj_path = config->mmproj_path ? config->mmproj_path : "";
+    factory->seen_backend = config->backend ? config->backend : "";
+    out->struct_size = factory->return_undersized ? 8u : sizeof(*out);
+    out->self = factory->return_null_self ? nullptr : factory->engine;
+    out->retain = (factory->return_borrowed ? nullptr : retain_engine);
+    out->release = (factory->return_borrowed || factory->return_retain_only)
+                       ? nullptr
+                       : release_engine;
+    out->set_input = factory->return_missing_set_input ? nullptr : set_input;
+    out->run_infer = run_infer;
+    out->get_output = get_output;
+    out->last_error = last_error;
+    return 0;
+}
+
+const char* factory_last_error(void* p) {
+    return static_cast<FakeFactory*>(p)->last_error;
 }
 
 }  // namespace
@@ -218,6 +272,152 @@ int main() {
                           "null error"),
           "null engine errors are reported without crashing");
     null_error_model->release(null_error_model->owner);
+
+    FakeEngine factory_engine;
+    FakeFactory factory;
+    factory.engine = &factory_engine;
+    frt_llama_cpp_engine_factory_v1 factory_api{};
+    factory_api.struct_size = sizeof(factory_api);
+    factory_api.self = &factory;
+    factory_api.create_pi0 = create_pi0_engine;
+    factory_api.last_error = factory_last_error;
+
+    const char* open_json =
+        "{"
+        "\"model_family\":\"pi0\","
+        "\"model_path\":\"/models/pi0.gguf\","
+        "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
+        "\"backend\":\"cpu\","
+        "\"n_views\":2,"
+        "\"image_height\":224,"
+        "\"image_width\":224,"
+        "\"image_channels\":3,"
+        "\"state_dim\":8,"
+        "\"action_steps\":2,"
+        "\"action_dim\":2"
+        "}";
+    frt_model_runtime_v2* opened = nullptr;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              open_json, &factory_api, &opened) == 0 &&
+              opened && factory.creates == 1,
+          "open_with_engine_factory creates a Pi0 runtime from JSON");
+    CHECK(factory.seen_model_path == "/models/pi0.gguf" &&
+              factory.seen_mmproj_path == "/models/pi0-mmproj.gguf" &&
+              factory.seen_backend == "cpu" &&
+              factory.seen.n_views == 2 &&
+              factory.seen.state_dim == 8 &&
+              factory.seen.action_steps == 2 &&
+              factory.seen.action_dim == 2,
+          "factory receives parsed Pi0 config");
+    CHECK(factory_engine.retains == 1 && factory_engine.releases == 1,
+          "factory engine reference is transferred to the runtime");
+    CHECK(opened->verbs_v2.run_stage(
+              opened->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER, -1) == 0 &&
+              factory_engine.infer == 1,
+          "opened runtime delegates infer to factory engine");
+    opened->release(opened->owner);
+    CHECK(factory_engine.releases == 2,
+          "opened runtime releases retained factory engine");
+
+    frt_model_runtime_v2* missing = nullptr;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              "{\"model_family\":\"pi0\",\"model_path\":\"/models/pi0.gguf\"}",
+              &factory_api, &missing) == -1 &&
+              missing == nullptr,
+          "open rejects incomplete JSON config");
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              "{\"model_family\":\"pi0\",\"model_path\":\"/models/pi0.gguf\","
+              "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
+              "\"backend\":\"cpu\",\"n_views\":2,\"image_height\":224,"
+              "\"image_width\":224,\"image_channels\":3,\"state_dim\":8,"
+              "\"action_steps\":2,\"action_dim\":2,\"unexpected\":1}",
+              &factory_api, &missing) == -1 &&
+              missing == nullptr,
+          "open rejects unknown JSON fields");
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              "{\"model_family\":\"pi0\",\"model_family\":\"pi0\","
+              "\"model_path\":\"/models/pi0.gguf\","
+              "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
+              "\"backend\":\"cpu\",\"n_views\":2,\"image_height\":224,"
+              "\"image_width\":224,\"image_channels\":3,\"state_dim\":8,"
+              "\"action_steps\":2,\"action_dim\":2}",
+              &factory_api, &missing) == -1 &&
+              missing == nullptr,
+          "open rejects duplicate JSON fields");
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              "{\"model_family\":\"llm\",\"model_path\":\"/models/pi0.gguf\","
+              "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
+              "\"backend\":\"cpu\",\"n_views\":2,\"image_height\":224,"
+              "\"image_width\":224,\"image_channels\":3,\"state_dim\":8,"
+              "\"action_steps\":2,\"action_dim\":2}",
+              &factory_api, &missing) == -1 &&
+              missing == nullptr,
+          "open rejects non-Pi0 model family");
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              "{\"model_family\":\"pi0\",\"model_path\":\"/models/pi0.gguf\","
+              "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
+              "\"backend\":\"cpu\",\"n_views\":0,\"image_height\":224,"
+              "\"image_width\":224,\"image_channels\":3,\"state_dim\":8,"
+              "\"action_steps\":2,\"action_dim\":2}",
+              &factory_api, &missing) == -1 &&
+              missing == nullptr,
+          "open rejects zero-sized numeric config fields");
+    FakeFactory borrowed_factory = factory;
+    borrowed_factory.engine = &factory_engine;
+    borrowed_factory.return_borrowed = true;
+    frt_llama_cpp_engine_factory_v1 borrowed_factory_api = factory_api;
+    borrowed_factory_api.self = &borrowed_factory;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              open_json, &borrowed_factory_api, &missing) == -1 &&
+              missing == nullptr,
+          "open rejects borrowed engines from factories");
+    const int releases_before_invalid_engine = factory_engine.releases;
+    FakeFactory invalid_factory = factory;
+    invalid_factory.engine = &factory_engine;
+    invalid_factory.return_undersized = true;
+    frt_llama_cpp_engine_factory_v1 invalid_factory_api = factory_api;
+    invalid_factory_api.self = &invalid_factory;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              open_json, &invalid_factory_api, &missing) == -1 &&
+              missing == nullptr &&
+              factory_engine.releases == releases_before_invalid_engine,
+          "open rejects undersized factory engines without calling release");
+    invalid_factory = factory;
+    invalid_factory.engine = &factory_engine;
+    invalid_factory.return_null_self = true;
+    invalid_factory_api.self = &invalid_factory;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              open_json, &invalid_factory_api, &missing) == -1 &&
+              missing == nullptr &&
+              factory_engine.releases == releases_before_invalid_engine,
+          "open rejects null factory engine self without calling release");
+    invalid_factory = factory;
+    invalid_factory.engine = &factory_engine;
+    invalid_factory.return_retain_only = true;
+    invalid_factory_api.self = &invalid_factory;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              open_json, &invalid_factory_api, &missing) == -1 &&
+              missing == nullptr &&
+              factory_engine.releases == releases_before_invalid_engine,
+          "open rejects asymmetric factory engines without calling release");
+    invalid_factory = factory;
+    invalid_factory.engine = &factory_engine;
+    invalid_factory.return_missing_set_input = true;
+    invalid_factory_api.self = &invalid_factory;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              open_json, &invalid_factory_api, &missing) == -1 &&
+              missing == nullptr &&
+              factory_engine.releases == releases_before_invalid_engine,
+          "open rejects factory engines missing hot-path hooks without release");
+    invalid_factory = factory;
+    invalid_factory.engine = &factory_engine;
+    invalid_factory.fail_after_engine = true;
+    invalid_factory_api.self = &invalid_factory;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              open_json, &invalid_factory_api, &missing) == -7 &&
+              missing == nullptr &&
+              factory_engine.releases == releases_before_invalid_engine,
+          "open ignores out_engine when factory create fails");
 
     std::printf(g_fail ? "\n== LLAMA_CPP PROVIDER FAILED ==\n"
                        : "\n== LLAMA_CPP PROVIDER PASSED ==\n");
