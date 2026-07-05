@@ -223,6 +223,12 @@ extern "C" int frt_runtime_builder_set_manifest(frt_runtime_builder b,
     return 0;
 }
 
+extern "C" void frt_runtime_builder_discard(frt_runtime_builder b) {
+    if (!b) return;
+    delete b->h;
+    delete b;
+}
+
 extern "C" uint64_t frt_runtime_fingerprint(const void* data, size_t len) {
     /* FNV-1a 64 — deterministic, dependency-free. An identity guard against
      * accidental mismatch, not an adversarial hash. */
@@ -242,8 +248,10 @@ extern "C" frt_runtime_export_v1* frt_runtime_builder_finish(
     /* Ports/stages declare a MODEL runtime; a plain export cannot carry
      * them — use frt_runtime_builder_finish_model instead. */
     if (!b->h->ports.empty() || !b->h->stages.empty() ||
-        !b->h->stages_v2.empty()) return nullptr;
-    if (b->provider_owned) return nullptr;
+        !b->h->stages_v2.empty() || b->provider_owned) {
+        frt_runtime_builder_discard(b);
+        return nullptr;
+    }
     Holder* h = b->h;
     frt_rt::finish_export_into(h, b, owner, retain_owner, release_owner);
     delete b;  /* h lives on inside the export */

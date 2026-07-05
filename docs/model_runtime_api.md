@@ -172,6 +172,12 @@ identity is unchanged.
 (`flash_rt/models/pi05/runtime_export.py`, via
 `flash_rt.runtime.export.build_model_runtime`) and the native Pi0.5 verb
 overlay `frt_pi05_model_runtime_create_over` (`cpp/models/pi05/`).
+The initial llama.cpp/GGML Pi0 provider boundary lives at
+`cpp/providers/llama_cpp/`: it exposes a `frt_model_runtime_v2` wrapper with
+`images`, `prompt`, `state`, `actions` staged ports and one provider-owned
+`infer` callback stage. The actual Jetson-PI/GGML engine remains behind an
+explicit injected engine interface; until that engine is wired, the wrapper does
+not fabricate inference or expose GGML types.
 
 ## Producer layout: model contract vs hardware pipeline
 

@@ -95,18 +95,27 @@ target_link_libraries(flashrt_cpp_pi05_c
 target_include_directories(flashrt_cpp_pi05_c
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 
+add_library(flashrt_cpp_llama_cpp_provider STATIC
+  providers/llama_cpp/src/pi0_runtime.cpp)
+target_link_libraries(flashrt_cpp_llama_cpp_provider
+  PUBLIC flashrt_runtime)
+target_include_directories(flashrt_cpp_llama_cpp_provider
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/llama_cpp/include)
+
 if(BUILD_TESTING)
   add_executable(test_cpp_modalities tests/test_modalities.cpp)
   target_link_libraries(test_cpp_modalities
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
   add_test(NAME cpp_modalities COMMAND test_cpp_modalities)
 
-  add_executable(test_pi05_runtime tests/test_pi05_runtime.cpp)
-  target_link_libraries(test_pi05_runtime
-    PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
-  add_test(NAME pi05_runtime COMMAND test_pi05_runtime)
+  if(FLASHRT_CPP_WITH_EXEC)
+    add_executable(test_pi05_runtime tests/test_pi05_runtime.cpp)
+    target_link_libraries(test_pi05_runtime
+      PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities flashrt_exec)
+    add_test(NAME pi05_runtime COMMAND test_pi05_runtime)
+  endif()
 
-  if(FLASHRT_CPP_WITH_CUDA_STAGING)
+  if(FLASHRT_CPP_WITH_EXEC AND FLASHRT_CPP_WITH_CUDA_STAGING)
     add_executable(test_device_staging tests/test_device_staging.cpp)
     target_link_libraries(test_device_staging
       PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities CUDA::cudart)
@@ -122,4 +131,9 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_pi05_c flashrt_exec flashrt_runtime CUDA::cudart)
     add_test(NAME pi05_model_runtime COMMAND test_pi05_model_runtime)
   endif()
+
+  add_executable(test_llama_cpp_provider tests/test_llama_cpp_provider.cpp)
+  target_link_libraries(test_llama_cpp_provider
+    PRIVATE flashrt_cpp_llama_cpp_provider flashrt_runtime)
+  add_test(NAME llama_cpp_provider COMMAND test_llama_cpp_provider)
 endif()

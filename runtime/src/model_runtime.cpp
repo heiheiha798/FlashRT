@@ -171,7 +171,10 @@ extern "C" frt_model_runtime_v1* frt_runtime_builder_finish_model(
         void* owner, void (*retain_owner)(void*),
         void (*release_owner)(void*)) {
     if (!b) return nullptr;
-    if (b->provider_owned) return nullptr;
+    if (b->provider_owned) {
+        frt_runtime_builder_discard(b);
+        return nullptr;
+    }
     Holder* h = b->h;
     frt_rt::finish_export_into(h, b, owner, retain_owner, release_owner);
 
@@ -200,21 +203,27 @@ extern "C" frt_model_runtime_v2* frt_runtime_builder_finish_model_v2(
     if (b->provider_owned &&
         (!h->streams.empty() || !h->graphs.empty() || !h->buffers.empty() ||
          !h->regions.empty() || h->stages_v2.empty())) {
+        frt_runtime_builder_discard(b);
         return nullptr;
     }
     if (b->provider_owned) {
-        for (const auto& p : h->ports)
+        for (const auto& p : h->ports) {
             if (p.update != FRT_RT_PORT_STAGED || p.buffer || p.offset ||
                 p.bytes) {
+                frt_runtime_builder_discard(b);
                 return nullptr;
             }
+        }
     }
     for (const auto& s : h->stages_v2) {
-        if (s.kind == FRT_RT_STAGE_GRAPH && s.graph >= h->graphs.size())
+        if (s.kind == FRT_RT_STAGE_GRAPH && s.graph >= h->graphs.size()) {
+            frt_runtime_builder_discard(b);
             return nullptr;
+        }
         if (s.kind == FRT_RT_STAGE_CALLBACK &&
             (!verbs || verbs->struct_size < sizeof(frt_model_runtime_verbs_v2) ||
              !verbs->run_stage)) {
+            frt_runtime_builder_discard(b);
             return nullptr;
         }
     }
