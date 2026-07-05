@@ -83,6 +83,10 @@ UPDATE = {
     "swap": int(_c.PORT_SWAP), "staged": int(_c.PORT_STAGED),
     "setup": int(_c.PORT_SETUP),
 }
+STAGE_KIND = {
+    "graph": int(_c.STAGE_GRAPH),
+    "callback": int(_c.STAGE_CALLBACK),
+}
 
 
 def _enum(table: Mapping[str, int], value: int | str) -> int:
@@ -167,6 +171,15 @@ class StageSpec:
 
 
 @dataclass
+class CallbackStageSpec:
+    """One provider-owned v2 callback stage."""
+
+    name: str
+    callback: int
+    after: Sequence[int] = ()
+
+
+@dataclass
 class RuntimeExport:
     """A finished export. ``ptr`` is the ``frt_runtime_export_v1*`` to hand to a
     native consumer. The export holds one reference; this object anchors every
@@ -212,6 +225,29 @@ class ModelRuntime:
         """Drop the producer's reference (native retains keep it alive)."""
         if self.ptr:
             _c.model_release(self.ptr)
+            self.ptr = 0
+
+
+@dataclass
+class ModelRuntimeV2:
+    """A backend-neutral model runtime with explicit v2 stages."""
+
+    ptr: int
+    export_ptr: int
+    fingerprint: int
+    identity: str
+    manifest: str | None
+    _anchor: Any = field(repr=False, default=None)
+
+    def ports(self) -> list:
+        return list(_c.model_v2_ports(self.ptr))
+
+    def stages(self) -> list:
+        return list(_c.model_stages_v2(self.ptr))
+
+    def release(self) -> None:
+        if self.ptr:
+            _c.model_v2_release(self.ptr)
             self.ptr = 0
 
 
@@ -307,6 +343,77 @@ def build_model_runtime(
     )
 
 
+def build_provider_model_runtime_v2(
+    *,
+    ports: Sequence[PortSpec] = (),
+    stages: Sequence[CallbackStageSpec],
+    identity: Mapping[str, str],
+    manifest_extra: Mapping[str, Any] | None = None,
+    owner: Any = None,
+    set_input=None,
+    get_output=None,
+    prepare=None,
+    step=None,
+    run_stage=None,
+) -> ModelRuntimeV2:
+    """Assemble a provider-owned model runtime.
+
+    This path declares staged ports and callback stages only; it does not
+    create or require a FlashRT exec context, buffers, streams, or graphs.
+    """
+    if run_stage is None:
+        raise ValueError("provider-owned v2 runtimes require run_stage")
+    if not stages:
+        raise ValueError("provider-owned v2 runtimes require at least one stage")
+    b = _c.Builder.provider_owned()
+    for p in ports:
+        if _enum(UPDATE, p.update) != UPDATE["staged"]:
+            raise ValueError("provider-owned ports must use staged updates")
+        if p.buffer is not None:
+            raise ValueError("provider-owned ports must not expose SWAP buffers")
+        if p.offset or p.nbytes is not None:
+            raise ValueError("provider-owned ports must not declare raw windows")
+        b.add_port(p.name, _enum(MODALITY, p.modality), _enum(DTYPE, p.dtype),
+                   _enum(LAYOUT, p.layout), _enum(DIRECTION, p.direction),
+                   _enum(UPDATE, p.update), int(bool(p.required)),
+                   list(p.shape), p.cadence_hz, 0, 0, 0)
+    for st in stages:
+        b.add_callback_stage_v2(st.name, st.callback, list(st.after))
+    for k, v in identity.items():
+        b.add_identity(str(k), str(v))
+
+    manifest = {
+        "ports": [
+            {"name": p.name, "modality": _enum(MODALITY, p.modality),
+             "dtype": _enum(DTYPE, p.dtype), "layout": _enum(LAYOUT, p.layout),
+             "direction": _enum(DIRECTION, p.direction),
+             "update": _enum(UPDATE, p.update), "required": bool(p.required),
+             "shape": list(p.shape), "cadence_hz": p.cadence_hz}
+            for p in ports],
+        "stages_v2": [
+            {"name": st.name, "kind": STAGE_KIND["callback"],
+             "callback": st.callback, "after": list(st.after)}
+            for st in stages],
+    }
+    if manifest_extra:
+        manifest.update(dict(manifest_extra))
+    manifest_json = json.dumps(manifest, sort_keys=True)
+    b.set_manifest(manifest_json)
+
+    anchor = _Anchor([owner, (set_input, get_output, prepare, step, run_stage)])
+    ptr = b.finish_model_v2(anchor, set_input=set_input, get_output=get_output,
+                            prepare=prepare, step=step, run_stage=run_stage)
+    export_ptr = int(_c.model_v2_export_ptr(ptr))
+    return ModelRuntimeV2(
+        ptr=ptr,
+        export_ptr=export_ptr,
+        fingerprint=int(_c.export_fingerprint(export_ptr)),
+        identity=_c.export_identity(export_ptr),
+        manifest=manifest_json,
+        _anchor=anchor,
+    )
+
+
 def _assemble(ctx, *, streams, graphs, buffers, regions, ports, stages,
               identity, manifest_extra, owner):
     if not streams:
@@ -379,11 +486,11 @@ def _assemble(ctx, *, streams, graphs, buffers, regions, ports, stages,
 
 
 __all__ = [
-    "RuntimeExport", "ModelRuntime",
+    "RuntimeExport", "ModelRuntime", "ModelRuntimeV2",
     "StreamSpec", "GraphSpec", "BufferSpec", "RegionSpec", "PortSpec",
-    "StageSpec",
-    "build_export", "build_model_runtime",
+    "StageSpec", "CallbackStageSpec",
+    "build_export", "build_model_runtime", "build_provider_model_runtime_v2",
     "ROLE_INPUT", "ROLE_OUTPUT", "ROLE_STATE", "ROLE_SCRATCH",
     "REGION_SNAPSHOT", "REGION_RESTORE", "REGION_DEFAULT",
-    "MODALITY", "DTYPE", "LAYOUT", "DIRECTION", "UPDATE",
+    "MODALITY", "DTYPE", "LAYOUT", "DIRECTION", "UPDATE", "STAGE_KIND",
 ]

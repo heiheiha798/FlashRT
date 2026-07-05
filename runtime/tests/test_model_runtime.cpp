@@ -24,7 +24,11 @@ static frt_graph  FAKE_G0  = (frt_graph)0x20;
 static frt_graph  FAKE_G1  = (frt_graph)0x21;
 static frt_buffer FAKE_B0  = (frt_buffer)0x30;
 
-struct VerbLog { int set_input = 0, get_output = 0, prepare = 0, step = 0; };
+struct VerbLog {
+    int set_input = 0, get_output = 0, prepare = 0, step = 0, run_stage = 0;
+    uint32_t last_stage = UINT32_MAX;
+    int last_stream = -99;
+};
 static int v_set_input(void* s, uint32_t, const void*, uint64_t, int) {
     ((VerbLog*)s)->set_input++; return 0;
 }
@@ -35,6 +39,13 @@ static int v_prepare(void* s, uint32_t, frt_shape_key) {
     ((VerbLog*)s)->prepare++; return 0;
 }
 static int v_step(void* s) { ((VerbLog*)s)->step++; return 0; }
+static int v_run_stage(void* s, uint32_t stage, int stream) {
+    auto* log = (VerbLog*)s;
+    log->run_stage++;
+    log->last_stage = stage;
+    log->last_stream = stream;
+    return 0;
+}
 static const char* v_last_error(void*) { return ""; }
 
 struct Owner { int retains = 0, releases = 0; };
@@ -293,6 +304,110 @@ int main() {
         over->release(over->owner);
         CHECK(native_owner.releases == 1 && base_owner.releases == 1,
               "override release frees native owner and drops the base model");
+    }
+
+    /* --- v2 provider-owned callback runtime ----------------------------- */
+    {
+        Owner provider_owner;
+        VerbLog provider_vlog;
+        frt_runtime_builder pb = frt_runtime_builder_create_provider_owned();
+
+        const int64_t text_shape[1] = {-1};
+        const int64_t action_shape[2] = {50, 32};
+        CHECK(frt_runtime_builder_add_port(
+                  pb, "prompt", FRT_RT_MOD_TEXT, FRT_RT_DTYPE_U8,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED,
+                  1, text_shape, 1, 0, nullptr, 0, 0) == 0,
+              "provider-owned v2 accepts staged text input");
+        CHECK(frt_runtime_builder_add_port(
+                  pb, "actions", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED,
+                  0, action_shape, 2, 0, nullptr, 0, 0) == 0,
+              "provider-owned v2 accepts staged action output");
+        CHECK(frt_runtime_builder_add_callback_stage_v2(
+                  pb, "infer", 7, nullptr, 0) == 0,
+              "provider-owned v2 accepts callback stage");
+
+        frt_model_runtime_verbs_v2 verbs2{};
+        verbs2.struct_size = sizeof(verbs2);
+        verbs2.set_input = v_set_input;
+        verbs2.get_output = v_get_output;
+        verbs2.prepare = v_prepare;
+        verbs2.step = v_step;
+        verbs2.last_error = v_last_error;
+        verbs2.run_stage = v_run_stage;
+
+        frt_model_runtime_v2* mv2 = frt_runtime_builder_finish_model_v2(
+            pb, &verbs2, &provider_vlog, &provider_owner, owner_retain,
+            owner_release);
+        CHECK(mv2 != nullptr, "finish provider-owned model_runtime_v2");
+        CHECK(mv2->abi_version == FRT_MODEL_RUNTIME_ABI_VERSION_V2 &&
+                  mv2->struct_size == sizeof(frt_model_runtime_v2),
+              "model runtime v2 ABI stamp");
+        CHECK(mv2->exp && mv2->exp->ctx == nullptr &&
+                  mv2->exp->n_graphs == 0,
+              "provider-owned v2 export has no FlashRT exec graph");
+        CHECK(mv2->n_stages == 0 && mv2->n_stages_v2 == 1,
+              "callback stage is visible only in the v2 stage view");
+        CHECK(std::strcmp(mv2->stages_v2[0].name, "infer") == 0 &&
+                  mv2->stages_v2[0].kind == FRT_RT_STAGE_CALLBACK &&
+                  mv2->stages_v2[0].callback == 7,
+              "callback stage descriptor round-trips");
+        std::string id2 = mv2->exp->identity;
+        CHECK(id2.find("stage_v2:0:infer:1:4294967295:7:") !=
+                  std::string::npos,
+              "identity carries v2 callback stage");
+
+        mv2->verbs_v2.run_stage(mv2->self, 0, -1);
+        mv2->verbs_v2.set_input(mv2->self, 0, nullptr, 0, -1);
+        CHECK(provider_vlog.run_stage == 1 &&
+                  provider_vlog.last_stage == 0 &&
+                  provider_vlog.last_stream == -1 &&
+                  provider_vlog.set_input == 1,
+              "v2 verbs dispatch through self");
+        CHECK(provider_owner.retains == 1, "v2 finish retained owner once");
+        mv2->release(mv2->owner);
+        CHECK(provider_owner.releases == 1,
+              "v2 final release frees owner exactly once");
+    }
+
+    {
+        frt_runtime_builder pb = frt_runtime_builder_create_provider_owned();
+        CHECK(frt_runtime_builder_finish_model(pb, nullptr, nullptr, nullptr,
+                                               nullptr, nullptr) == nullptr,
+              "provider-owned builders cannot finish as v1 runtimes");
+    }
+
+    {
+        Owner mixed_owner;
+        VerbLog mixed_vlog;
+        frt_runtime_builder mb = make_builder();
+        const int64_t scalar_shape[1] = {1};
+        CHECK(frt_runtime_builder_add_port(
+                  mb, "input", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED,
+                  1, scalar_shape, 1, 0, nullptr, 0, 0) == 0,
+              "mixed v2 test port");
+        const uint32_t after0[1] = {0};
+        CHECK(frt_runtime_builder_add_graph_stage_v2(
+                  mb, "prefill", 0, nullptr, 0) == 0,
+              "mixed v2 accepts graph stage");
+        CHECK(frt_runtime_builder_add_callback_stage_v2(
+                  mb, "decode", 3, after0, 1) == 0,
+              "mixed v2 accepts callback stage after graph stage");
+        frt_model_runtime_verbs_v2 verbs2{};
+        verbs2.struct_size = sizeof(verbs2);
+        verbs2.step = v_step;
+        verbs2.last_error = v_last_error;
+        verbs2.run_stage = v_run_stage;
+        frt_model_runtime_v2* mv2 = frt_runtime_builder_finish_model_v2(
+            mb, &verbs2, &mixed_vlog, &mixed_owner, owner_retain,
+            owner_release);
+        CHECK(mv2 && mv2->n_stages == 0 && mv2->n_stages_v2 == 2 &&
+                  mv2->stages_v2[1].after[0] == 0,
+              "mixed callback DAG has no legacy graph-only stage view");
+        mv2->release(mv2->owner);
+        CHECK(mixed_owner.releases == 1, "mixed v2 release frees owner");
     }
 
     std::printf(g_fail ? "\n== MODEL RUNTIME ABI FAILED ==\n"

@@ -91,6 +91,18 @@ void finish_export_into(Holder* h, frt_runtime_builder_s* b,
         }
         id += '\n';
     }
+    for (size_t i = 0; i < h->stages_v2.size(); ++i) {
+        const auto& s = h->stages_v2[i];
+        std::snprintf(line, sizeof(line), "stage_v2:%zu:%s:%u:%u:%u:",
+                      i, s.name, s.kind, s.graph, s.callback);
+        id += line;
+        for (uint32_t d = 0; d < s.n_after; ++d) {
+            std::snprintf(line, sizeof(line), "%s%u", d ? "," : "",
+                          s.after[d]);
+            id += line;
+        }
+        id += '\n';
+    }
     h->identity = std::move(id);
 
     h->user_owner = owner;
@@ -122,6 +134,13 @@ extern "C" frt_runtime_builder frt_runtime_builder_create(frt_ctx ctx) {
     if (!ctx) return nullptr;
     auto* b = new frt_runtime_builder_s();
     b->ctx = ctx;
+    b->h = new Holder();
+    return b;
+}
+
+extern "C" frt_runtime_builder frt_runtime_builder_create_provider_owned(void) {
+    auto* b = new frt_runtime_builder_s();
+    b->provider_owned = true;
     b->h = new Holder();
     return b;
 }
@@ -222,7 +241,9 @@ extern "C" frt_runtime_export_v1* frt_runtime_builder_finish(
     if (!b) return nullptr;
     /* Ports/stages declare a MODEL runtime; a plain export cannot carry
      * them — use frt_runtime_builder_finish_model instead. */
-    if (!b->h->ports.empty() || !b->h->stages.empty()) return nullptr;
+    if (!b->h->ports.empty() || !b->h->stages.empty() ||
+        !b->h->stages_v2.empty()) return nullptr;
+    if (b->provider_owned) return nullptr;
     Holder* h = b->h;
     frt_rt::finish_export_into(h, b, owner, retain_owner, release_owner);
     delete b;  /* h lives on inside the export */

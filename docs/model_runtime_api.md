@@ -36,10 +36,16 @@ port, never advertise-and-refuse.
 `bytes` (null buffer = staged-only). Strings/arrays are owned by the runtime
 object and stay valid while a reference is held.
 
-`frt_runtime_stage_desc` — one schedulable stage: `graph` (index into the
+`frt_runtime_stage_desc` — v1 graph-backed stage: `graph` (index into the
 export's graphs) plus `after[n_after]` (earlier stage indices). Declared array
 order is the sequential order `step` uses. Stage streams are not a separate
 field: replay stream comes from the referenced graph descriptor.
+
+`frt_runtime_stage_desc_v2` — v2 backend-neutral stage: `name`, `kind`
+(`GRAPH` or `CALLBACK`), `graph` (for graph-backed stages), `callback` (a
+provider-private executable id), and `after[n_after]`. `CALLBACK` stages are
+executed through `frt_model_runtime_verbs_v2::run_stage`; GGML/llama.cpp
+objects remain provider-private and are not exposed in the ABI.
 
 Graph stream placement and the stage DAG are deployment identity. A cut from
 `full` to `context_action`, a stream move, or a dependency change changes the
@@ -58,6 +64,12 @@ frt_model_runtime_v1 {
 }
 ```
 
+`frt_model_runtime_v2` keeps the v1 prefix concepts (`exp`, `ports`,
+v1-compatible verbs, lifetime) and appends `stages_v2 / n_stages_v2` plus
+`verbs_v2`. Its legacy `stages / n_stages` view is empty when callback stages
+are present, so graph-only consumers do not accidentally treat a provider-owned
+stage as a CUDA graph.
+
 **Verbs** (`frt_model_runtime_verbs`; every entry is always callable — absent
 producer verbs are filled with unsupported stubs returning `-3`):
 
@@ -68,6 +80,10 @@ producer verbs are filled with unsupported stubs returning `-3`):
 | `prepare(self, graph, key)` | WARM only | ensure a shape-bucket variant exists (capture-on-miss); never call inside a tick |
 | `step(self)` | HOT (sugar) | fire all stages in declared order; scheduling hosts fire stages themselves |
 | `last_error(self)` | — | message for the most recent failure |
+
+v2 adds `run_stage(self, stage, stream)`, which executes one v2 stage by index.
+It is required for `CALLBACK` stages. A white-box host may still schedule
+`GRAPH` stages through `exp->graphs`.
 
 Status codes follow the pi05 C face: `0` ok, `-1` invalid, `-2` not found,
 `-3` unsupported, `-4` shape mismatch, `-5` insufficient storage, `-6` backend.
@@ -94,6 +110,24 @@ frt_model_runtime_v1* m = frt_runtime_builder_finish_model(
     b, &verbs, verbs_self, owner, retain_owner, release_owner);
 ```
 
+**Provider-owned v2** — the provider owns execution and exposes staged ports
+plus callback stages, without pretending to have FlashRT exec graphs:
+
+```c
+frt_runtime_builder b = frt_runtime_builder_create_provider_owned();
+frt_runtime_builder_add_port(b, "prompt", FRT_RT_MOD_TEXT, FRT_RT_DTYPE_U8,
+                             FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN,
+                             FRT_RT_PORT_STAGED, 1, shape, rank, 0,
+                             NULL, 0, 0);
+frt_runtime_builder_add_callback_stage_v2(b, "infer", 0, NULL, 0);
+frt_model_runtime_v2* m = frt_runtime_builder_finish_model_v2(
+    b, &verbs_v2, verbs_self, owner, retain_owner, release_owner);
+```
+
+Provider-owned v2 ports are `STAGED` only in this first contract. The builder
+rejects raw SWAP windows on this path until FlashRT has an explicit
+memory-domain contract for cross-provider buffers.
+
 Identity covers each port's schema **and its bound window** (buffer index
 into the declared buffers array, offset, bytes) plus the stage DAG; only
 `cadence_hint_hz` stays out. A port-schema or window change therefore changes
@@ -103,6 +137,7 @@ the fingerprint, and stored state is refused. Canonical record formats:
 port:<i>:<name>:<modality>:<dtype>:<layout>:<dir>:<update>:<req>:<d0,d1,..>:<buf_idx>:<off>:<bytes>
 graph:<name>:<stream_id>
 stage:<i>:<graph>:<after0,after1,..>
+stage_v2:<i>:<name>:<kind>:<graph>:<callback>:<after0,after1,..>
 ```
 
 **Adapter** — wrap an existing export with ports/verbs; identity inherited,

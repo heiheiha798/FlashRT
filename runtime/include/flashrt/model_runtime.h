@@ -56,6 +56,7 @@ extern "C" {
 #endif
 
 #define FRT_MODEL_RUNTIME_ABI_VERSION 1u
+#define FRT_MODEL_RUNTIME_ABI_VERSION_V2 2u
 
 /* ------------------------------------------------------------------ */
 /* Enums — values are ABI-frozen after v1 (append-only).               */
@@ -103,6 +104,11 @@ enum frt_rt_port_update {
     FRT_RT_PORT_SWAP   = 0,
     FRT_RT_PORT_STAGED = 1,
     FRT_RT_PORT_SETUP  = 2
+};
+
+enum frt_rt_stage_kind {
+    FRT_RT_STAGE_GRAPH    = 0,
+    FRT_RT_STAGE_CALLBACK = 1
 };
 
 /* ------------------------------------------------------------------ */
@@ -159,6 +165,19 @@ typedef struct frt_runtime_stage_desc {
     const uint32_t* after;     /* stage indices                            */
 } frt_runtime_stage_desc;
 
+/* v2 stage descriptors keep graph-backed stages explicit while allowing a
+ * provider-owned callback executable. Callback indices are private to the
+ * provider and are executed through frt_model_runtime_verbs_v2::run_stage;
+ * no GGML/llama.cpp/backend type is exposed in the public ABI. */
+typedef struct frt_runtime_stage_desc_v2 {
+    const char* name;          /* stable stage name: "infer", "decode"...  */
+    uint32_t kind;             /* frt_rt_stage_kind                        */
+    uint32_t graph;            /* exp->graphs index, or UINT32_MAX         */
+    uint32_t callback;         /* provider stage id, or UINT32_MAX         */
+    uint32_t n_after;
+    const uint32_t* after;     /* stage indices                            */
+} frt_runtime_stage_desc_v2;
+
 /* ------------------------------------------------------------------ */
 /* Verbs — implemented by the producer, called by the host.            */
 /* set_input / get_output are HOT (contract above); prepare is WARM;   */
@@ -194,6 +213,25 @@ typedef struct frt_model_runtime_verbs {
     const char* (*last_error)(void* self);
 } frt_model_runtime_verbs;
 
+typedef struct frt_model_runtime_verbs_v2 {
+    uint32_t struct_size;      /* = sizeof(frt_model_runtime_verbs_v2)     */
+    uint32_t reserved;
+
+    int (*set_input)(void* self, uint32_t port,
+                     const void* data, uint64_t bytes, int stream);
+    int (*get_output)(void* self, uint32_t port,
+                      void* out, uint64_t capacity, uint64_t* written,
+                      int stream);
+    int (*prepare)(void* self, uint32_t graph, frt_shape_key key);
+    int (*step)(void* self);
+    const char* (*last_error)(void* self);
+
+    /* Execute one v2 stage by index. Required for CALLBACK stages; graph
+     * stages remain directly schedulable through exp->graphs by white-box
+     * hosts. `stream` = an exp stream id, or -1 for the provider default. */
+    int (*run_stage)(void* self, uint32_t stage, int stream);
+} frt_model_runtime_verbs_v2;
+
 /* ------------------------------------------------------------------ */
 /* The model runtime object.                                           */
 /* ------------------------------------------------------------------ */
@@ -219,11 +257,39 @@ typedef struct frt_model_runtime_v1 {
     void (*release)(void* owner);
 } frt_model_runtime_v1;
 
+typedef struct frt_model_runtime_v2 {
+    uint32_t abi_version;      /* = FRT_MODEL_RUNTIME_ABI_VERSION_V2       */
+    uint32_t struct_size;      /* = sizeof(frt_model_runtime_v2)           */
+
+    const frt_runtime_export_v1* exp;
+
+    const frt_runtime_port_desc*  ports;  uint64_t n_ports;
+
+    /* Legacy graph-only view. Empty when v2 stages include provider-owned
+     * callbacks, so old graph schedulers do not misinterpret the DAG. */
+    const frt_runtime_stage_desc* stages; uint64_t n_stages;
+
+    void* self;
+    frt_model_runtime_verbs verbs;       /* v1-compatible verb subset     */
+
+    void* owner;
+    void (*retain)(void* owner);
+    void (*release)(void* owner);
+
+    const frt_runtime_stage_desc_v2* stages_v2;
+    uint64_t n_stages_v2;
+    frt_model_runtime_verbs_v2 verbs_v2;
+} frt_model_runtime_v2;
+
 /* Factory symbol convention for NATIVE model runtimes: a model-runtime .so
  * exports exactly this symbol. Returns a retained object (caller releases). */
 #define FRT_MODEL_RUNTIME_OPEN_V1_SYMBOL "frt_model_runtime_open_v1"
 typedef int (*frt_model_runtime_open_v1_fn)(const char* config_json,
                                             frt_model_runtime_v1** out);
+
+#define FRT_MODEL_RUNTIME_OPEN_V2_SYMBOL "frt_model_runtime_open_v2"
+typedef int (*frt_model_runtime_open_v2_fn)(const char* config_json,
+                                            frt_model_runtime_v2** out);
 
 /* ------------------------------------------------------------------ */
 /* Construction path 1 — INTEGRATED (preferred): the export builder    */
@@ -245,6 +311,21 @@ int frt_runtime_builder_add_port(frt_runtime_builder, const char* name,
 int frt_runtime_builder_add_stage(frt_runtime_builder, uint32_t graph,
                                   const uint32_t* after, uint32_t n_after);
 
+/* Create a builder for provider-owned model runtimes with no FlashRT exec
+ * context. It may only be finished through frt_runtime_builder_finish_model_v2.
+ */
+frt_runtime_builder frt_runtime_builder_create_provider_owned(void);
+
+int frt_runtime_builder_add_graph_stage_v2(frt_runtime_builder,
+                                           const char* name, uint32_t graph,
+                                           const uint32_t* after,
+                                           uint32_t n_after);
+int frt_runtime_builder_add_callback_stage_v2(frt_runtime_builder,
+                                              const char* name,
+                                              uint32_t callback,
+                                              const uint32_t* after,
+                                              uint32_t n_after);
+
 /* Like frt_runtime_builder_finish, but returns the model runtime whose
  * `exp` is the internally-built export (one object, one refcount). `verbs`
  * is copied; entries may be null (the runtime then reports them
@@ -252,6 +333,11 @@ int frt_runtime_builder_add_stage(frt_runtime_builder, uint32_t graph,
 frt_model_runtime_v1* frt_runtime_builder_finish_model(
     frt_runtime_builder,
     const frt_model_runtime_verbs* verbs, void* verbs_self,
+    void* owner, void (*retain_owner)(void*), void (*release_owner)(void*));
+
+frt_model_runtime_v2* frt_runtime_builder_finish_model_v2(
+    frt_runtime_builder,
+    const frt_model_runtime_verbs_v2* verbs, void* verbs_self,
     void* owner, void (*retain_owner)(void*), void (*release_owner)(void*));
 
 /* ------------------------------------------------------------------ */
