@@ -61,9 +61,38 @@ typedef struct frt_llama_cpp_engine_v1 {
     const char* (*last_error)(void* self);
 } frt_llama_cpp_engine_v1;
 
+typedef struct frt_llama_cpp_engine_factory_v1 {
+    uint32_t struct_size;
+    uint32_t reserved;
+
+    void* self;
+    /* Returns one owned engine reference in out_engine. The config pointer
+     * and its string fields are borrowed and valid only for the duration of
+     * the callback; factories must copy anything they keep. The runtime-open
+     * wrapper consumes the returned reference after retaining the model
+     * runtime's own engine reference. Factory-created engines must provide
+     * symmetric retain/release hooks; borrowed engines are only accepted by
+     * the lower create_with_engine entry point. On nonzero return, no engine
+     * ownership is transferred and out_engine is ignored. */
+    int (*create_pi0)(void* self, const frt_llama_cpp_pi0_config* config,
+                      frt_llama_cpp_engine_v1* out_engine);
+    const char* (*last_error)(void* self);
+} frt_llama_cpp_engine_factory_v1;
+
 int frt_llama_cpp_pi0_runtime_create_with_engine(
     const frt_llama_cpp_pi0_config* config,
     const frt_llama_cpp_engine_v1* engine,
+    frt_model_runtime_v2** out);
+
+/* Provider-specific JSON open path for the current dependency-injection
+ * boundary. Required JSON fields:
+ *   model_family="pi0", model_path, mmproj_path, backend,
+ *   n_views, image_height, image_width, image_channels,
+ *   state_dim, action_steps, action_dim.
+ * No field has a default; missing or mismatched fields fail hard. */
+int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+    const char* config_json,
+    const frt_llama_cpp_engine_factory_v1* factory,
     frt_model_runtime_v2** out);
 
 #ifdef __cplusplus
