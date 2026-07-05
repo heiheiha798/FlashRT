@@ -108,9 +108,13 @@ class Qwen3VlFp8Sm89TextFrontend:
             'fp8_block128_gemm_blockscaled_sm89_bf16out',
             'ht_gemv_fp8_block128_m1_w8',
             'ht_gemv_fp8_block128_m1_w16',
+            'ht_gemv_fp8_block128_m1_bf16in_w8',
+            'ht_gemv_fp8_block128_m1_bf16in_w16',
             'fp8_per_token_block128_quant_bf16',
             'rms_norm_to_fp8_block128_bf16',
             'residual_add_rms_norm_to_fp8_block128_bf16',
+            'rms_norm_bf16_out',
+            'residual_add_rms_norm_bf16_out',
             'silu_mul_to_fp8_block128_bf16',
             'silu_mul_merged_to_fp8_block128_bf16',
             'qwen3_qk_norm_rope_kvwrite_bf16',
@@ -314,6 +318,14 @@ class Qwen3VlFp8Sm89TextFrontend:
             scale = torch.empty(1, K // 128, device=device, dtype=fp32)
             out = torch.empty(1, N, device=device, dtype=bf16)
             self._fp8_scratch[(N, K)] = (act, scale, out)
+        # BF16 activation scratch for the bf16in GEMV path (qkv / gate_up in
+        # decode). Keyed by K (activation length); one row each for the qkv
+        # input (K=hidden) and the gate_up input (K=hidden) — both share hidden,
+        # but the cross-layer fusion hands the same buffer to the next layer's
+        # qkv, so a single hidden-length buffer suffices.
+        self._bf16_act_scratch: dict[int, torch.Tensor] = {
+            hidden: torch.empty(1, hidden, device=device, dtype=bf16),
+        }
         self._prefill_fp8_scratch: dict[
             tuple[int, int], tuple[torch.Tensor, ...]] = {}
         for N, K in (
@@ -458,15 +470,16 @@ class Qwen3VlFp8Sm89TextFrontend:
         lw = self._weights.ptrs['layers'][L]
         h2 = h_in.view(1, hidden).contiguous()
 
+        # qkv input: BF16 normed activation (no FP8 quant) → bf16in GEMV.
         if prequant is None:
-            ap, sc, _ = self._fp8_scratch[(self._qkv_N, hidden)]
-            fvk.rms_norm_to_fp8_block128_bf16(
+            ap_bf = self._bf16_act_scratch[hidden]
+            fvk.rms_norm_bf16_out(
                 h2.data_ptr(), int(lw['input_norm_w']),
-                ap.data_ptr(), sc.data_ptr(), 1, hidden, eps, s)
+                ap_bf.data_ptr(), 1, hidden, eps, s)
         else:
-            ap, sc = prequant
-        self._gemv(ap, sc, int(lw['qkv_proj_w']), int(lw['qkv_proj_s']),
-                   self._qkv_out, int(lw['qkv_proj_N']), hidden)
+            ap_bf = prequant
+        self._gemv_bf16in(ap_bf, int(lw['qkv_proj_w']), int(lw['qkv_proj_s']),
+                          self._qkv_out, int(lw['qkv_proj_N']), hidden)
         Nq = n_q * hd
         Nk = n_kv * hd
         qkv_out = self._qkv_out[:1]
@@ -507,23 +520,29 @@ class Qwen3VlFp8Sm89TextFrontend:
 
         attn_proj = o_out.view(1, 1, hidden)
         h_post = self._res_mid[:, :1]
-        ap, sc, gate_out = self._fp8_scratch[(inter, hidden)]
-        fvk.residual_add_rms_norm_to_fp8_block128_bf16(
+        # gate_up input: BF16 normed activation → bf16in GEMV.
+        ap_bf_mlp = self._bf16_act_scratch[hidden]
+        fvk.residual_add_rms_norm_bf16_out(
             h_in.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
             int(lw['post_attn_norm_w']),
-            ap.data_ptr(), sc.data_ptr(), 1, hidden, eps, s)
+            ap_bf_mlp.data_ptr(), 1, hidden, eps, s)
         if self.fuse_gate_up:
-            self._gemv(ap, sc, int(lw['gate_up_w']), int(lw['gate_up_s']),
-                       self._gate_up_out, int(lw['gate_up_N']), hidden)
+            self._gemv_bf16in(ap_bf_mlp, int(lw['gate_up_w']),
+                              int(lw['gate_up_s']), self._gate_up_out,
+                              int(lw['gate_up_N']), hidden)
             gate_out = self._gate_up_out[:, :inter]
             up_out = self._gate_up_out[:, inter:]
         else:
-            self._gemv(ap, sc, int(lw['mlp_gate_w']), int(lw['mlp_gate_s']),
-                       self._gate_out, inter, hidden)
-            self._gemv(ap, sc, int(lw['mlp_up_w']), int(lw['mlp_up_s']),
-                       self._up_out, inter, hidden)
+            self._gemv_bf16in(ap_bf_mlp, int(lw['mlp_gate_w']),
+                              int(lw['mlp_gate_s']), self._gate_out, inter,
+                              hidden)
+            self._gemv_bf16in(ap_bf_mlp, int(lw['mlp_up_w']),
+                              int(lw['mlp_up_s']), self._up_out, inter, hidden)
             gate_out = self._gate_out
             up_out = self._up_out
+        # down_proj stays FP8: silu_mul output is quantized to FP8 (the silu
+        # result has a wide dynamic range and the FP8 path here is already at
+        # roofline; bf16in down-proj would need a separate BF16 silu kernel).
         ap, sc, down_out = self._fp8_scratch[(hidden, inter)]
         fvk.silu_mul_to_fp8_block128_bf16(
             gate_out.data_ptr(), up_out.data_ptr(),
@@ -535,12 +554,12 @@ class Qwen3VlFp8Sm89TextFrontend:
                  else self._layer_out_b)[:, :1]
         mlp_out = down_out.view(1, 1, hidden)
         if next_input_norm_w:
-            next_ap, next_sc, _ = self._fp8_scratch[(self._qkv_N, hidden)]
-            fvk.residual_add_rms_norm_to_fp8_block128_bf16(
+            next_ap_bf = self._bf16_act_scratch[hidden]
+            fvk.residual_add_rms_norm_bf16_out(
                 h_post.data_ptr(), mlp_out.data_ptr(), h_out.data_ptr(),
                 int(next_input_norm_w),
-                next_ap.data_ptr(), next_sc.data_ptr(), 1, hidden, eps, s)
-            return h_out, (next_ap, next_sc)
+                next_ap_bf.data_ptr(), 1, hidden, eps, s)
+            return h_out, next_ap_bf
         if final_norm_w:
             fvk.residual_add_rms_norm(
                 h_post.data_ptr(), mlp_out.data_ptr(),

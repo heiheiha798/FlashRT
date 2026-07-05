@@ -244,6 +244,33 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("output_scale"), py::arg("M"), py::arg("K"),
         py::arg("stream") = 0);
 
+    // BF16-output norm variants: skip the FP8 quant pass, emit BF16 activations
+    // for the bf16in GEMV path (qkv / gate_up in decode).
+    m.def("rms_norm_bf16_out",
+        [](uintptr_t input, uintptr_t weight, uintptr_t output,
+           int M, int K, float eps, uintptr_t stream) {
+            flash_rt::quantize::rms_norm_bf16_out(
+                to_ptr(input), to_ptr(weight), to_ptr(output),
+                M, K, eps, to_stream(stream));
+        },
+        py::arg("input"), py::arg("weight"), py::arg("output"),
+        py::arg("M"), py::arg("K"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
+    m.def("residual_add_rms_norm_bf16_out",
+        [](uintptr_t residual, uintptr_t x, uintptr_t residual_out,
+           uintptr_t weight, uintptr_t output,
+           int M, int K, float eps, uintptr_t stream) {
+            flash_rt::quantize::residual_add_rms_norm_bf16_out(
+                to_ptr(residual), to_ptr(x), to_ptr(residual_out),
+                to_ptr(weight), to_ptr(output),
+                M, K, eps, to_stream(stream));
+        },
+        py::arg("residual"), py::arg("x"), py::arg("residual_out"),
+        py::arg("weight"), py::arg("output"),
+        py::arg("M"), py::arg("K"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
     m.def("fp8_block128_gemm_blockscaled_sm89_bf16out",
         [](uintptr_t A, uintptr_t B, uintptr_t D,
            int M, int N, int K,

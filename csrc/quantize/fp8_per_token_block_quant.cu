@@ -210,6 +210,36 @@ __global__ void rms_norm_to_fp8_block128_kernel(
   }
 }
 
+// BF16-output variant of rms_norm_to_fp8_block128_kernel: RMSNorm only, no FP8
+// quantization. Output is BF16 so the downstream GEMV can use the bf16in kernel
+// (BF16 activation x FP8 weight with block-128 scale), eliminating the per-step
+// FP8 quant overhead. M=1 decode only; K must be a multiple of 128.
+__global__ void rms_norm_bf16_out_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    int K, float eps)
+{
+  const int m = blockIdx.x;
+  const int t = threadIdx.x;
+  const __nv_bfloat16* row = input + (size_t)m * K;
+  __nv_bfloat16* out = output + (size_t)m * K;
+
+  float ssq = 0.0f;
+  for (int i = t; i < K; i += kBlock) {
+    const float v = __bfloat162float(row[i]);
+    ssq += v * v;
+  }
+  __shared__ float red[4];
+  const float inv_rms = rsqrtf(block_reduce_sum_128(ssq, red) / K + eps);
+
+  for (int i = t; i < K; i += kBlock) {
+    const float v = __bfloat162float(row[i]) * inv_rms *
+                    __bfloat162float(weight[i]);
+    out[i] = __float2bfloat16(v);
+  }
+}
+
 __global__ void residual_add_rms_norm_to_fp8_block128_kernel(
     const __nv_bfloat16* __restrict__ residual,
     const __nv_bfloat16* __restrict__ x,
@@ -256,6 +286,44 @@ __global__ void residual_add_rms_norm_to_fp8_block128_kernel(
     float q = v / sc;
     q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
     out[i] = __nv_fp8_e4m3(q);
+  }
+}
+
+// BF16-output variant of residual_add_rms_norm_to_fp8_block128_kernel:
+// residual add + RMSNorm (2 passes), skipping the 3rd FP8-quant pass. Output is
+// BF16 so the downstream GEMV can use the bf16in kernel. Same residual_out
+// semantics as the FP8 version (separate buffer, residual input preserved).
+// M=1 decode; K multiple of 128.
+__global__ void residual_add_rms_norm_bf16_out_kernel(
+    const __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ residual_out,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ output,
+    int K, float eps)
+{
+  const int m = blockIdx.x;
+  const int t = threadIdx.x;
+  const __nv_bfloat16* rrow = residual + (size_t)m * K;
+  const __nv_bfloat16* xrow = x + (size_t)m * K;
+  __nv_bfloat16* res_out = residual_out + (size_t)m * K;
+  __nv_bfloat16* out = output + (size_t)m * K;
+
+  float ssq = 0.0f;
+  for (int i = t; i < K; i += kBlock) {
+    const float rv = __bfloat162float(rrow[i]) + __bfloat162float(xrow[i]);
+    const __nv_bfloat16 rb = __float2bfloat16(rv);
+    res_out[i] = rb;
+    const float rbf = __bfloat162float(rb);
+    ssq += rbf * rbf;
+  }
+  __shared__ float red[4];
+  const float inv_rms = rsqrtf(block_reduce_sum_128(ssq, red) / K + eps);
+
+  for (int i = t; i < K; i += kBlock) {
+    const float v = __bfloat162float(res_out[i]) * inv_rms *
+                    __bfloat162float(weight[i]);
+    out[i] = __float2bfloat16(v);
   }
 }
 
@@ -388,6 +456,44 @@ void residual_add_rms_norm_to_fp8_block128_bf16(
       reinterpret_cast<const __nv_bfloat16*>(weight),
       reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
       output_scale, K, eps);
+}
+
+void rms_norm_bf16_out(
+    const void* input,
+    const void* weight,
+    void* output,
+    int M, int K, float eps,
+    cudaStream_t stream)
+{
+  if ((K % kBlock) != 0)
+    throw std::runtime_error(
+        "rms_norm_bf16_out requires K multiple of 128");
+  rms_norm_bf16_out_kernel<<<M, kBlock, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(input),
+      reinterpret_cast<const __nv_bfloat16*>(weight),
+      reinterpret_cast<__nv_bfloat16*>(output),
+      K, eps);
+}
+
+void residual_add_rms_norm_bf16_out(
+    const void* residual,
+    const void* x,
+    void* residual_out,
+    const void* weight,
+    void* output,
+    int M, int K, float eps,
+    cudaStream_t stream)
+{
+  if ((K % kBlock) != 0)
+    throw std::runtime_error(
+        "residual_add_rms_norm_bf16_out requires K multiple of 128");
+  residual_add_rms_norm_bf16_out_kernel<<<M, kBlock, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(residual),
+      reinterpret_cast<const __nv_bfloat16*>(x),
+      reinterpret_cast<__nv_bfloat16*>(residual_out),
+      reinterpret_cast<const __nv_bfloat16*>(weight),
+      reinterpret_cast<__nv_bfloat16*>(output),
+      K, eps);
 }
 
 void silu_mul_to_fp8_block128_bf16(
