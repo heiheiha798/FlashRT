@@ -34,9 +34,9 @@ endif()
 if(FLASHRT_CPP_WITH_JETSON_PI AND NOT BUILD_TESTING)
   message(FATAL_ERROR
     "FLASHRT_CPP_WITH_JETSON_PI currently requires BUILD_TESTING=ON "
-    "(the Jetson-PI integration is exercised through a link-check test target).")
+    "(the Jetson-PI integration is exercised through test targets).")
 endif()
-if(FLASHRT_CPP_WITH_JETSON_PI AND BUILD_TESTING)
+if(FLASHRT_CPP_WITH_JETSON_PI)
   if(NOT JETSON_PI_ROOT OR NOT EXISTS "${JETSON_PI_ROOT}/CMakeLists.txt")
     message(FATAL_ERROR "FLASHRT_CPP_WITH_JETSON_PI requires -DJETSON_PI_ROOT=/path/to/Jetson-PI")
   endif()
@@ -45,7 +45,7 @@ if(FLASHRT_CPP_WITH_JETSON_PI AND BUILD_TESTING)
   # so the "mtmd without the full tools tree" isolation holds.
   set(LLAMA_BUILD_COMMON ON CACHE BOOL "llama: build common utils library" FORCE)
   set(LLAMA_CURL OFF CACHE BOOL "llama: use libcurl to download model from an URL" FORCE)
-  set(LLAMA_HTTPLIB OFF CACHE BOOL "llama: disable httplib (FlashRT link check needs no HTTP)" FORCE)
+  set(LLAMA_HTTPLIB OFF CACHE BOOL "llama: disable httplib (FlashRT integration needs no HTTP)" FORCE)
   set(LLAMA_BUILD_TESTS OFF CACHE BOOL "llama: build tests" FORCE)
   set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "llama: build tools" FORCE)
   set(JETSON_PI_BUILD_MTMD ON CACHE BOOL "Jetson-PI: build the mtmd library without the full tools tree" FORCE)
@@ -128,11 +128,14 @@ target_link_libraries(flashrt_cpp_llama_cpp_provider
   PUBLIC flashrt_runtime)
 target_include_directories(flashrt_cpp_llama_cpp_provider
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/llama_cpp/include)
-if(FLASHRT_CPP_WITH_JETSON_PI AND BUILD_TESTING)
+if(FLASHRT_CPP_WITH_JETSON_PI)
   target_sources(flashrt_cpp_llama_cpp_provider
-    PRIVATE providers/llama_cpp/src/jetson_pi_link_check.cpp)
+    PRIVATE providers/llama_cpp/src/jetson_pi_engine.cpp
+            providers/llama_cpp/src/jetson_pi_link_check.cpp)
   target_link_libraries(flashrt_cpp_llama_cpp_provider
-    PRIVATE mtmd llama)
+    PRIVATE jetson_pi_pi0)
+  target_compile_definitions(flashrt_cpp_llama_cpp_provider
+    PRIVATE FLASHRT_CPP_WITH_JETSON_PI=1)
 endif()
 
 if(BUILD_TESTING)
@@ -177,5 +180,14 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_llama_cpp_provider)
     add_test(NAME llama_cpp_jetson_pi_link
       COMMAND test_llama_cpp_jetson_pi_link)
+
+    add_executable(test_llama_cpp_jetson_pi_engine
+      tests/test_llama_cpp_jetson_pi_engine.cpp)
+    target_link_libraries(test_llama_cpp_jetson_pi_engine
+      PRIVATE flashrt_cpp_llama_cpp_provider jetson_pi_pi0)
+    target_include_directories(test_llama_cpp_jetson_pi_engine
+      PRIVATE ${JETSON_PI_ROOT}/vendor)   # stb_image.h for fixture loading
+    add_test(NAME llama_cpp_jetson_pi_engine
+      COMMAND test_llama_cpp_jetson_pi_engine)
   endif()
 endif()

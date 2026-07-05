@@ -35,7 +35,6 @@ typedef struct frt_llama_cpp_pi0_config {
     uint32_t image_height;
     uint32_t image_width;
     uint32_t image_channels;
-    uint32_t state_dim;
     uint32_t action_steps;
     uint32_t action_dim;
 } frt_llama_cpp_pi0_config;
@@ -88,7 +87,7 @@ int frt_llama_cpp_pi0_runtime_create_with_engine(
  * boundary. Required JSON fields:
  *   model_family="pi0", model_path, mmproj_path, backend,
  *   n_views, image_height, image_width, image_channels,
- *   state_dim, action_steps, action_dim.
+ *   action_steps, action_dim.
  * No field has a default; missing or mismatched fields fail hard. */
 int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
     const char* config_json,
