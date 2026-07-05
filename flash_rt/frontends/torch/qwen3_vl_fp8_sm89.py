@@ -533,6 +533,9 @@ class Qwen3VlFp8Sm89TextFrontend:
 
     def _layer_forward_prefill_fp8_blockscaled(self, L: int, h_in_S, cos_S,
                                            sin_S, start_pos: int, S: int,
+                                           *,
+                                           prequant=None,
+                                           next_input_norm_w: int = 0,
                                            final_norm_w: int = 0,
                                            final_norm_out=None):
         import torch
@@ -551,10 +554,15 @@ class Qwen3VlFp8Sm89TextFrontend:
         lw = self._weights.ptrs['layers'][L]
         h2 = h_in_S.view(S, hidden)
 
-        ap_h, sc_h, qkv_out = self._prefill_fp8_scratch[(n_q * hd + 2 * n_kv * hd, hidden)]
-        fvk.rms_norm_to_fp8_block128_bf16(
-            h2.data_ptr(), int(lw['input_norm_w']),
-            ap_h.data_ptr(), sc_h.data_ptr(), S, hidden, eps, s)
+        qkv_N = n_q * hd + 2 * n_kv * hd
+        if prequant is None:
+            ap_h, sc_h, qkv_out = self._prefill_fp8_scratch[(qkv_N, hidden)]
+            fvk.rms_norm_to_fp8_block128_bf16(
+                h2.data_ptr(), int(lw['input_norm_w']),
+                ap_h.data_ptr(), sc_h.data_ptr(), S, hidden, eps, s)
+        else:
+            ap_h, sc_h = prequant
+            qkv_out = self._prefill_fp8_scratch[(qkv_N, hidden)][2]
         self._prefill_gemm(
             ap_h, sc_h, int(lw['qkv_proj_w']), int(lw['qkv_proj_s']),
             qkv_out, int(lw['qkv_proj_N']), hidden, S)
@@ -632,11 +640,19 @@ class Qwen3VlFp8Sm89TextFrontend:
                 down_out[:S].view(1, S, hidden).contiguous().data_ptr(),
                 final_norm_w, final_norm_out.data_ptr(),
                 S, hidden, eps, s)
-            return final_norm_out.view(1, S, hidden)
+            return final_norm_out.view(1, S, hidden), None
         h_out = (self._layer_out_a if (L % 2 == 0)
                  else self._layer_out_b)[:, :S]
-        torch.add(h_post, down_out[:S].view(1, S, hidden), out=h_out)
-        return h_out
+        mlp_out = down_out[:S].view(1, S, hidden)
+        if next_input_norm_w:
+            next_ap, next_sc, _ = self._prefill_fp8_scratch[(qkv_N, hidden)]
+            fvk.residual_add_rms_norm_to_fp8_block128_bf16(
+                h_post.data_ptr(), mlp_out.data_ptr(), h_out.data_ptr(),
+                int(next_input_norm_w),
+                next_ap.data_ptr(), next_sc.data_ptr(), S, hidden, eps, s)
+            return h_out, (next_ap, next_sc)
+        torch.add(h_post, mlp_out, out=h_out)
+        return h_out, None
 
     def forward_hidden_prefill_fp8_blockscaled(self, h_S, cos_S, sin_S,
                                            start_pos: int = 0,
@@ -663,20 +679,27 @@ class Qwen3VlFp8Sm89TextFrontend:
         last_has_ds = (deepstack_by_layer is not None
                        and (n_layers - 1) in deepstack_by_layer)
         h = h_S.view(1, S, hidden).to(torch.bfloat16).contiguous()
+        prequant = None
         for L in range(n_layers):
+            next_norm = 0
             fnw = 0
             fno = None
-            if L + 1 == n_layers and not last_has_ds:
+            if L + 1 < n_layers:
+                next_norm = int(
+                    self._weights.ptrs['layers'][L + 1]['input_norm_w'])
+            elif not last_has_ds:
                 fnw = final_norm_ptr
                 fno = self._last_hidden_buf[:, :S].view(S, hidden)
-            h = self._layer_forward_prefill_fp8_blockscaled(
+            h, prequant = self._layer_forward_prefill_fp8_blockscaled(
                 L, h, cos_S, sin_S, start_pos, S,
+                prequant=prequant, next_input_norm_w=next_norm,
                 final_norm_w=fnw, final_norm_out=fno)
             if deepstack_by_layer is not None and L in deepstack_by_layer:
                 for a, b, ds in deepstack_by_layer[L]:
                     self._fvk.residual_add(
                         h[0, a:b].data_ptr(), ds.data_ptr(),
                         (b - a) * hidden, s)
+                prequant = None
 
         self._cur_pos = start_pos + S
         if not last_has_ds:
