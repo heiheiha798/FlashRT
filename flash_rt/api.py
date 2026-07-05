@@ -299,7 +299,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fp16=False,
                use_fp8=True,
                state_prompt_mode="exact",
-               state_prompt_fixed_max_len=None):
+               state_prompt_fixed_max_len=None,
+               *,
+               mmproj_path=None,
+               backend="cpu",
+               action_steps=None,
+               action_dim=None,
+               lib_path=None):
     """Load a FlashRT model.
 
     Args:
@@ -419,15 +425,36 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     Returns:
         VLAModel instance with .predict() method.
     """
-    if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
+    if framework == "jetson_pi":
+        # The Jetson-PI provider only serves Pi0 today; config is implied.
+        if config not in ("pi0", "pi05"):
+            logger.warning(
+                "framework='jetson_pi' serves Pi0; config=%r ignored.", config)
+    elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, nexn2")
-    if framework not in ("torch", "jax"):
+    if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
-            f"Unknown framework: {framework}. Supported: torch, jax")
+            f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
+
+    # ── Jetson-PI (llama.cpp/GGML) provider — Phase 2 ──
+    # Drives the Jetson-PI Pi0 provider through the frt_model_runtime_v2 C ABI
+    # via ctypes. No torch/jax, no GPU arch detection. The Pi0 action chunk
+    # shape is passed explicitly by the caller (e.g. 10x32 for pi0_base).
+    if framework == "jetson_pi":
+        from flash_rt.frontends.jetson_pi.pi0 import Pi0JetsonPiFrontend
+        pipe = Pi0JetsonPiFrontend(
+            checkpoint,
+            mmproj_path=mmproj_path,
+            backend=backend,
+            num_views=num_views,
+            action_steps=action_steps,
+            action_dim=action_dim,
+            lib_path=lib_path)
+        return VLAModel(pipe, framework)
 
     # When use_fp4=True, the default resolves to the best-known production
     # FP4 config (full 18 encoder FFN layers + AWQ + P1 split-GU). Passing
