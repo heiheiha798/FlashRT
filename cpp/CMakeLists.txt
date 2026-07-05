@@ -136,6 +136,22 @@ if(FLASHRT_CPP_WITH_JETSON_PI)
     PRIVATE jetson_pi_pi0)
   target_compile_definitions(flashrt_cpp_llama_cpp_provider
     PRIVATE FLASHRT_CPP_WITH_JETSON_PI=1)
+
+  # SHARED variant for Python ctypes consumption (Phase 2). Same sources as the
+  # STATIC provider minus the test-only link check; exports
+  # frt_llama_cpp_default_engine_factory + frt_llama_cpp_pi0_runtime_open_with_engine_factory
+  # for dlopen. Linux default visibility exposes the extern "C" symbols.
+  add_library(flashrt_cpp_llama_cpp_provider_c SHARED
+    providers/llama_cpp/src/pi0_runtime.cpp
+    providers/llama_cpp/src/jetson_pi_engine.cpp)
+  target_link_libraries(flashrt_cpp_llama_cpp_provider_c
+    PUBLIC flashrt_runtime jetson_pi_pi0)
+  target_include_directories(flashrt_cpp_llama_cpp_provider_c
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/llama_cpp/include)
+  target_compile_definitions(flashrt_cpp_llama_cpp_provider_c
+    PRIVATE FLASHRT_CPP_WITH_JETSON_PI=1)
+  set_target_properties(flashrt_cpp_llama_cpp_provider_c PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
 endif()
 
 if(BUILD_TESTING)
