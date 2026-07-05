@@ -1,13 +1,24 @@
 // End-to-end Pi0 engine test: drives the real Jetson-PI engine factory with
-// the LIBERO Pi0 weights (when available) and asserts a sane action chunk.
-// Skips (returns 0) when the weights/fixture env vars are unset, so CI without
-// weights still passes.
+// Pi0 weights (when available) and asserts a sane action chunk. Skips (returns
+// 0) when the weights/fixture env vars are unset, so CI without weights still
+// passes.
+//
+// Coverage:
+//   A. bogus model path fails cleanly (no-weights contract)
+//   B. end-to-end single Pi0 tick: set_input images/prompt/state -> run_stage
+//      infer -> get_output actions; asserts shape, no NaN/Inf, non-zero.
+//   C. config vs model action_dim mismatch: open must reject (engine freed).
+//   D. multi-tick: a second infer with fresh inputs must (1) return -7 from
+//      get_output after set_input but before run_infer (staleness guard),
+//      and (2) reproduce the first tick's actions (KV reset, no leak).
 //
 // Env:
 //   FLASHRT_PI0_MODEL        path to Pi0 policy GGUF
 //   FLASHRT_PI0_MMPROJ       path to VIT mmproj GGUF
 //   FLASHRT_PI0_FIXTURE_DIR  dir containing image.png, wrist_image.png,
 //                            state.bin (action_dim float32), prompt.txt
+//   FLASHRT_PI0_ACTION_STEPS (optional) override; default 50 (LIBERO base).
+//   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
@@ -97,13 +108,35 @@ int main() {
     // Action dims come from env (default 50x32 for LIBERO base; pi0_base is 10x32).
     const char * steps_env = std::getenv("FLASHRT_PI0_ACTION_STEPS");
     const char * dim_env   = std::getenv("FLASHRT_PI0_ACTION_DIM");
-    const long action_steps = steps_env ? std::atol(steps_env) : 50;
-    const long action_dim   = dim_env   ? std::atol(dim_env)   : 32;
+    long action_steps = steps_env ? std::atol(steps_env) : 50;
+    long action_dim   = dim_env   ? std::atol(dim_env)   : 32;
     if (action_steps <= 0 || action_dim <= 0 || action_steps > 10000 ||
         action_dim > 10000) {
         std::printf("SKIP - bad FLASHRT_PI0_ACTION_STEPS/DIM\n");
         return 0;
     }
+
+    // ---- sub-test C: config vs model action_dim mismatch fails cleanly ----
+    // Real model is 10x32 (or whatever env says); claim a wrong action_dim
+    // and expect create_pi0 to reject without leaking the opened engine.
+    {
+        std::string mismatch_json =
+            std::string("{") +
+            "\"model_family\":\"pi0\","
+            "\"model_path\":\"" + model_env + "\","
+            "\"mmproj_path\":\"" + mmproj_env + "\","
+            "\"backend\":\"cpu\","
+            "\"n_views\":2,\"image_height\":224,\"image_width\":224,"
+            "\"image_channels\":3,\"action_steps\":" +
+            std::to_string(action_steps) +
+            ",\"action_dim\":" + std::to_string(action_dim + 1) + "}";
+        frt_model_runtime_v2 * m = nullptr;
+        int mrc = frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+            mismatch_json.c_str(), factory, &m);
+        CHECK(mrc != 0 && m == nullptr,
+              "open rejects action_dim mismatch with model");
+    }
+
     std::string json =
         std::string("{") +
         "\"model_family\":\"pi0\","
@@ -193,6 +226,56 @@ int main() {
             }
             CHECK(!nan_inf, "actions contain no NaN/Inf");
             CHECK(!all_zero, "actions are not all zero");
+        }
+
+        // ---- multi-tick: a second infer with fresh inputs must not leak the
+        // first tick's KV (KV reset) nor return the first tick's actions
+        // (staleness guard). We reuse the same inputs; the action should
+        // reproduce within tolerance, and a get_output before run_infer (after
+        // set_input) must return -7 (actions not ready). ----
+        CHECK(model->verbs_v2.set_input(model->self,
+                                        FRT_LLAMA_CPP_PI0_PORT_IMAGES,
+                                        &views[0], sizeof(views), -1) == 0,
+              "tick2 set_input images");
+        CHECK(model->verbs_v2.set_input(model->self,
+                                        FRT_LLAMA_CPP_PI0_PORT_PROMPT,
+                                        prompt.data(), prompt.size(), -1) == 0,
+              "tick2 set_input prompt");
+        CHECK(model->verbs_v2.set_input(model->self,
+                                        FRT_LLAMA_CPP_PI0_PORT_STATE,
+                                        state_bytes.data(),
+                                        state_bytes.size(), -1) == 0,
+              "tick2 set_input state");
+        // set_input must have invalidated actions_buf: get_output now -7.
+        {
+            uint64_t w2 = 0;
+            int rc2 = model->verbs_v2.get_output(
+                model->self, FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
+                actions.data(), actions.size() * sizeof(float), &w2, -1);
+            CHECK(rc2 != 0,
+                  "get_output after set_input (before run_infer) fails");
+        }
+        CHECK(model->verbs_v2.run_stage(
+                  model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER, -1) == 0,
+              "tick2 run_stage infer");
+        std::vector<float> actions2(
+            static_cast<size_t>(action_steps) * action_dim);
+        written = 0;
+        rc = model->verbs_v2.get_output(
+            model->self, FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
+            actions2.data(), actions2.size() * sizeof(float), &written, -1);
+        CHECK(rc == 0 &&
+                  written == static_cast<uint64_t>(action_steps) * action_dim *
+                                 sizeof(float),
+              "tick2 get_output actions shape matches config");
+        if (rc == 0) {
+            // Same inputs -> deterministically reproducible action chunk
+            // (Pi0 with fixed seed noise). Verify the two ticks match.
+            bool match = actions.size() == actions2.size();
+            for (size_t i = 0; match && i < actions.size(); ++i) {
+                if (std::fabs(actions[i] - actions2[i]) > 1e-5f) match = false;
+            }
+            CHECK(match, "tick2 actions reproduce tick1 (KV reset, no leak)");
         }
     }
 
