@@ -392,6 +392,17 @@ class Qwen3VlFp8Sm89TextFrontend:
         fn(act.data_ptr(), weight_ptr, out.data_ptr(), 1, N, K,
            scale.data_ptr(), w_scale_ptr, 1.0, s)
 
+    def _gemv_bf16in(self, act_bf16, weight_ptr: int, w_scale_ptr: int,
+                     out, N: int, K: int) -> None:
+        import torch
+        s = torch.cuda.current_stream().cuda_stream
+        if N >= 4096:
+            fn = self._fvk.ht_gemv_fp8_block128_m1_bf16in_w16
+        else:
+            fn = self._fvk.ht_gemv_fp8_block128_m1_bf16in_w8
+        fn(act_bf16.data_ptr(), weight_ptr, out.data_ptr(), 1, N, K,
+           w_scale_ptr, s)
+
     def _prefill_gemm(self, act, scale, weight_ptr: int,
                       w_scale_ptr: int, out, N: int, K: int,
                       S: int) -> None:
@@ -416,10 +427,10 @@ class Qwen3VlFp8Sm89TextFrontend:
         s = torch.cuda.current_stream().cuda_stream
         last_row = last_row.view(1, hidden).contiguous()
         if self.use_fp8_lm_head:
-            ap, sc, _ = self._quant(last_row, (vocab, hidden))
-            self._gemv(ap, sc, int(self._weights.ptrs['lm_head_fp8_w']),
-                       int(self._weights.ptrs['lm_head_fp8_s']),
-                       self._logits_buf, vocab, hidden)
+            self._gemv_bf16in(last_row,
+                              int(self._weights.ptrs['lm_head_fp8_w']),
+                              int(self._weights.ptrs['lm_head_fp8_s']),
+                              self._logits_buf, vocab, hidden)
         else:
             self._fvk.bf16_matmul_bf16(
                 last_row.data_ptr(), int(self._weights.ptrs['lm_head_w']),
@@ -490,9 +501,9 @@ class Qwen3VlFp8Sm89TextFrontend:
             'full', layer_idx=L, q_seq=1, kv_seq=cur_pos + 1,
             stream=s, causal=True)
         attn_2d = self._attn.O_buf[:, :1].reshape(1, hidden).contiguous()
-        ap, sc, o_out = self._quant(attn_2d, (hidden, hidden))
-        self._gemv(ap, sc, int(lw['o_proj_w']), int(lw['o_proj_s']),
-                   o_out, hidden, hidden)
+        o_out = self._fp8_scratch[(hidden, hidden)][2]
+        self._gemv_bf16in(attn_2d, int(lw['o_proj_w']), int(lw['o_proj_s']),
+                          o_out, hidden, hidden)
 
         attn_proj = o_out.view(1, 1, hidden)
         h_post = self._res_mid[:, :1]

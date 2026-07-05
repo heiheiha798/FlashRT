@@ -342,6 +342,27 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
     BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w4);
     BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w8);
     BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w16);
+
+    // BF16-input GEMV: A is BF16, B is FP8 with block-128 weight scale.
+    // Eliminates standalone FP8 activation quantization before O-proj.
+#define BIND_BLOCK128_GEMV_M1_BF16IN(NAME)                                     \
+    m.def("ht_" #NAME,                                                         \
+        [](uintptr_t A, uintptr_t B, uintptr_t D,                              \
+           int M, int N, int K, uintptr_t w_scale, uintptr_t stream) {         \
+            return flash_rt::gemm::gemv_m1_sm89::NAME(                          \
+                to_ptr(A), to_ptr(B), to_ptr(D),                               \
+                M, N, K, reinterpret_cast<const float*>(w_scale),              \
+                to_stream(stream));                                            \
+        },                                                                     \
+        py::arg("A"), py::arg("B"), py::arg("D"),                              \
+        py::arg("M"), py::arg("N"), py::arg("K"),                              \
+        py::arg("w_scale"), py::arg("stream") = 0)
+
+    BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w8);
+    BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w16);
+
+#undef BIND_BLOCK128_GEMV_M1_BF16IN
+
 #endif  // ENABLE_SM89_BLOCK_FP8_GEMM
 
 #ifdef ENABLE_QWEN3_VL_BF16_CUBLASLT
