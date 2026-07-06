@@ -4,11 +4,14 @@
 llama.cpp/GGML providers through the FlashRT `frt_model_runtime_v2` C ABI
 via ctypes. No torch/jax, no GPU arch detection.
 
-Two providers, selected by `config=`:
+Three providers, selected by `config=`:
 - **`config="pi0"`** (default for VLA) — Pi0 whole-graph infer via
   `jetson_pi_pi0`. Returns a `VLAModel` (`.predict(images, prompt, state)`).
 - **`config="llm"`** — generic GGUF text completion via `jetson_pi_llm`.
   Returns an `LlmJetsonPiFrontend` directly (`.generate(prompt)`); not a VLA.
+- **`config="mllm"`** — multimodal LLM (vision+text) via `jetson_pi_mllm`.
+  Returns an `MllmJetsonPiFrontend` directly (`.generate(images, prompt)`);
+  not a VLA.
 
 ## Build
 
@@ -71,8 +74,6 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
 ```
 
 ## Limitations
-
-- **Pi0 + LLM.** Multimodal LLM (vision+text) is Phase 4.
 - **Pi0 raw action chunk.** `predict` returns the model's `action_steps ×
   action_dim` output without unnormalization or LIBERO 7-D slicing. The caller
   is responsible for post-processing (use `meta/stats.json` to unnormalize).
@@ -117,5 +118,46 @@ FLASHRT_LLM_MODEL=.../qwen3-0.6b-q4_k_m.gguf \
 FLASHRT_LLM_LIB=FlashRT/cpp/build-jetson-pi/libflashrt_cpp_llama_cpp_provider_c.so \
 LD_LIBRARY_PATH=.../miniconda3/lib:FlashRT/cpp/build-jetson-pi \
 python -m flash_rt.tests.test_jetson_pi_llm_python
+```
+
+## Multimodal LLM (Phase 4)
+
+```python
+import flash_rt
+
+fe = flash_rt.load_model(
+    "/path/to/Qwen2.5-VL-3B-Instruct-q4_0.gguf",
+    framework="jetson_pi",
+    config="mllm",
+    mmproj_path="/path/to/Qwen2.5-VL-3B-Instruct-mmproj-f16.gguf",
+    backend="cpu",
+    n_ctx=2048, n_threads=0,
+    temp=0.0, top_k=0, top_p=0.0, seed=1, max_tokens=64,
+    lib_path=None,            # auto-discover, or set FLASHRT_MLLM_LIB
+)
+
+text = fe.generate(
+    [image_rgb_224x224],      # list of HxWx3 uint8 numpy (may be empty for text-only)
+    "Describe this image in one sentence.",
+)
+# text: str, the generated completion
+```
+
+The returned object is an `MllmJetsonPiFrontend` (not a `VLAModel` — MLLMs
+output text, not actions). `fe.infer({"images": [...], "prompt": ...})` returns
+`{"text": ...}` for callers that want a dict-shaped interface.
+
+The caller is responsible for applying the chat template; the engine only does
+raw prompt + media markers → text. Each `generate` call clears KV (independent
+completion, no multi-turn).
+
+### Run the MLLM smoke test
+
+```bash
+FLASHRT_MLLM_MODEL=.../Qwen2.5-VL-3B-Instruct-q4_0.gguf \
+FLASHRT_MLLM_MMPROJ=.../Qwen2.5-VL-3B-Instruct-mmproj-f16.gguf \
+FLASHRT_MLLM_LIB=FlashRT/cpp/build-jetson-pi/libflashrt_cpp_llama_cpp_provider_c.so \
+LD_LIBRARY_PATH=.../miniconda3/lib:FlashRT/cpp/build-jetson-pi \
+python -m flash_rt.tests.test_jetson_pi_mllm_python
 ```
 

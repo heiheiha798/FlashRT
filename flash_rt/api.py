@@ -448,9 +448,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     if framework == "jetson_pi":
         # The Jetson-PI provider serves Pi0 (VLA) and generic GGUF LLMs. config
         # picks the path. Neither uses torch/jax or GPU arch detection.
-        if config not in ("pi0", "pi05", "llm"):
+        if config not in ("pi0", "pi05", "llm", "mllm"):
             logger.warning(
-                "framework='jetson_pi' serves Pi0 / LLM; config=%r ignored.",
+                "framework='jetson_pi' serves Pi0 / LLM / MLLM; config=%r ignored.",
                 config)
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
@@ -473,6 +473,20 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             from flash_rt.frontends.jetson_pi.llm import LlmJetsonPiFrontend
             return LlmJetsonPiFrontend(
                 checkpoint,
+                backend=backend,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
+                max_tokens=max_tokens,
+                lib_path=lib_path)
+        if config == "mllm":
+            from flash_rt.frontends.jetson_pi.mllm import MllmJetsonPiFrontend
+            return MllmJetsonPiFrontend(
+                checkpoint,
+                mmproj_path=mmproj_path,
                 backend=backend,
                 n_ctx=n_ctx,
                 n_threads=n_threads,
