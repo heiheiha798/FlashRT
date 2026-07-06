@@ -13,6 +13,7 @@
 
 #include "flashrt/model_runtime.h"
 #include "jetson_pi_pi0.h"
+#include "jetson_pi_llm.h"
 
 #include <atomic>
 #include <cmath>
@@ -290,6 +291,126 @@ int engine_get_output(void * self, uint32_t port, void * out,
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// LLM engine (generic GGUF text completion). Distinct IO shape from Pi0
+// (1 prompt in -> 1 text out), so it has its own Engine struct + verbs, but
+// reuses the frt_llama_cpp_engine_v1 vtable shape and the default factory.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct LlmEngine {
+    jetson_pi_llm * llm = nullptr;
+    uint32_t max_tokens = 0;
+
+    std::string prompt;            // set_input(PROMPT) stash
+    std::string text_buf;          // run_infer output, get_output(TEXT) source
+    bool prompt_set = false;
+
+    std::string last_error;
+    std::atomic<long> refs{1};
+
+    void set_error(const std::string & m) { last_error = m; }
+    void clear_error() { last_error.clear(); }
+};
+
+void llm_engine_retain(void * self) {
+    static_cast<LlmEngine*>(self)->refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void llm_engine_release(void * self) {
+    LlmEngine * e = static_cast<LlmEngine*>(self);
+    if (e->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (e->llm) jetson_pi_llm_close(e->llm);
+        delete e;
+    }
+}
+
+int llm_engine_set_input(void * self, uint32_t port, const void * data,
+                         uint64_t bytes, int /*stream*/) {
+    LlmEngine * e = static_cast<LlmEngine*>(self);
+    if (!e) return -1;
+    e->clear_error();
+    if (port != FRT_LLAMA_CPP_LLM_PORT_PROMPT) {
+        e->set_error("llm engine only accepts the prompt input port");
+        return -1;
+    }
+    if (!data || bytes == 0) {
+        e->set_error("empty prompt");
+        return -1;
+    }
+    e->prompt.assign(static_cast<const char*>(data), bytes);
+    e->prompt_set = true;
+    // New input invalidates any previous output.
+    e->text_buf.clear();
+    return 0;
+}
+
+int llm_engine_run_infer(void * self) {
+    LlmEngine * e = static_cast<LlmEngine*>(self);
+    if (!e) return -1;
+    e->clear_error();
+    if (!e->prompt_set) {
+        e->set_error("infer requires prompt to be set");
+        return -1;
+    }
+    // Worst-case output buffer: max_tokens * 8 bytes (utf-8 can be up to 4
+    // bytes/char; 8 is conservative headroom). jetson_pi_llm_generate reports
+    // the same worst-case for size-query.
+    const size_t cap = static_cast<size_t>(e->max_tokens) * 8u;
+    e->text_buf.assign(cap, '\0');
+    size_t written = 0;
+    int32_t s = jetson_pi_llm_generate(e->llm, e->prompt.data(),
+                                       e->prompt.size(),
+                                       &e->text_buf[0], cap, &written);
+    if (s != JETSON_PI_LLM_OK) {
+        e->set_error(std::string("jetson_pi_llm_generate failed: ") +
+                     jetson_pi_llm_last_error(e->llm));
+        e->text_buf.clear();
+        return -8;
+    }
+    e->text_buf.resize(written);
+    return 0;
+}
+
+int llm_engine_get_output(void * self, uint32_t port, void * out,
+                          uint64_t capacity, uint64_t * written,
+                          int /*stream*/) {
+    LlmEngine * e = static_cast<LlmEngine*>(self);
+    if (!e) return -1;
+    e->clear_error();
+    if (port != FRT_LLAMA_CPP_LLM_PORT_TEXT) {
+        e->set_error("llm engine only exports the text output port");
+        return -1;
+    }
+    if (!written) {
+        e->set_error("get_output requires written");
+        return -1;
+    }
+    const uint64_t need = e->text_buf.size();
+    *written = need;
+    // Size-query (out=NULL) or too-small buffer: report need, return nonzero.
+    if (!out || capacity < need) {
+        if (need == 0) {
+            e->set_error("text not ready; run_infer did not complete");
+            return -7;
+        }
+        e->set_error("text output buffer too small");
+        return -5;
+    }
+    std::memcpy(out, e->text_buf.data(), need);
+    return 0;
+}
+
+const char * llm_engine_last_error(void * self) {
+    LlmEngine * e = static_cast<LlmEngine*>(self);
+    if (!e) return "null jetson_pi llm engine";
+    if (e->last_error.empty()) return "ok";
+    return e->last_error.c_str();
+}
+
+} // namespace
+
 extern "C" const frt_llama_cpp_engine_factory_v1*
 frt_llama_cpp_default_engine_factory(void) {
     static const frt_llama_cpp_engine_factory_v1 factory = []{
@@ -374,6 +495,59 @@ frt_llama_cpp_default_engine_factory(void) {
             out->run_infer   = engine_run_infer;
             out->get_output  = engine_get_output;
             out->last_error  = engine_last_error;
+            return 0;
+        };
+        f.create_llm = [](void * /*self*/,
+                          const frt_llama_cpp_llm_config * config,
+                          frt_llama_cpp_engine_v1 * out) -> int {
+            g_create_error.clear();
+            if (!config || config->struct_size < sizeof(*config) || !out) {
+                set_create_error("invalid create_llm arguments");
+                return -1;
+            }
+            if (!config->model_path || !config->model_path[0] ||
+                !config->backend || !config->backend[0]) {
+                set_create_error("create_llm config has empty/zero fields");
+                return -1;
+            }
+            jetson_pi_llm_config jc{};
+            jc.struct_size = sizeof(jc);
+            jc.model_path  = config->model_path;
+            jc.backend     = config->backend;
+            jc.n_ctx       = config->n_ctx;
+            jc.n_threads   = config->n_threads;
+            jc.temp        = config->temp;
+            jc.top_k       = config->top_k;
+            jc.top_p       = config->top_p;
+            jc.seed        = config->seed;
+            jc.max_tokens  = config->max_tokens;
+
+            jetson_pi_llm * llm = nullptr;
+            int32_t s = jetson_pi_llm_open(&jc, &llm);
+            if (s != JETSON_PI_LLM_OK || !llm) {
+                set_create_error(std::string("jetson_pi_llm_open failed: ") +
+                                 jetson_pi_llm_open_error());
+                return -1;
+            }
+
+            LlmEngine * e = new (std::nothrow) LlmEngine();
+            if (!e) {
+                set_create_error("llm engine allocation failed");
+                jetson_pi_llm_close(llm);
+                return -5;
+            }
+            e->llm = llm;
+            e->max_tokens = config->max_tokens ? config->max_tokens : 512;
+
+            out->struct_size = sizeof(*out);
+            out->reserved    = 0;
+            out->self        = e;
+            out->retain      = llm_engine_retain;
+            out->release     = llm_engine_release;
+            out->set_input   = llm_engine_set_input;
+            out->run_infer   = llm_engine_run_infer;
+            out->get_output  = llm_engine_get_output;
+            out->last_error  = llm_engine_last_error;
             return 0;
         };
         f.last_error = [](void * /*self*/) -> const char * {

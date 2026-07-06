@@ -1,9 +1,14 @@
-# Jetson-PI Pi0 provider (Python)
+# Jetson-PI providers (Python)
 
-`flash_rt.load_model(..., framework="jetson_pi")` drives the Jetson-PI
-llama.cpp/GGML Pi0 provider through the FlashRT `frt_model_runtime_v2` C ABI
-via ctypes. No torch/jax, no GPU arch detection — the Pi0 whole-graph infer
-runs in-process on the Jetson-PI `jetson_pi_pi0` policy library.
+`flash_rt.load_model(..., framework="jetson_pi")` drives Jetson-PI
+llama.cpp/GGML providers through the FlashRT `frt_model_runtime_v2` C ABI
+via ctypes. No torch/jax, no GPU arch detection.
+
+Two providers, selected by `config=`:
+- **`config="pi0"`** (default for VLA) — Pi0 whole-graph infer via
+  `jetson_pi_pi0`. Returns a `VLAModel` (`.predict(images, prompt, state)`).
+- **`config="llm"`** — generic GGUF text completion via `jetson_pi_llm`.
+  Returns an `LlmJetsonPiFrontend` directly (`.generate(prompt)`); not a VLA.
 
 ## Build
 
@@ -65,16 +70,52 @@ FLASHRT_PI0_ACTION_STEPS=10 FLASHRT_PI0_ACTION_DIM=32 \
 python -m flash_rt.tests.test_jetson_pi_pi0_python
 ```
 
-## Limitations (Phase 2)
+## Limitations
 
-- **Pi0 only.** Generic GGUF LLM is Phase 3; multimodal LLM is Phase 4.
-- **Raw action chunk.** `predict` returns the model's `action_steps ×
+- **Pi0 + LLM.** Multimodal LLM (vision+text) is Phase 4.
+- **Pi0 raw action chunk.** `predict` returns the model's `action_steps ×
   action_dim` output without unnormalization or LIBERO 7-D slicing. The caller
   is responsible for post-processing (use `meta/stats.json` to unnormalize).
+- **LLM raw prompt.** `generate(prompt)` takes a raw prompt; the caller must
+  apply the chat template (e.g. `llama_chat_apply_template`) before calling.
+  No streaming; one blob out. Each call clears KV (independent completion).
 - **CPU backend verified.** `backend="cuda"` is wired through but not yet
   tested end-to-end on this machine.
-- **No calibration.** The frontend has no `calibrate`/`calibrated`; the
-  Jetson-PI provider does not need FlashRT-style FP8 calibration.
-- **`state` is a separate port**, not encoded into the prompt (unlike Pi0.5).
-  `VLAModel.predict` detects that `set_prompt` does not accept `state` and
-  routes it through `observation["state"]` automatically.
+- **No calibration.** The frontends have no `calibrate`/`calibrated`; the
+  Jetson-PI providers do not need FlashRT-style FP8 calibration.
+- **`state` is a separate port** for Pi0, not encoded into the prompt (unlike
+  Pi0.5). `VLAModel.predict` detects that `set_prompt` does not accept `state`
+  and routes it through `observation["state"]` automatically.
+
+## Generic GGUF LLM (Phase 3)
+
+```python
+import flash_rt
+
+fe = flash_rt.load_model(
+    "/path/to/qwen3-0.6b-q4_k_m.gguf",
+    framework="jetson_pi",
+    config="llm",
+    backend="cpu",
+    n_ctx=2048, n_threads=0,
+    temp=0.8, top_k=40, top_p=0.9, seed=1, max_tokens=512,
+    lib_path=None,            # auto-discover, or set FLASHRT_LLM_LIB
+)
+
+text = fe.generate("What is 2 plus 2? The answer is")
+# text: str, the generated completion (no chat template applied by the engine)
+```
+
+The returned object is an `LlmJetsonPiFrontend` (not a `VLAModel` — LLMs are
+not VLA). `fe.infer({"prompt": ...})` returns `{"text": ...}` for callers that
+want a dict-shaped interface.
+
+### Run the LLM smoke test
+
+```bash
+FLASHRT_LLM_MODEL=.../qwen3-0.6b-q4_k_m.gguf \
+FLASHRT_LLM_LIB=FlashRT/cpp/build-jetson-pi/libflashrt_cpp_llama_cpp_provider_c.so \
+LD_LIBRARY_PATH=.../miniconda3/lib:FlashRT/cpp/build-jetson-pi \
+python -m flash_rt.tests.test_jetson_pi_llm_python
+```
+

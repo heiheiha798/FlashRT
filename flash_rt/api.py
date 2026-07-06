@@ -305,7 +305,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                backend="cpu",
                action_steps=None,
                action_dim=None,
-               lib_path=None):
+               lib_path=None,
+               n_ctx=0,
+               n_threads=0,
+               temp=0.8,
+               top_k=40,
+               top_p=0.9,
+               seed=1,
+               max_tokens=512):
     """Load a FlashRT model.
 
     Args:
@@ -426,10 +433,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         VLAModel instance with .predict() method.
     """
     if framework == "jetson_pi":
-        # The Jetson-PI provider only serves Pi0 today; config is implied.
-        if config not in ("pi0", "pi05"):
+        # The Jetson-PI provider serves Pi0 (VLA) and generic GGUF LLMs. config
+        # picks the path. Neither uses torch/jax or GPU arch detection.
+        if config not in ("pi0", "pi05", "llm"):
             logger.warning(
-                "framework='jetson_pi' serves Pi0; config=%r ignored.", config)
+                "framework='jetson_pi' serves Pi0 / LLM; config=%r ignored.",
+                config)
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
         raise ValueError(
@@ -445,6 +454,22 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     # via ctypes. No torch/jax, no GPU arch detection. The Pi0 action chunk
     # shape is passed explicitly by the caller (e.g. 10x32 for pi0_base).
     if framework == "jetson_pi":
+        # The Jetson-PI provider serves Pi0 (VLA) and generic GGUF LLMs. config
+        # picks the path. Neither uses torch/jax or GPU arch detection.
+        if config == "llm":
+            from flash_rt.frontends.jetson_pi.llm import LlmJetsonPiFrontend
+            return LlmJetsonPiFrontend(
+                checkpoint,
+                backend=backend,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
+                max_tokens=max_tokens,
+                lib_path=lib_path)
+        # default / "pi0": VLA path
         from flash_rt.frontends.jetson_pi.pi0 import Pi0JetsonPiFrontend
         pipe = Pi0JetsonPiFrontend(
             checkpoint,
