@@ -125,10 +125,10 @@ _FRT_MODEL_RUNTIME_ABI_VERSION_V2 = 2
 _F32_BYTES = np.dtype(np.float32).itemsize
 
 
-def _find_lib(lib_path):
+def _find_lib(lib_path, env_var="FLASHRT_PI0_LIB"):
     """Resolve the SHARED provider .so path.
 
-    Priority: explicit ``lib_path`` kwarg > ``FLASHRT_PI0_LIB`` env > build-dir
+    Priority: explicit ``lib_path`` kwarg > ``env_var`` env > build-dir
     convention. An explicit ``lib_path`` that does not exist is a hard error
     (no silent fallback to env/build-dirs) so callers get deterministic loads.
     """
@@ -137,7 +137,7 @@ def _find_lib(lib_path):
             raise RuntimeError(
                 f"lib_path does not exist: {lib_path}")
         return lib_path
-    env = os.environ.get("FLASHRT_PI0_LIB")
+    env = os.environ.get(env_var)
     if env and os.path.exists(env):
         return env
     here = os.path.dirname(os.path.abspath(__file__))
@@ -156,22 +156,27 @@ def _find_lib(lib_path):
     raise RuntimeError(
         "libflashrt_cpp_llama_cpp_provider_c.so not found. Build it with "
         "-DFLASHRT_CPP_WITH_JETSON_PI=ON, or pass lib_path=, or set "
-        "FLASHRT_PI0_LIB.")
+        f"{env_var}.")
 
 
 # frt_llama_cpp_engine_factory_v1 layout:
 #   uint32 struct_size; uint32 reserved; void* self;
 #   int (*create_pi0)(void*, const cfg*, engine*);
+#   int (*create_llm)(void*, const cfg*, engine*);   // Phase 3, between pi0 and last_error
 #   const char* (*last_error)(void*);
 # self is nullptr for the default factory; last_error ignores it (returns the
 # thread-local create-error sink). Defined at module scope so it is not
-# re-created per instance.
+# re-created per instance. Field order MUST match c_api.h exactly — ctypes
+# reads by offset, so a missing field shifts every later field.
 class _FactoryV1(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
         ("self", ctypes.c_void_p),
         ("create_pi0", ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p)),
+        ("create_llm", ctypes.CFUNCTYPE(
             ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p)),
         ("last_error", ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_void_p)),
@@ -238,6 +243,12 @@ class Pi0JetsonPiFrontend:
                 "(FlashRT built without FLASHRT_CPP_WITH_JETSON_PI?)")
 
         factory = _FactoryV1.from_address(factory_ptr)
+        if factory.struct_size < ctypes.sizeof(_FactoryV1):
+            raise RuntimeError(
+                f"frt_llama_cpp_engine_factory_v1 struct_size="
+                f"{factory.struct_size} < ctypes sizeof "
+                f"{ctypes.sizeof(_FactoryV1)}; provider .so is older than the "
+                f"Python frontend expects.")
 
         model_ptr = ctypes.c_void_p(0)
         rc = self._lib.frt_llama_cpp_pi0_runtime_open_with_engine_factory(

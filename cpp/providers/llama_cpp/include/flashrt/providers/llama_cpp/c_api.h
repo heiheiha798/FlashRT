@@ -11,6 +11,7 @@ extern "C" {
 
 enum frt_llama_cpp_model_family {
     FRT_LLAMA_CPP_MODEL_PI0 = 1,
+    FRT_LLAMA_CPP_MODEL_LLM = 2,
 };
 
 enum frt_llama_cpp_pi0_port {
@@ -22,6 +23,15 @@ enum frt_llama_cpp_pi0_port {
 
 enum frt_llama_cpp_pi0_stage_index {
     FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER = 0,
+};
+
+enum frt_llama_cpp_llm_port {
+    FRT_LLAMA_CPP_LLM_PORT_PROMPT = 0,
+    FRT_LLAMA_CPP_LLM_PORT_TEXT   = 1,
+};
+
+enum frt_llama_cpp_llm_stage_index {
+    FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER = 0,
 };
 
 typedef struct frt_llama_cpp_pi0_config {
@@ -38,6 +48,22 @@ typedef struct frt_llama_cpp_pi0_config {
     uint32_t action_steps;
     uint32_t action_dim;
 } frt_llama_cpp_pi0_config;
+
+typedef struct frt_llama_cpp_llm_config {
+    uint32_t struct_size;
+
+    const char* model_path;
+    const char* backend;
+
+    uint32_t n_ctx;            /* KV context size; 0 = from model             */
+    int32_t  n_threads;        /* CPU threads; 0 = hardware_concurrency       */
+
+    float    temp;             /* sampler temperature (<=0 = greedy)          */
+    int32_t  top_k;            /* 0 = disabled                                */
+    float    top_p;            /* 0 = disabled                                */
+    uint32_t seed;             /* RNG seed                                    */
+    uint32_t max_tokens;       /* cap on generated tokens per infer           */
+} frt_llama_cpp_llm_config;
 
 typedef struct frt_llama_cpp_engine_v1 {
     uint32_t struct_size;
@@ -75,6 +101,10 @@ typedef struct frt_llama_cpp_engine_factory_v1 {
      * ownership is transferred and out_engine is ignored. */
     int (*create_pi0)(void* self, const frt_llama_cpp_pi0_config* config,
                       frt_llama_cpp_engine_v1* out_engine);
+    /* Same contract as create_pi0 but for a generic GGUF LLM (text in ->
+     * text out). May be NULL if the factory only serves Pi0. */
+    int (*create_llm)(void* self, const frt_llama_cpp_llm_config* config,
+                      frt_llama_cpp_engine_v1* out_engine);
     const char* (*last_error)(void* self);
 } frt_llama_cpp_engine_factory_v1;
 
@@ -90,6 +120,22 @@ int frt_llama_cpp_pi0_runtime_create_with_engine(
  *   action_steps, action_dim.
  * No field has a default; missing or mismatched fields fail hard. */
 int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+    const char* config_json,
+    const frt_llama_cpp_engine_factory_v1* factory,
+    frt_model_runtime_v2** out);
+
+int frt_llama_cpp_llm_runtime_create_with_engine(
+    const frt_llama_cpp_llm_config* config,
+    const frt_llama_cpp_engine_v1* engine,
+    frt_model_runtime_v2** out);
+
+/* Provider-specific JSON open path for generic GGUF LLM. Required JSON
+ * fields:
+ *   model_family="llm", model_path, backend,
+ *   n_ctx, n_threads, temp, top_k, top_p, seed, max_tokens.
+ * No field has a default; missing or mismatched fields fail hard. The factory
+ * must provide create_llm. */
+int frt_llama_cpp_llm_runtime_open_with_engine_factory(
     const char* config_json,
     const frt_llama_cpp_engine_factory_v1* factory,
     frt_model_runtime_v2** out);
