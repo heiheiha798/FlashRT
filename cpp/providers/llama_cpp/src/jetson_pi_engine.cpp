@@ -14,6 +14,7 @@
 #include "flashrt/model_runtime.h"
 #include "jetson_pi_pi0.h"
 #include "jetson_pi_llm.h"
+#include "jetson_pi_mllm.h"
 
 #include <atomic>
 #include <cmath>
@@ -409,6 +410,175 @@ const char * llm_engine_last_error(void * self) {
     return e->last_error.c_str();
 }
 
+// ---------------------------------------------------------------------------
+// MLLM engine (multimodal LLM: images + prompt -> text). IO shape = Pi0's
+// image input + LLM's text output. Reuses view_to_rgb for images and the
+// LLM generate contract for text.
+// ---------------------------------------------------------------------------
+
+struct MllmEngine {
+    jetson_pi_mllm * mllm = nullptr;
+    uint32_t max_tokens = 0;
+
+    // Per-tick transient state.
+    std::vector<uint8_t> rgb_scratch;
+    std::vector<const uint8_t*> image_ptrs;
+    uint32_t n_images = 0;
+    uint32_t image_height = 0;
+    uint32_t image_width = 0;
+    std::string prompt;
+    std::string text_buf;
+    bool images_set = false;
+    bool prompt_set = false;
+
+    std::string last_error;
+    std::atomic<long> refs{1};
+
+    void set_error(const std::string & m) { last_error = m; }
+    void clear_error() { last_error.clear(); }
+};
+
+void mllm_engine_retain(void * self) {
+    static_cast<MllmEngine*>(self)->refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void mllm_engine_release(void * self) {
+    MllmEngine * e = static_cast<MllmEngine*>(self);
+    if (e->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (e->mllm) jetson_pi_mllm_close(e->mllm);
+        delete e;
+    }
+}
+
+int mllm_engine_set_input(void * self, uint32_t port, const void * data,
+                          uint64_t bytes, int /*stream*/) {
+    MllmEngine * e = static_cast<MllmEngine*>(self);
+    if (!e) return -1;
+    e->clear_error();
+    switch (port) {
+        case FRT_LLAMA_CPP_MLLM_PORT_IMAGES: {
+            if (!data || bytes % sizeof(frt_image_view) != 0) {
+                e->set_error("images payload must be frt_image_view[]");
+                return -1;
+            }
+            const uint64_t n = bytes / sizeof(frt_image_view);
+            if (n == 0) {
+                // n_images == 0 means text-only; allow but record zero.
+                e->image_ptrs.clear();
+                e->rgb_scratch.clear();
+                e->n_images = 0;
+                e->images_set = true;
+                e->text_buf.clear();
+                return 0;
+            }
+            const auto * views = static_cast<const frt_image_view*>(data);
+            // All images must share the first view's H/W (jetson_pi_mllm
+            // takes a single image_height/image_width for all images).
+            std::vector<uint8_t> packed;
+            const uint32_t w = static_cast<uint32_t>(views[0].width);
+            const uint32_t h = static_cast<uint32_t>(views[0].height);
+            packed.reserve(n * w * h * 3);
+            e->image_ptrs.clear();
+            for (uint64_t i = 0; i < n; ++i) {
+                std::vector<uint8_t> rgb;
+                if (!view_to_rgb(views[i], w, h, rgb)) {
+                    e->set_error("invalid frt_image_view at index " +
+                                 std::to_string(i));
+                    return -1;
+                }
+                packed.insert(packed.end(), rgb.begin(), rgb.end());
+            }
+            e->rgb_scratch = std::move(packed);
+            const size_t per_view = static_cast<size_t>(w) * h * 3;
+            e->image_ptrs.resize(n);
+            for (uint64_t i = 0; i < n; ++i) {
+                e->image_ptrs[i] = e->rgb_scratch.data() + i * per_view;
+            }
+            e->n_images = static_cast<uint32_t>(n);
+            e->image_height = h;
+            e->image_width = w;
+            e->images_set = true;
+            e->text_buf.clear();
+            return 0;
+        }
+        case FRT_LLAMA_CPP_MLLM_PORT_PROMPT: {
+            if (!data || bytes == 0) {
+                e->set_error("empty prompt");
+                return -1;
+            }
+            e->prompt.assign(static_cast<const char*>(data), bytes);
+            e->prompt_set = true;
+            e->text_buf.clear();
+            return 0;
+        }
+        case FRT_LLAMA_CPP_MLLM_PORT_TEXT:
+        default:
+            e->set_error("unknown/invalid mllm input port");
+            return -1;
+    }
+}
+
+int mllm_engine_run_infer(void * self) {
+    MllmEngine * e = static_cast<MllmEngine*>(self);
+    if (!e) return -1;
+    e->clear_error();
+    if (!e->images_set || !e->prompt_set) {
+        e->set_error("infer requires images and prompt to be set");
+        return -1;
+    }
+    const size_t cap = static_cast<size_t>(e->max_tokens) * 8u;
+    e->text_buf.assign(cap, '\0');
+    size_t written = 0;
+    int32_t s = jetson_pi_mllm_infer(e->mllm,
+                                     e->image_ptrs.data(), e->n_images,
+                                     e->image_height, e->image_width,
+                                     e->prompt.data(), e->prompt.size(),
+                                     &e->text_buf[0], cap, &written);
+    if (s != JETSON_PI_MLLM_OK) {
+        e->set_error(std::string("jetson_pi_mllm_infer failed: ") +
+                     jetson_pi_mllm_last_error(e->mllm));
+        e->text_buf.clear();
+        return -8;
+    }
+    e->text_buf.resize(written);
+    return 0;
+}
+
+int mllm_engine_get_output(void * self, uint32_t port, void * out,
+                           uint64_t capacity, uint64_t * written,
+                           int /*stream*/) {
+    MllmEngine * e = static_cast<MllmEngine*>(self);
+    if (!e) return -1;
+    e->clear_error();
+    if (port != FRT_LLAMA_CPP_MLLM_PORT_TEXT) {
+        e->set_error("mllm engine only exports the text output port");
+        return -1;
+    }
+    if (!written) {
+        e->set_error("get_output requires written");
+        return -1;
+    }
+    const uint64_t need = e->text_buf.size();
+    *written = need;
+    if (!out || capacity < need) {
+        if (need == 0) {
+            e->set_error("text not ready; run_infer did not complete");
+            return -7;
+        }
+        e->set_error("text output buffer too small");
+        return -5;
+    }
+    std::memcpy(out, e->text_buf.data(), need);
+    return 0;
+}
+
+const char * mllm_engine_last_error(void * self) {
+    MllmEngine * e = static_cast<MllmEngine*>(self);
+    if (!e) return "null jetson_pi mllm engine";
+    if (e->last_error.empty()) return "ok";
+    return e->last_error.c_str();
+}
+
 } // namespace
 
 extern "C" const frt_llama_cpp_engine_factory_v1*
@@ -548,6 +718,61 @@ frt_llama_cpp_default_engine_factory(void) {
             out->run_infer   = llm_engine_run_infer;
             out->get_output  = llm_engine_get_output;
             out->last_error  = llm_engine_last_error;
+            return 0;
+        };
+        f.create_mllm = [](void * /*self*/,
+                           const frt_llama_cpp_mllm_config * config,
+                           frt_llama_cpp_engine_v1 * out) -> int {
+            g_create_error.clear();
+            if (!config || config->struct_size < sizeof(*config) || !out) {
+                set_create_error("invalid create_mllm arguments");
+                return -1;
+            }
+            if (!config->model_path || !config->model_path[0] ||
+                !config->mmproj_path || !config->mmproj_path[0] ||
+                !config->backend || !config->backend[0]) {
+                set_create_error("create_mllm config has empty/zero fields");
+                return -1;
+            }
+            jetson_pi_mllm_config jc{};
+            jc.struct_size  = sizeof(jc);
+            jc.model_path   = config->model_path;
+            jc.mmproj_path  = config->mmproj_path;
+            jc.backend      = config->backend;
+            jc.n_ctx        = config->n_ctx;
+            jc.n_threads    = config->n_threads;
+            jc.temp         = config->temp;
+            jc.top_k        = config->top_k;
+            jc.top_p        = config->top_p;
+            jc.seed         = config->seed;
+            jc.max_tokens   = config->max_tokens;
+
+            jetson_pi_mllm * mllm = nullptr;
+            int32_t s = jetson_pi_mllm_open(&jc, &mllm);
+            if (s != JETSON_PI_MLLM_OK || !mllm) {
+                set_create_error(std::string("jetson_pi_mllm_open failed: ") +
+                                 jetson_pi_mllm_open_error());
+                return -1;
+            }
+
+            MllmEngine * e = new (std::nothrow) MllmEngine();
+            if (!e) {
+                set_create_error("mllm engine allocation failed");
+                jetson_pi_mllm_close(mllm);
+                return -5;
+            }
+            e->mllm = mllm;
+            e->max_tokens = config->max_tokens ? config->max_tokens : 512;
+
+            out->struct_size = sizeof(*out);
+            out->reserved    = 0;
+            out->self        = e;
+            out->retain      = mllm_engine_retain;
+            out->release     = mllm_engine_release;
+            out->set_input   = mllm_engine_set_input;
+            out->run_infer   = mllm_engine_run_infer;
+            out->get_output  = mllm_engine_get_output;
+            out->last_error  = mllm_engine_last_error;
             return 0;
         };
         f.last_error = [](void * /*self*/) -> const char * {

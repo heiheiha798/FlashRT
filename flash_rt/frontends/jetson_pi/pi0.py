@@ -179,6 +179,9 @@ class _FactoryV1(ctypes.Structure):
         ("create_llm", ctypes.CFUNCTYPE(
             ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p)),
+        ("create_mllm", ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p)),
         ("last_error", ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_void_p)),
     ]
 

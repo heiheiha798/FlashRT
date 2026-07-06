@@ -124,7 +124,8 @@ target_include_directories(flashrt_cpp_pi05_c
 
 add_library(flashrt_cpp_llama_cpp_provider STATIC
   providers/llama_cpp/src/pi0_runtime.cpp
-  providers/llama_cpp/src/llm_runtime.cpp)
+  providers/llama_cpp/src/llm_runtime.cpp
+  providers/llama_cpp/src/mllm_runtime.cpp)
 target_link_libraries(flashrt_cpp_llama_cpp_provider
   PUBLIC flashrt_runtime)
 target_include_directories(flashrt_cpp_llama_cpp_provider
@@ -134,7 +135,7 @@ if(FLASHRT_CPP_WITH_JETSON_PI)
     PRIVATE providers/llama_cpp/src/jetson_pi_engine.cpp
             providers/llama_cpp/src/jetson_pi_link_check.cpp)
   target_link_libraries(flashrt_cpp_llama_cpp_provider
-    PRIVATE jetson_pi_pi0 jetson_pi_llm)
+    PRIVATE jetson_pi_pi0 jetson_pi_llm jetson_pi_mllm)
   target_compile_definitions(flashrt_cpp_llama_cpp_provider
     PRIVATE FLASHRT_CPP_WITH_JETSON_PI=1)
 
@@ -145,9 +146,10 @@ if(FLASHRT_CPP_WITH_JETSON_PI)
   add_library(flashrt_cpp_llama_cpp_provider_c SHARED
     providers/llama_cpp/src/pi0_runtime.cpp
     providers/llama_cpp/src/llm_runtime.cpp
+    providers/llama_cpp/src/mllm_runtime.cpp
     providers/llama_cpp/src/jetson_pi_engine.cpp)
   target_link_libraries(flashrt_cpp_llama_cpp_provider_c
-    PUBLIC flashrt_runtime jetson_pi_pi0 jetson_pi_llm)
+    PUBLIC flashrt_runtime jetson_pi_pi0 jetson_pi_llm jetson_pi_mllm)
   target_include_directories(flashrt_cpp_llama_cpp_provider_c
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/llama_cpp/include)
   target_compile_definitions(flashrt_cpp_llama_cpp_provider_c
@@ -214,5 +216,12 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_llama_cpp_provider jetson_pi_llm)
     add_test(NAME llama_cpp_jetson_pi_llm
       COMMAND test_llama_cpp_jetson_pi_llm)
+
+    add_executable(test_llama_cpp_jetson_pi_mllm
+      tests/test_llama_cpp_jetson_pi_mllm.cpp)
+    target_link_libraries(test_llama_cpp_jetson_pi_mllm
+      PRIVATE flashrt_cpp_llama_cpp_provider jetson_pi_mllm)
+    add_test(NAME llama_cpp_jetson_pi_mllm
+      COMMAND test_llama_cpp_jetson_pi_mllm)
   endif()
 endif()
