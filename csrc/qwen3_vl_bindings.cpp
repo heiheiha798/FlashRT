@@ -292,6 +292,20 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("act_block_scale"), py::arg("w_block_scale"),
         py::arg("stream") = 0);
 
+    // Bench-only tile-variant bindings for prefill GEMM tuning. Not used by
+    // the frontend; exposed so the micro-bench can sweep tiles and candidate
+    // kernels without re-templating the dispatcher.
+#define BIND_GEMM_TILE(NAME)                                                        m.def("bench_" #NAME,                                                               [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,                     uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {                      return flash_rt::gemm::block128_sm89::NAME(                                         to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,                                      reinterpret_cast<const float*>(act_scale),                                      reinterpret_cast<const float*>(w_scale), to_stream(stream));            },                                                                              py::arg("A"), py::arg("B"), py::arg("D"),                                      py::arg("M"), py::arg("N"), py::arg("K"),                                      py::arg("act_block_scale"), py::arg("w_block_scale"),                          py::arg("stream") = 0)
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_16x64x128_w4);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_32x64x128_w4);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_64x64x128_w4);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_64x64x128_w4_s1);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_32x128x128_w4);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_64x128x128_w8);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_128x128x128_w8);
+#undef BIND_GEMM_TILE
+
     m.def("qwen3_qk_norm_rope_kvwrite_bf16",
         [](uintptr_t q_pre, uintptr_t k_pre, uintptr_t v_pre,
            uintptr_t q_norm_w, uintptr_t k_norm_w,
