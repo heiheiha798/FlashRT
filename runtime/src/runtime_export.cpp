@@ -18,6 +18,15 @@ extern "C" void frt_rt_holder_retain(void* owner) {
 extern "C" void frt_rt_holder_release(void* owner) {
     Holder* h = static_cast<Holder*>(owner);
     if (h->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        /* Phase 6: fire each port token's destroy exactly once before the
+         * holder (and its port descriptors) go away. A null handle or null
+         * destroy verb is a no-op. This is the ONLY place FlashRT touches a
+         * provider-owned token's lifetime. */
+        for (const auto& tk : h->port_tokens) {
+            if (tk.handle && tk.verbs && tk.verbs->destroy) {
+                tk.verbs->destroy(tk.handle);
+            }
+        }
         if (h->user_release) h->user_release(h->user_owner);
         delete h;
     }

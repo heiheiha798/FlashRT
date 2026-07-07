@@ -42,6 +42,12 @@ struct Holder {
     std::vector<frt_runtime_stage_desc> stages;
     std::vector<frt_runtime_stage_desc_v2> stages_v2;
 
+    /* Phase 6 — memory-domain tokens attached to provider-owned ports.
+     * One entry per port that carries a token (parallel to `ports` by index,
+     * with token.handle == nullptr for ports without one). Copied verbatim
+     * from the builder; `verbs.destroy` is fired at release. */
+    std::vector<frt_memory_token_desc> port_tokens;
+
     frt_runtime_export_v1 exp{};
     frt_model_runtime_v1  model{};
     frt_model_runtime_v2  model_v2{};
