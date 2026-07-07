@@ -1,4 +1,5 @@
 #include "flashrt/providers/llama_cpp/c_api.h"
+#include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -151,10 +152,31 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
         b, "state", FRT_RT_MOD_STATE, FRT_RT_DTYPE_F32, FRT_RT_LAYOUT_FLAT,
         FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1, owner->state_shape, 1, 0,
         nullptr, 0, 0);
+    // Phase 6: the actions OUT port carries a memory-domain token (handle =
+    // engine.self, the provider Engine*) so a consumer can read the action
+    // chunk through frt_memory_token_verbs as well as get_output. HOST_VISIBLE:
+    // actions_buf is host memory, read live at copy_to_host call time. The
+    // port desc this produces is byte-identical to add_port (STAGED, no raw
+    // buffer), so the model identity/fingerprint and get_output are unchanged.
+    // Only minted when a real Jetson-PI engine is linked; without
+    // FLASHRT_CPP_WITH_JETSON_PI there is no backing store to advertise (the
+    // fake-engine unit test path uses add_port and reads via get_output).
+#if defined(FLASHRT_CPP_WITH_JETSON_PI)
+    const uint64_t action_window_bytes =
+        static_cast<uint64_t>(config->action_steps) *
+        static_cast<uint64_t>(config->action_dim) * sizeof(float);
+    rc |= frt_runtime_builder_add_port_token(
+        b, "actions", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32, FRT_RT_LAYOUT_FLAT,
+        FRT_RT_PORT_OUT, 0, owner->action_shape, 2, 0,
+        reinterpret_cast<frt_memory_token>(owner->engine.self),
+        frt_jetson_pi_actions_token_verbs(),
+        /*offset=*/0, action_window_bytes, FRT_RT_LOCATION_HOST_VISIBLE);
+#else
     rc |= frt_runtime_builder_add_port(
         b, "actions", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32, FRT_RT_LAYOUT_FLAT,
         FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0, owner->action_shape, 2, 0,
         nullptr, 0, 0);
+#endif
     rc |= frt_runtime_builder_add_callback_stage_v2(
         b, "infer", 0, nullptr, 0);
     rc |= frt_runtime_builder_add_identity(b, "provider", "llama_cpp");

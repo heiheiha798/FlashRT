@@ -33,6 +33,17 @@ extern "C" {
 const frt_llama_cpp_engine_factory_v1*
 frt_llama_cpp_default_engine_factory(void);
 
+// Phase 6 memory-domain token verbs for the Pi0 actions OUT port. The paired
+// frt_memory_token handle is frt_llama_cpp_engine_v1::self (the provider's
+// engine pointer, round-tripped opaquely). location_kind is HOST_VISIBLE:
+// the backing store is the engine's host-resident actions_buf, read live at
+// copy_to_host call time (NOT a mint-time snapshot). Returns a borrowed
+// pointer to a process-global verb table; valid for the process lifetime.
+// destroy is null (the engine owns the buffer; release frees it after the
+// holder's token-destroy loop).
+const frt_memory_token_verbs*
+frt_jetson_pi_actions_token_verbs(void);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif
