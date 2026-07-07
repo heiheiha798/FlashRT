@@ -81,16 +81,22 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
 - **LLM raw prompt.** `generate(prompt)` takes a raw prompt; the caller must
   apply the chat template (e.g. `llama_chat_apply_template`) before calling.
   No streaming; one blob out. Each call clears KV (independent completion).
-- **CPU and CUDA backends verified.** `backend="cuda"` is verified end-to-end
-  on an RTX 4090 (sm_89) for all three providers — Pi0 (`offloaded 37/37
-  layers`, pi0_base), LLM (`29/29`, qwen3-0.6b-q4_k_m), and MLLM (`37/37`,
-  Qwen2.5-VL-3B-Instruct-q4_0; the VIT/mmproj encoder offloads too). For Pi0
-  and LLM the generated output is coherent; for MLLM the GPU execution path
-  (load → VIT encode → forward → sample) is exercised, but the smoke test
+- **CPU, CUDA, and Vulkan backends verified.** `backend="cuda"` is verified
+  end-to-end on an RTX 4090 (sm_89) for all three providers — Pi0 (`offloaded
+  37/37 layers`, pi0_base), LLM (`29/29`, qwen3-0.6b-q4_k_m), and MLLM
+  (`37/37`, Qwen2.5-VL-3B-Instruct-q4_0; the VIT/mmproj encoder offloads too).
+  For Pi0 and LLM the generated output is coherent; for MLLM the GPU execution
+  path (load → VIT encode → forward → sample) is exercised, but the smoke test
   feeds a raw prompt so the output is template-token noise rather than a
   caption — output coherence requires a caller-applied chat template (see the
-  MLLM note below). The CUDA build needs its own build dir with
-  `-DGGML_CUDA=ON` (it defaults OFF), plus the same Jetson-PI flags:
+  MLLM note below). `backend="vulkan"` is also verified on the RTX 4090 for
+  Pi0 and LLM (smoke + numerical parity vs the direct `jetson_pi_*` call, both
+  passing with `max_diff = 0` / exact text match); the VIT/mmproj encoder
+  offloads to Vulkan0 too (`clip_ctx: CLIP using Vulkan0 backend`). Per §6 of
+  the migration plan, compiling a backend does not guarantee every model op is
+  supported on it — each model×backend combo is verified separately. The CUDA
+  build needs its own build dir with `-DGGML_CUDA=ON` (it defaults OFF), plus
+  the same Jetson-PI flags:
 
   ```bash
   cmake -S FlashRT/cpp -B FlashRT/cpp/build-jetson-pi-cuda \
@@ -113,10 +119,62 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
   `_c.so` and env-override recipe apply to the LLM (`FLASHRT_LLM_*`) and MLLM
   (`FLASHRT_MLLM_*`) smoke tests — see their sections below.
 
-  Note: the Jetson-PI engine maps `backend == "cuda"` to GPU offload by exact
-  string match; any other value (including typos) silently runs CPU. Treat the
-  `offloaded N/N layers to GPU` log line as the real signal that CUDA was
-  exercised.
+  Note: the Jetson-PI engine accepts `backend` `"cpu"` / `"cuda"` / `"vulkan"`
+  by exact string match; any other value (including typos) is **rejected** by
+  `open` (returns `INVALID` + a null handle), NOT a silent CPU fallback — this
+  honors the project's no-fallback contract. `"cpu"` sets `n_gpu_layers=0`;
+  `"cuda"`/`"vulkan"` set `n_gpu_layers=9999`. The actual device (CUDA0 /
+  Vulkan0) is chosen by GGML's scheduler from the backends registered by
+  `ggml_backend_load_all` (i.e. what was compiled in), **not** pinned by the
+  string — so on a CUDA+Vulkan mixed build, `backend="vulkan"` would split
+  layers across CUDA0+Vulkan0, and on a build lacking the requested backend GGML
+  leaves everything on CPU. The per-build recipes below use a single-backend
+  build (`-DGGML_CUDA=ON` or `-DGGML_VULKAN=ON -DGGML_CUDA=OFF`) to avoid that
+  ambiguity. Treat the `load_tensors: layer N assigned to device <Dev>` /
+  `offloaded N/N layers to <Dev>` log line as the real signal that the intended
+  backend was exercised.
+
+  **Vulkan backend** (verified on RTX 4090 for Pi0 + LLM). Build in a separate
+  dir with `-DGGML_VULKAN=ON -DGGML_CUDA=OFF` (Vulkan is SPIR-V; no CUDA arch
+  needed) and conda compilers; the `vulkan-shaders-gen` build-time tool needs a
+  C++17 host compiler, so export `CC`/`CXX` to the conda compilers for the
+  build step:
+
+  ```bash
+  cmake -S FlashRT/cpp -B FlashRT/cpp/build-jetson-pi-vulkan \
+    -DCMAKE_C_COMPILER=.../x86_64-conda-linux-gnu-cc \
+    -DCMAKE_CXX_COMPILER=.../x86_64-conda-linux-gnu-c++ \
+    -DCMAKE_PREFIX_PATH=.../envs/migrate \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+    -DFLASHRT_CPP_WITH_JETSON_PI=ON \
+    -DJETSON_PI_ROOT=/path/to/Jetson-PI \
+    -DGGML_VULKAN=ON -DGGML_CUDA=OFF
+  CC=.../x86_64-conda-linux-gnu-cc CXX=.../x86_64-conda-linux-gnu-c++ \
+    cmake --build FlashRT/cpp/build-jetson-pi-vulkan -j32 \
+    --target flashrt_cpp_llama_cpp_provider_c
+  ```
+
+  `CMAKE_PREFIX_PATH` must point at a prefix providing the Vulkan loader
+  (`libvulkan.so`), `glslc` (conda-forge `vulkan-loader` + `shaderc`), and the
+  Vulkan **headers**. Header caveat: conda-forge `vulkan-headers` (1.3.231)
+  lacks the `vk_video/` av1 codec headers and `vulkan_hpp_macros.hpp` that
+  `vulkan_core.h` unconditionally `#include`s, so a build against just the conda
+  headers fails with `fatal error: vk_video/vulkan_video_codec_av1std.h`. Use
+  the current Khronos `Vulkan-Headers` (≥1.3.295, which bundles `vk_video/` +
+  the split hpp files) — `git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git`
+  and point `CMAKE_PREFIX_PATH` at its `include` parent (or stage its `vulkan/`
+  + `vk_video/` ahead of the conda env's). Do NOT rely on overwriting the conda
+  env's `include/vulkan` in place — a later `conda install/update vulkan-headers`
+  clobbers it; a separate prefix is robust. The Vulkan device is selected by
+  `GGML_VK_VISIBLE_DEVICES=<idx>` (emulates `CUDA_VISIBLE_DEVICES`). Then set
+  `FLASHRT_PI0_BACKEND=vulkan` / `FLASHRT_LLM_BACKEND=vulkan`, point
+  `FLASHRT_PI0_LIB`/`FLASHRT_LLM_LIB` at the vulkan build's `_c.so`, and ensure
+  `LD_LIBRARY_PATH` includes the vulkan build's `bin/` (for `libggml-vulkan.so`).
+  Verified: Pi0 `pi0_base` offloads 36 layers + VIT to Vulkan0, actions
+  (10,32) sane, parity `max_diff = 0` vs the direct `jetson_pi_pi0` call;
+  LLM `qwen3-0.6b-q4_k_m` offloads 28 layers to Vulkan0, greedy text
+  byte-identical to the direct `jetson_pi_llm` call. MLLM-on-Vulkan is not
+  verified this round (§6: each model×backend combo separately).
 - **No calibration.** The frontends have no `calibrate`/`calibrated`; the
   Jetson-PI providers do not need FlashRT-style FP8 calibration.
 - **`state` is a separate port** for Pi0, not encoded into the prompt (unlike
