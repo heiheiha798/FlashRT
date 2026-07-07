@@ -108,6 +108,16 @@ int main() {
     // Action dims come from env (default 50x32 for LIBERO base; pi0_base is 10x32).
     const char * steps_env = std::getenv("FLASHRT_PI0_ACTION_STEPS");
     const char * dim_env   = std::getenv("FLASHRT_PI0_ACTION_DIM");
+    // Backend is "cpu" by default (byte-identical to the original test). Set
+    // FLASHRT_PI0_BACKEND=cuda to run the real forward pass on the GPU (the
+    // Jetson-PI engine maps backend=="cuda" to n_gpu_layers=9999 and use_gpu
+    // for the mmproj). CUDA_VISIBLE_DEVICES selects the physical card.
+    // Applied to the real-Pi0 JSON only (sub-test B); the bogus-path and
+    // action_dim-mismatch sub-tests keep "cpu" hardcoded so they stay cheap
+    // and deterministic.
+    const char * be_env = std::getenv("FLASHRT_PI0_BACKEND");
+    const std::string backend = (be_env && be_env[0]) ? std::string(be_env)
+                                                     : std::string("cpu");
     long action_steps = steps_env ? std::atol(steps_env) : 50;
     long action_dim   = dim_env   ? std::atol(dim_env)   : 32;
     if (action_steps <= 0 || action_dim <= 0 || action_steps > 10000 ||
@@ -119,6 +129,11 @@ int main() {
     // ---- sub-test C: config vs model action_dim mismatch fails cleanly ----
     // Real model is 10x32 (or whatever env says); claim a wrong action_dim
     // and expect create_pi0 to reject without leaking the opened engine.
+    // Backend is hardcoded "cpu" here on purpose: this path only exercises the
+    // action_dim rejection, so paying for a full GPU model load + 37-layer
+    // offload (which FLASHRT_PI0_BACKEND=cuda would trigger) is wasteful and
+    // nondeterministic. The env-driven backend below is for the real forward
+    // pass only.
     {
         std::string mismatch_json =
             std::string("{") +
@@ -142,7 +157,7 @@ int main() {
         "\"model_family\":\"pi0\","
         "\"model_path\":\"" + model_env + "\","
         "\"mmproj_path\":\"" + mmproj_env + "\","
-        "\"backend\":\"cpu\","
+        "\"backend\":\"" + backend + "\","
         "\"n_views\":2,\"image_height\":224,\"image_width\":224,"
         "\"image_channels\":3,\"action_steps\":" + std::to_string(action_steps) +
         ",\"action_dim\":" + std::to_string(action_dim) + "}";
