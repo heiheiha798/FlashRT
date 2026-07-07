@@ -7,6 +7,12 @@ Env:
   FLASHRT_MLLM_MODEL   path to a VLM GGUF (e.g. Qwen2.5-VL-3B-Instruct-q4_0.gguf)
   FLASHRT_MLLM_MMPROJ  path to the VIT mmproj GGUF
   FLASHRT_MLLM_LIB     (optional) path to libflashrt_cpp_llama_cpp_provider_c.so
+  FLASHRT_MLLM_BACKEND (optional) backend for the Jetson-PI engine; default
+                        "cpu" (byte-identical to the original test). Set to
+                        "cuda" to run the real forward pass on the GPU (the
+                        engine maps backend=="cuda" to full-layer GPU offload
+                        for both the LLM and the VIT/mmproj encoder).
+                        CUDA_VISIBLE_DEVICES selects the physical card.
 """
 
 import os
@@ -30,12 +36,16 @@ def main():
 
     import flash_rt
 
+    # Default "cpu" keeps the original behavior; set FLASHRT_MLLM_BACKEND=cuda
+    # to exercise the real GPU forward pass through the Jetson-PI engine.
+    backend = os.environ.get("FLASHRT_MLLM_BACKEND", "cpu") or "cpu"
+
     fe = flash_rt.load_model(
         model_env,
         framework="jetson_pi",
         config="mllm",
         mmproj_path=mmproj_env,
-        backend="cpu",
+        backend=backend,
         n_ctx=2048,
         n_threads=0,
         temp=0.0,

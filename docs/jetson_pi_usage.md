@@ -82,7 +82,14 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
   apply the chat template (e.g. `llama_chat_apply_template`) before calling.
   No streaming; one blob out. Each call clears KV (independent completion).
 - **CPU and CUDA backends verified.** `backend="cuda"` is verified end-to-end
-  on an RTX 4090 (sm_89). The CUDA build needs its own build dir with
+  on an RTX 4090 (sm_89) for all three providers — Pi0 (`offloaded 37/37
+  layers`, pi0_base), LLM (`29/29`, qwen3-0.6b-q4_k_m), and MLLM (`37/37`,
+  Qwen2.5-VL-3B-Instruct-q4_0; the VIT/mmproj encoder offloads too). For Pi0
+  and LLM the generated output is coherent; for MLLM the GPU execution path
+  (load → VIT encode → forward → sample) is exercised, but the smoke test
+  feeds a raw prompt so the output is template-token noise rather than a
+  caption — output coherence requires a caller-applied chat template (see the
+  MLLM note below). The CUDA build needs its own build dir with
   `-DGGML_CUDA=ON` (it defaults OFF), plus the same Jetson-PI flags:
 
   ```bash
@@ -102,7 +109,9 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
   Then point `FLASHRT_PI0_LIB` at `build-jetson-pi-cuda/libflashrt_cpp_llama_cpp_provider_c.so`,
   set `FLASHRT_PI0_BACKEND=cuda`, and ensure `LD_LIBRARY_PATH` includes the
   CUDA build's `bin/` (for `libggml-cuda.so`) and `runtime/`. The smoke test
-  then offloads all model layers to the GPU (37/37 for pi0_base).
+  then offloads all model layers to the GPU (37/37 for pi0_base). The same
+  `_c.so` and env-override recipe apply to the LLM (`FLASHRT_LLM_*`) and MLLM
+  (`FLASHRT_MLLM_*`) smoke tests — see their sections below.
 
   Note: the Jetson-PI engine maps `backend == "cuda"` to GPU offload by exact
   string match; any other value (including typos) silently runs CPU. Treat the
@@ -146,6 +155,12 @@ LD_LIBRARY_PATH=.../miniconda3/lib:FlashRT/cpp/build-jetson-pi \
 python -m flash_rt.tests.test_jetson_pi_llm_python
 ```
 
+`FLASHRT_LLM_BACKEND=cuda` switches the test to the GPU forward pass; point
+`FLASHRT_LLM_LIB` at the `build-jetson-pi-cuda/libflashrt_cpp_llama_cpp_provider_c.so`
+and add the cuda build's `bin/` to `LD_LIBRARY_PATH` (same recipe as the Pi0
+CUDA section above). Verified on an RTX 4090 (sm_89): `offloaded 29/29 layers
+to GPU` for qwen3-0.6b-q4_k_m.
+
 ## Multimodal LLM (Phase 4)
 
 ```python
@@ -186,4 +201,17 @@ FLASHRT_MLLM_LIB=FlashRT/cpp/build-jetson-pi/libflashrt_cpp_llama_cpp_provider_c
 LD_LIBRARY_PATH=.../miniconda3/lib:FlashRT/cpp/build-jetson-pi \
 python -m flash_rt.tests.test_jetson_pi_mllm_python
 ```
+
+`FLASHRT_MLLM_BACKEND=cuda` switches the test to the GPU forward pass (LLM
+layers + VIT/mmproj encoder both offloaded); point `FLASHRT_MLLM_LIB` at the
+`build-jetson-pi-cuda/libflashrt_cpp_llama_cpp_provider_c.so` (same CUDA recipe
+as the Pi0 section above). Verified on an RTX 4090 (sm_89): `offloaded 37/37
+layers to GPU` for Qwen2.5-VL-3B-Instruct-q4_0.
+
+Note: the engine injects one media marker per supplied image *after* the prompt
+text (see `jetson_pi_mllm.cpp`); the smoke test feeds a raw prompt, so the
+generated text is a connectivity check (non-empty, printable), not a
+task-accurate caption. Callers wanting a well-formed answer must apply the
+model's chat template (with the image placeholder positioned by the template)
+themselves.
 

@@ -4,8 +4,13 @@ the Python ``flash_rt.load_model(framework="jetson_pi", config="llm")`` entry.
 Skips (returns early) when FLASHRT_LLM_MODEL is unset.
 
 Env:
-  FLASHRT_LLM_MODEL  path to a GGUF LLM (e.g. qwen3-0.6b-q4_k_m.gguf)
-  FLASHRT_LLM_LIB    (optional) path to libflashrt_cpp_llama_cpp_provider_c.so
+  FLASHRT_LLM_MODEL    path to a GGUF LLM (e.g. qwen3-0.6b-q4_k_m.gguf)
+  FLASHRT_LLM_LIB      (optional) path to libflashrt_cpp_llama_cpp_provider_c.so
+  FLASHRT_LLM_BACKEND  (optional) backend for the Jetson-PI engine; default
+                        "cpu" (byte-identical to the original test). Set to
+                        "cuda" to run the real forward pass on the GPU (the
+                        engine maps backend=="cuda" to full-layer GPU offload).
+                        CUDA_VISIBLE_DEVICES selects the physical card.
 """
 
 import os
@@ -24,11 +29,15 @@ def main():
 
     import flash_rt
 
+    # Default "cpu" keeps the original behavior; set FLASHRT_LLM_BACKEND=cuda
+    # to exercise the real GPU forward pass through the Jetson-PI engine.
+    backend = os.environ.get("FLASHRT_LLM_BACKEND", "cpu") or "cpu"
+
     fe = flash_rt.load_model(
         model_env,
         framework="jetson_pi",
         config="llm",
-        backend="cpu",
+        backend=backend,
         n_ctx=2048,
         n_threads=0,
         temp=0.0,        # greedy for deterministic test output
