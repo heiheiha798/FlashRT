@@ -57,6 +57,30 @@ __device__ __forceinline__ float block_reduce_max_128(float v, float* sh) {
   return out;
 }
 
+// Block sum reduce for a 256-thread block (8 warps). Mirrors block_reduce_sum
+// in csrc/kernels/common.cuh but kept local so this translation unit stays
+// self-contained.
+__device__ __forceinline__ float block_reduce_sum_256(float v, float* sh) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  for (int off = 16; off > 0; off >>= 1) {
+    v += __shfl_xor_sync(0xffffffff, v, off);
+  }
+  if (lane == 0) sh[warp] = v;
+  __syncthreads();
+  if (warp == 0) {
+    v = (lane < 8) ? sh[lane] : 0.0f;
+    for (int off = 4; off > 0; off >>= 1) {
+      v += __shfl_xor_sync(0xffffffff, v, off);
+    }
+    if (lane == 0) sh[0] = v;
+  }
+  __syncthreads();
+  const float out = sh[0];
+  __syncthreads();
+  return out;
+}
+
 __global__ void fp8_per_token_block_quant_kernel(
     const __nv_bfloat16* __restrict__ input,
     __nv_fp8_e4m3* __restrict__ output,
@@ -294,6 +318,14 @@ __global__ void residual_add_rms_norm_to_fp8_block128_kernel(
 // BF16 so the downstream GEMV can use the bf16in kernel. Same residual_out
 // semantics as the FP8 version (separate buffer, residual input preserved).
 // M=1 decode; K multiple of 128.
+//
+// Uses 256 threads + packed BF16x2 loads (matching the fvk2
+// residual_add_rms_norm_kernel shape) instead of the 128-thread scalar loop the
+// FP8 variant inherits. ncu showed the 128-thread grid (1 block) leaves the SM
+// mostly idle and is L1TEX-stall-bound on the per-element reload; the wider
+// block halves latency by processing 2x elements per thread per iteration with
+// coalesced 4-byte loads, and keeps the same single-block grid so residual_out
+// stays a separate buffer (unlike fvk2 which is in-place on residual).
 __global__ void residual_add_rms_norm_bf16_out_kernel(
     const __nv_bfloat16* __restrict__ residual,
     const __nv_bfloat16* __restrict__ x,
@@ -302,28 +334,37 @@ __global__ void residual_add_rms_norm_bf16_out_kernel(
     __nv_bfloat16* __restrict__ output,
     int K, float eps)
 {
+  using T2 = __nv_bfloat162;
   const int m = blockIdx.x;
   const int t = threadIdx.x;
-  const __nv_bfloat16* rrow = residual + (size_t)m * K;
-  const __nv_bfloat16* xrow = x + (size_t)m * K;
-  __nv_bfloat16* res_out = residual_out + (size_t)m * K;
-  __nv_bfloat16* out = output + (size_t)m * K;
+  const int dim2 = K >> 1;
+  const T2* res2 = reinterpret_cast<const T2*>(residual + (size_t)m * K);
+  const T2* x2   = reinterpret_cast<const T2*>(x + (size_t)m * K);
+  const T2* w2   = reinterpret_cast<const T2*>(weight);
+  T2* res_out2   = reinterpret_cast<T2*>(residual_out + (size_t)m * K);
+  T2* out2       = reinterpret_cast<T2*>(output + (size_t)m * K);
 
-  float ssq = 0.0f;
-  for (int i = t; i < K; i += kBlock) {
-    const float rv = __bfloat162float(rrow[i]) + __bfloat162float(xrow[i]);
-    const __nv_bfloat16 rb = __float2bfloat16(rv);
-    res_out[i] = rb;
-    const float rbf = __bfloat162float(rb);
-    ssq += rbf * rbf;
+  extern __shared__ float shared[];
+  float local_sum = 0.0f;
+  for (int i = t; i < dim2; i += blockDim.x) {
+    T2 rv = res2[i], xv = x2[i];
+    float r0 = __bfloat162float(__low2bfloat16(rv)) +
+               __bfloat162float(__low2bfloat16(xv));
+    float r1 = __bfloat162float(__high2bfloat16(rv)) +
+               __bfloat162float(__high2bfloat16(xv));
+    res_out2[i] = __floats2bfloat162_rn(r0, r1);
+    local_sum += r0 * r0 + r1 * r1;
   }
-  __shared__ float red[4];
-  const float inv_rms = rsqrtf(block_reduce_sum_128(ssq, red) / K + eps);
+  const float inv_rms =
+      rsqrtf(block_reduce_sum_256(local_sum, shared) / K + eps);
 
-  for (int i = t; i < K; i += kBlock) {
-    const float v = __bfloat162float(res_out[i]) * inv_rms *
-                    __bfloat162float(weight[i]);
-    out[i] = __float2bfloat16(v);
+  for (int i = t; i < dim2; i += blockDim.x) {
+    T2 rv = res_out2[i], wv = w2[i];
+    float v0 = __bfloat162float(__low2bfloat16(rv)) * inv_rms *
+               __bfloat162float(__low2bfloat16(wv));
+    float v1 = __bfloat162float(__high2bfloat16(rv)) * inv_rms *
+               __bfloat162float(__high2bfloat16(wv));
+    out2[i] = __floats2bfloat162_rn(v0, v1);
   }
 }
 
@@ -487,7 +528,12 @@ void residual_add_rms_norm_bf16_out(
   if ((K % kBlock) != 0)
     throw std::runtime_error(
         "residual_add_rms_norm_bf16_out requires K multiple of 128");
-  residual_add_rms_norm_bf16_out_kernel<<<M, kBlock, 0, stream>>>(
+  // 256 threads (8 warps) for M=1 decode: doubles per-thread element throughput
+  // via BF16x2 packed loads vs the 128-thread scalar FP8 variant. Shared mem
+  // holds 8 warp partials for block_reduce_sum_256.
+  constexpr int kThreads = 256;
+  residual_add_rms_norm_bf16_out_kernel<<<M, kThreads,
+      kThreads * sizeof(float), stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(residual),
       reinterpret_cast<const __nv_bfloat16*>(x),
       reinterpret_cast<__nv_bfloat16*>(residual_out),

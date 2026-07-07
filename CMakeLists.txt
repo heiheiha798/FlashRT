@@ -1014,7 +1014,7 @@ if(FLASHRT_BUILD_QWEN3_VL)
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
   target_compile_options(flash_rt_qwen3_vl_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
-      --expt-relaxed-constexpr -O3
+      --expt-relaxed-constexpr -O3 -lineinfo
       -U__CUDA_NO_BFLOAT16_OPERATORS__
       -U__CUDA_NO_BFLOAT162_OPERATORS__
       ${GPU_GENCODE}
