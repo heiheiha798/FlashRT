@@ -157,6 +157,8 @@ option(FLASHRT_ENABLE_QWEN35MOE
 # module so flash_rt_kernels.so stays stable; OFF by default.
 option(FLASHRT_BUILD_QWEN3_VL
        "Build Qwen3-VL kernels into a separate flash_rt_qwen3_vl_kernels module" OFF)
+option(FLASHRT_ENABLE_QWEN3_VL_DEV_KERNELS
+       "Expose Qwen3-VL bench/probe pybind symbols for kernel development" OFF)
 # MelBandRoformer audio source separation kernels (FP8 fused kernels for
 # BF16-in / FP8-out norm, QKV+RoPE, gated attention quant, residual+norm).
 # OFF by default; enable with -DFLASHRT_ENABLE_MELBAND_ROFORMER=ON.
@@ -1004,6 +1006,10 @@ if(FLASHRT_BUILD_QWEN3_VL)
   if(GPU_ARCH STREQUAL "89")
     target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
       ENABLE_SM89_BLOCK_FP8_GEMM=1)
+  endif()
+  if(FLASHRT_ENABLE_QWEN3_VL_DEV_KERNELS)
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_DEV_KERNELS=1)
   endif()
   set_target_properties(flash_rt_qwen3_vl_kernels PROPERTIES
     CUDA_STANDARD 17

@@ -47,21 +47,20 @@ cmake -S . -B build -DGPU_ARCH=89 -DFLASHRT_BUILD_QWEN3_VL=ON
 cmake --build build -j --target flash_rt_kernels flash_rt_fa2 flash_rt_qwen3_vl_kernels
 ```
 
-## lm_head: optional FP8 mode for 2B
+## lm_head default
 
-The frontend default is BF16 `lm_head` (shared with the 8B path). For
-throughput-sensitive local validation, pass `use_fp8_lm_head=True` or
-`--fp8-lm-head`. The 152k-vocab projection is a large decode-time weight read,
-so FP8 `lm_head` can reduce bandwidth pressure on 2B. Treat it as a performance
-mode: validate logits and generation quality against the default BF16 head on
-the target checkpoint before using it in production.
+The frontend default is FP8 `lm_head` (shared with the 8B path). The
+152k-vocab projection is a large decode-time weight read, so FP8 `lm_head`
+reduces bandwidth pressure on 2B. For BF16 reference validation or deployment
+comparisons, construct the frontend with `use_fp8_lm_head=False` or pass
+`--no-fp8-lm-head` to `scripts/smoke_qwen3_vl_fp8_sm89.py`.
 
 ## Quickstart
 
 ```bash
 python scripts/smoke_qwen3_vl_fp8_sm89.py \
   --checkpoint /path/to/Qwen3-VL-2B-Instruct-FP8 \
-  --multimodal --fp8-lm-head --iters 10 --generate-tokens 32
+  --multimodal --iters 10 --generate-tokens 32
 ```
 
 ## RTX 4090 Validation

@@ -58,11 +58,13 @@ The dtype mapping is:
 | Residual stream and norms | BF16 |
 | Vision protected blocks | BF16 |
 | Vision bulk GEMMs | FP8 block-128 activation/weight, BF16 output |
-| `lm_head` default | BF16 |
+| `lm_head` default | FP8 block-128 |
 
-`use_fp8_lm_head=True` remains an explicit experimental mode. Single-step
-logits can match closely, but multi-token generation can diverge after the
-first generated tokens, so BF16 `lm_head` is the default.
+`use_fp8_lm_head=True` is the default for the SM89 FP8 path because the
+vocabulary projection is a large decode-time weight read. For BF16 reference
+validation or deployment comparisons, construct the frontend with
+`use_fp8_lm_head=False` or pass `--no-fp8-lm-head` to
+`scripts/smoke_qwen3_vl_fp8_sm89.py`.
 
 ## Quickstart
 

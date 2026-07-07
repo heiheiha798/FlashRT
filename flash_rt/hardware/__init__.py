@@ -136,9 +136,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # ── Qwen3-VL (multimodal Qwen3-VL-8B, NVFP4 + FP8 paths) ──
     # VLM with chat-style API (generate(messages) -> str), not VLA
     # predict(images). Requires the gated kernel build
-    # (-DFLASHRT_BUILD_QWEN3_VL=ON). Registered for discoverability;
-    # direct instantiation of the frontend class is the typical usage
-    # (see docs/qwen3_vl_nvfp4.md, docs/qwen3_vl_fp8_sm89.md).
+    # (-DFLASHRT_BUILD_QWEN3_VL=ON). Registered for resolver/direct frontend
+    # discovery only; load_model(config="qwen3_vl") raises a redirect because
+    # the frontend exposes a chat-style VLM surface rather than VLAModel.
+    # See docs/qwen3_vl_nvfp4.md and docs/qwen3_vl_fp8_sm89.md.
     ("qwen3_vl", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.qwen3_vl_rtx", "Qwen3VlTorchFrontendRtx"),
     ("qwen3_vl", "torch", "rtx_sm89"):
