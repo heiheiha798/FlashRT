@@ -64,6 +64,8 @@ The CUDA export path already has one (CUDA-specific by construction); GGML must 
 
 ## 4. mllm reference patterns worth borrowing (lens 3)
 
+> NOTE: the `mllm/` reference repo was deleted from the workspace on 2026-07-07 after this distillation. The file:line citations below (`X2XOp.cpp:13-15` etc.) are historical references to that repo, retained as provenance; reclone `git@github.com:UbiquitousLearning/mllm.git` if you need to re-open them. The distilled patterns themselves are self-contained in this section.
+
 mllm is reference architecture, NOT transplant material (CLAUDE.md). Worth borrowing for Phase 6:
 
 1. **Device-tagged storage with tag-driven alloc/free routing** (`Storage.device_` + `MemoryManager::alloc` lookup). This is the minimal viable "memory domain" primitive: a buffer carries a domain tag, and a registry maps tag→allocator. FlashRT's analog: a `frt_memory_token` carries a `location_kind` tag; copy/sync dispatch by that tag.

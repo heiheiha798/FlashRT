@@ -38,7 +38,8 @@ model = flash_rt.load_model(
     mmproj_path="/path/to/mmproj-model-f16.gguf",
     backend="cpu",            # or "cuda"
     num_views=2,
-    action_steps=10,          # pi0_base; pi0_libero_base is 50
+    action_steps=10,          # pi0_base metadata; see CLAUDE.md weights note
+                             # (pi0_libero_base fails this fork's check_tensor_dims)
     action_dim=32,
     lib_path=None,            # auto-discover, or set FLASHRT_PI0_LIB
 )
