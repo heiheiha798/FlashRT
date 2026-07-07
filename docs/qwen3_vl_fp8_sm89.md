@@ -153,13 +153,14 @@ graph_decode_pos=63 median=8.715 ms (8B) / 2.361 ms (2B), cos_vs_eager=1.000000
 The same workload on the SM120/NVFP4 path is faster because it uses Blackwell
 NVFP4 language kernels. The SM89 path is intended to use the best available
 Ada-compatible dtype path: official FP8 language weights, BF16 attention and
-residual state, and BF16 `lm_head`.
+residual state, and FP8 `lm_head` by default.
 
 ## Limits
 
 - This is not an NVFP4 implementation. SM89 uses official FP8 weights because
   NVFP4 is a Blackwell path.
-- `lm_head` stays BF16 by default for generation quality.
+- FP8 `lm_head` is the default; use `use_fp8_lm_head=False` or
+  `--no-fp8-lm-head` for BF16 reference comparisons.
 - Single-image prefill has a CUDA Graph replay path. Multi-image and video
   should use the eager path unless separately validated.
 - Decode graphs are captured per cache position because the FA2 call captures
