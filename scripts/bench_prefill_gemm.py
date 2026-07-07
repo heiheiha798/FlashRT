@@ -50,8 +50,10 @@ SHAPES_8B = [("8B_qkv", 6144, 4096), ("8B_o", 4096, 4096),
 
 def bench(fn, args, warmup, iters, pollute=None):
     s = torch.cuda.current_stream().cuda_stream
+    # All bench GEMM bindings take (A,B,D,M,N,K,asc,wsc,stream). The cold/warm
+    # callers already pass `s` as the trailing positional arg, so forward as-is.
     def run():
-        fn(*args, stream=s) if fn.__code__.co_argcount > 7 else fn(*args)
+        fn(*args)
     for _ in range(warmup):
         if pollute is not None: pollute()
         run()
