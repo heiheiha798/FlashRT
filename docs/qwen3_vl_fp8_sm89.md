@@ -112,18 +112,41 @@ CUDA_VISIBLE_DEVICES=0 python scripts/smoke_qwen3_vl_fp8_sm89.py \
   --generate-tokens 0
 ```
 
-Result:
+Result (RTX 4090, sm_89, empty card, iters=30, median):
 
 ```text
 S=1581 pixel_shape=(6256, 1536) spans=[(4, 1568)]
-set_prompt_warm median=15.711 ms
-vision_only median=88.990 ms
-language_only_no_mm_scatter median=120.634 ms
-prefill median=206.987 ms top=785 finite=True
-prefill_graph median=206.214 ms cos_vs_eager=0.998522 top=785 finite=True
-graph_decode_cache_pos=1581 median=10.681 ms cos_vs_eager=1.000000
+set_prompt_warm median=12.594 ms
+vision_only median=82.009 ms
+language_only_no_mm_scatter median=106.863 ms
+prefill median=193.291 ms top=785 finite=True
+prefill_graph median=193.183 ms cos_vs_eager=1.000000 top=785 finite=True
+graph_decode_cache_pos=1581 median=9.284 ms cos_vs_eager=1.000000
 top_eager=2168 top_graph=2168
 ```
+
+vs the initial PR #111 numbers (iters=3 at PR time): `prefill_graph`
+206.214 → 193.183 ms (**-6.3%**), `graph_decode` 10.681 → 9.284 ms
+(**-13.1%**), `language_only_no_mm_scatter` 120.634 → 106.863 ms (-11.4%),
+`vision_only` 88.990 → 82.009 ms (-7.8%). The decode gain comes from the
+decode-path work on this branch (BF16-input GEMV skipping the FP8 activation
+quant for O-proj / lm_head / qkv / gate_up, BF16-output RMSNorm feeding the
+bf16in GEMV, 512-thread decode norm for 8B occupancy, gate/up GEMV fusion,
+last-layer residual + final RMSNorm fusion); the prefill gain is dominated by
+the small-M 32x64 GEMM tile (short prefill, M<256) plus cross-layer norm
+fusion and kernel-lookup caching. Large-M prefill GEMM (the FlashRT.png
+single-image workload, M=1581) is L2-bandwidth-bound at ~84% L2 / 42% compute
+/ 33% occupancy and was not further optimized on this branch.
+
+Text-only decode (`--text-only`, iters=30, median):
+
+```text
+S=79 prefill median=12.641 ms (8B) / 6.586 ms (2B)
+graph_decode_pos=63 median=8.715 ms (8B) / 2.361 ms (2B), cos_vs_eager=1.000000
+```
+
+8B text decode 9.213 → 8.715 ms, 2B text decode 2.552 → 2.361 ms vs the
+2026-07-05 branch baseline.
 
 The same workload on the SM120/NVFP4 path is faster because it uses Blackwell
 NVFP4 language kernels. The SM89 path is intended to use the best available

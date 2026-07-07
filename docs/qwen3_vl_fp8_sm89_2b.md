@@ -69,28 +69,38 @@ python scripts/smoke_qwen3_vl_fp8_sm89.py \
 Environment: NVIDIA GeForce RTX 4090 (SM89); checkpoint
 `Qwen3-VL-2B-Instruct-FP8` (quantized as above); FP8 `lm_head`.
 
-Text-only (S=79 prefill, decode at cache_pos=63):
+Text-only (S=79 prefill, decode at cache_pos=63, iters=30, median):
 
 ```text
-S=79 prefill median=8.489 ms
-prefill_speedup=52.09x logit_cos=0.999426 top_prefill=198 top_loop=198
-graph_decode_pos=63 median=2.653 ms (377 tok/s) top=19564 finite=True
+S=79 prefill median=6.586 ms
+prefill_speedup=63.68x logit_cos=0.999504 top_prefill=198 top_loop=198
+graph_decode_pos=63 median=2.361 ms (423 tok/s) cos_vs_eager=1.000000 top=19564 finite=True
 ```
 
-Multimodal (`FlashRT.png`, `Describe this image in one sentence.`, S=1581):
+2B text decode 2.653 → 2.361 ms (377 → 423 tok/s) vs the initial PR #111
+number, from the decode-path work on this branch (BF16-input GEMV, BF16-output
+RMSNorm, gate/up GEMV fusion, FP8 lm_head).
+
+Multimodal (`FlashRT.png`, `Describe this image in one sentence.`, S=1581,
+iters=30, median):
 
 ```text
 S=1581 pixel_shape=(6256, 1536) spans=[(4, 1568)]
-vision_only median=69.670 ms
-language_only_no_mm_scatter median=29.827 ms
-prefill median=102.991 ms top=32 finite=True
-prefill_graph median=99.743 ms cos_vs_eager=0.997508 top=32 finite=True
-graph_decode_cache_pos=1581 median=2.966 ms (337 tok/s) cos_vs_eager=1.000000
+vision_only median=53.682 ms
+language_only_no_mm_scatter median=26.402 ms
+prefill median=81.548 ms top=32 finite=True
+prefill_graph median=81.129 ms cos_vs_eager=1.000000 top=32 finite=True
+graph_decode_cache_pos=1581 median=2.669 ms (375 tok/s) cos_vs_eager=1.000000
   top_eager=3691 top_graph=3691
 generate_tokens=32 text='A black background features the "FlashRT" logo, with
   an orange lightning bolt symbol next to the stylized text "FlashRT" in white
   and orange.'
 ```
+
+2B multimodal `prefill_graph` 99.743 → 81.129 ms (**-18.6%**), `graph_decode`
+2.966 → 2.669 ms (**-10.0%**), `vision_only` 69.670 → 53.682 ms (-23%),
+`language_only_no_mm_scatter` 29.827 → 26.402 ms (-11.4%) vs the initial PR
+#111 numbers.
 
 These numbers are local validation points, not CI guarantees. Re-benchmark on
 the target GPU, driver, and build flags before treating them as deployment
