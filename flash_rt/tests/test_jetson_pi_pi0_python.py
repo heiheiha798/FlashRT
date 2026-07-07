@@ -11,6 +11,12 @@ Env:
   FLASHRT_PI0_LIB          (optional) path to libflashrt_cpp_llama_cpp_provider_c.so
   FLASHRT_PI0_ACTION_STEPS (optional) override; default 10 (pi0_base).
   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
+  FLASHRT_PI0_BACKEND      (optional) backend for the Jetson-PI engine; default
+                            "cpu" (byte-identical to the original test). Set to
+                            "cuda" to run the real forward pass on the GPU
+                            (the engine maps backend=="cuda" to n_gpu_layers=9999
+                            and use_gpu for the mmproj). CUDA_VISIBLE_DEVICES
+                            selects the physical card.
 
 Run from the repo root:
     FLASHRT_PI0_MODEL=... FLASHRT_PI0_MMPROJ=... FLASHRT_PI0_FIXTURE_DIR=/tmp/pi0_fixture \
@@ -46,13 +52,16 @@ def main():
 
     action_steps = int(os.environ.get("FLASHRT_PI0_ACTION_STEPS", "10"))
     action_dim = int(os.environ.get("FLASHRT_PI0_ACTION_DIM", "32"))
+    # Default "cpu" keeps the original behavior; set FLASHRT_PI0_BACKEND=cuda to
+    # exercise the real GPU forward pass through the Jetson-PI engine.
+    backend = os.environ.get("FLASHRT_PI0_BACKEND", "cpu") or "cpu"
 
     import flash_rt
     model = flash_rt.load_model(
         model_env,
         framework="jetson_pi",
         mmproj_path=mmproj_env,
-        backend="cpu",
+        backend=backend,
         num_views=2,
         action_steps=action_steps,
         action_dim=action_dim,
