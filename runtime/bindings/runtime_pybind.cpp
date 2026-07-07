@@ -240,7 +240,7 @@ struct PyRtBuilder {
 frt_runtime_export_v1* as_export(std::uintptr_t p) {
     auto* e = reinterpret_cast<frt_runtime_export_v1*>(p);
     if (!e || e->abi_version != FRT_RUNTIME_ABI_VERSION ||
-        e->struct_size != sizeof(frt_runtime_export_v1))
+        e->struct_size < sizeof(frt_runtime_export_v1))
         throw std::runtime_error("not a valid frt_runtime_export_v1 pointer");
     return e;
 }
@@ -248,15 +248,22 @@ frt_runtime_export_v1* as_export(std::uintptr_t p) {
 frt_model_runtime_v1* as_model(std::uintptr_t p) {
     auto* m = reinterpret_cast<frt_model_runtime_v1*>(p);
     if (!m || m->abi_version != FRT_MODEL_RUNTIME_ABI_VERSION ||
-        m->struct_size != sizeof(frt_model_runtime_v1))
+        m->struct_size < sizeof(frt_model_runtime_v1))
         throw std::runtime_error("not a valid frt_model_runtime_v1 pointer");
     return m;
 }
 
 frt_model_runtime_v2* as_model_v2(std::uintptr_t p) {
     auto* m = reinterpret_cast<frt_model_runtime_v2*>(p);
+    /* Append-only: accept any producer whose struct_size is AT LEAST the v2
+     * size we were compiled against. A producer built with a newer header
+     * (larger struct_size, e.g. with Phase 6 port_tokens) must still be
+     * drivable; a producer built with this header matches exactly. The old
+     * strict `!=` gate would reject a newer producer and break the
+     * append-only contract — see frt_model_runtime_wrap (model_runtime.cpp)
+     * which already uses `>=`. */
     if (!m || m->abi_version != FRT_MODEL_RUNTIME_ABI_VERSION_V2 ||
-        m->struct_size != sizeof(frt_model_runtime_v2))
+        m->struct_size < sizeof(frt_model_runtime_v2))
         throw std::runtime_error("not a valid frt_model_runtime_v2 pointer");
     return m;
 }

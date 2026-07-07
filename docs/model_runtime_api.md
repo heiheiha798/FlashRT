@@ -124,9 +124,19 @@ frt_model_runtime_v2* m = frt_runtime_builder_finish_model_v2(
     b, &verbs_v2, verbs_self, owner, retain_owner, release_owner);
 ```
 
-Provider-owned v2 ports are `STAGED` only in this first contract. The builder
-rejects raw SWAP windows on this path until FlashRT has an explicit
-memory-domain contract for cross-provider buffers.
+Provider-owned v2 ports are `STAGED` by default. The builder rejects a raw
+SWAP window (`frt_buffer` + offset + bytes) on this path — that would imply
+same-backend device sharing with no contract. **Phase 6** adds the ONE
+permitted buffer form on provider-owned ports: a memory-domain **token**
+(`frt_memory_token` + `frt_memory_token_verbs` + `frt_rt_location_kind`),
+attached via `frt_runtime_builder_add_port_token`. The token is an opaque
+provider-minted handle; FlashRT never dereferences it — it only calls the
+provider's `copy_to_host` / `copy_from_host` / `sync` / `destroy` verbs.
+Zero-copy is an ADVERTISED capability (`location_kind = HOST_VISIBLE`), not an
+assumption FlashRT makes. `destroy` fires exactly once when the runtime's
+refcount hits zero. See `docs/phase6_backend_vtable_eval.md` for the full
+contract and the vtable-vs-contract decision. The CUDA-export SWAP path
+(`frt_buffer` on a non-provider-owned runtime) is unchanged.
 
 Identity covers each port's schema **and its bound window** (buffer index
 into the declared buffers array, offset, bytes) plus the stage DAG; only

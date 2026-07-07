@@ -130,6 +130,71 @@ extern "C" int frt_runtime_builder_add_port(frt_runtime_builder b,
     d.offset = offset;
     d.bytes = bytes;
     h->ports.push_back(d);
+
+    /* Phase 6: push a NULL token entry so `h->port_tokens` stays index-parallel
+     * with `h->ports` (the header invariant: port_tokens[i] aligns with
+     * ports[i], handle == nullptr for a port that carries no token). A port
+     * added through this entry never carries a token — only
+     * frt_runtime_builder_add_port_token mints a real one. The release-time
+     * destroy loop already no-ops on a null handle, so this is just alignment.
+     * Without this, a runtime that mixes add_port + add_port_token would have
+     * n_port_tokens != n_ports and port_tokens would be column-shifted. */
+    frt_memory_token_desc null_tk{};
+    null_tk.struct_size = (uint32_t)sizeof(frt_memory_token_desc);
+    h->port_tokens.push_back(null_tk);
+    return 0;
+}
+
+/* Phase 6 — provider-owned port with a memory-domain token. The port is
+ * recorded with update=STAGED (no raw frt_buffer; the token is the only
+ * buffer form on provider-owned ports) and a parallel port_tokens entry
+ * whose handle is the provider-minted token. `valid_port_args` rejects bad
+ * name/direction/update/shape. We additionally require a non-null handle +
+ * verbs for a token port. */
+extern "C" int frt_runtime_builder_add_port_token(
+        frt_runtime_builder b, const char* name,
+        uint32_t modality, uint32_t dtype, uint32_t layout, uint32_t direction,
+        uint32_t required, const int64_t* shape, uint32_t rank,
+        uint32_t cadence_hint_hz,
+        frt_memory_token handle, const frt_memory_token_verbs* verbs,
+        uint64_t offset, uint64_t bytes, uint32_t location_kind) {
+    if (!b) return -1;
+    if (!valid_port_args(name, direction, FRT_RT_PORT_STAGED, shape, rank))
+        return -1;
+    if (!handle || !verbs ||
+        verbs->struct_size < sizeof(frt_memory_token_verbs) ||
+        !verbs->copy_to_host || !verbs->copy_from_host || !verbs->sync) {
+        return -1;  /* a token port needs the full copy/sync verb set */
+    }
+    if (location_kind > FRT_RT_LOCATION_DEVICE_LOCAL) return -1;
+
+    Holder* h = b->h;
+    h->shape_arrays.emplace_back(shape, shape + rank);
+    frt_runtime_port_desc d{};
+    d.name = stored(h, name);
+    d.modality = modality;
+    d.dtype = dtype;
+    d.layout = layout;
+    d.direction = direction;
+    d.update = FRT_RT_PORT_STAGED;  /* token ports are STAGED; no raw window */
+    d.required = required;
+    d.shape = h->shape_arrays.back().data();
+    d.rank = rank;
+    d.cadence_hint_hz = cadence_hint_hz;
+    d.buffer = nullptr;  /* never a raw frt_buffer on a token port */
+    d.offset = 0;
+    d.bytes = 0;
+    h->ports.push_back(d);
+
+    frt_memory_token_desc tk{};
+    tk.struct_size = (uint32_t)sizeof(frt_memory_token_desc);
+    tk.handle = handle;
+    tk.verbs = verbs;
+    tk.offset = offset;
+    tk.bytes = bytes;
+    tk.location_kind = location_kind;
+    tk.reserved = 0;
+    h->port_tokens.push_back(tk);
     return 0;
 }
 
@@ -257,6 +322,7 @@ extern "C" frt_model_runtime_v2* frt_runtime_builder_finish_model_v2(
     m.ports = h->ports.data();       m.n_ports = h->ports.size();
     m.stages = h->stages.data();     m.n_stages = h->stages.size();
     m.stages_v2 = h->stages_v2.data(); m.n_stages_v2 = h->stages_v2.size();
+    m.port_tokens = h->port_tokens.data(); m.n_port_tokens = h->port_tokens.size();
     copy_verbs_v2(&m, verbs, verbs_self);
     m.owner = h;
     m.retain = frt_rt::frt_rt_holder_retain;

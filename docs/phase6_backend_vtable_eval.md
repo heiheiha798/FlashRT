@@ -238,3 +238,32 @@ stage-ready flag, engine run_stage-by-index) stay OUT of Phase 6 scope.
 - Cross-backend zero-copy implementation (batch=1 robot control is premature).
 - Phase 5 ABI gaps 1/3/4/5.
 - Any exec/src/ struct refactor; mllm op-factory / dispatcher / plugin patterns.
+
+### Implementation revision note (recorded 2026-07-07, post-review)
+
+The §8/§13 text names `frt_runtime_port_desc_v2` + a per-port `struct_size`
+tail-probe as the token carrier. The shipped implementation chose a **simpler,
+parallel-array carrier** instead, recorded here so history does not contradict
+the code:
+
+- Tokens ride a NEW trailing `port_tokens` / `n_port_tokens` array on
+  `frt_model_runtime_v2`, index-parallel with `ports`
+  (`n_port_tokens == n_ports` always: a port added via `add_port` gets a
+  null-handle entry; a port added via `frt_runtime_builder_add_port_token`
+  gets the minted token). This matches how v2 already carries parallel
+  `ports`/`stages`/`stages_v2` arrays and keeps `frt_runtime_port_desc`
+  byte-identical. The `frt_runtime_port_desc_v2` tail-probe form is NOT used
+  (it was a dead declaration in the first draft; removed on review).
+- `destroy` fires once when the **holder refcount** hits zero — not a separate
+  per-port/per-export counter. On the provider-owned v2 path the holder IS the
+  token's lifetime owner (there is no v2 wrap/override path, so the holder
+  refcount is the single relevant count). The §6/§13 "port/export refcount"
+  wording was wider than the implementation; this note narrows it to "holder
+  refcount" as actually shipped.
+- Append-only is honored by `struct_size >=` / `<` probes in the C ABI
+  (`frt_model_runtime_wrap`) and the pybind readers (`as_model_v2` uses `<`).
+  This revision also fixed a pre-existing strict-`!=` pybind gate that the v2
+  growth would have made reject newer producers.
+
+The decision (GO-MINIMAL-CONTRACT) and the vtable-vs-contract reasoning are
+unchanged; only the token *carrier* mechanism differs from the §8 sketch.

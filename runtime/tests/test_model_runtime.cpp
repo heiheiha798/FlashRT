@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
@@ -410,6 +411,234 @@ int main() {
               "mixed callback DAG has no legacy graph-only stage view");
         mv2->release(mv2->owner);
         CHECK(mixed_owner.releases == 1, "mixed v2 release frees owner");
+    }
+
+    /* --- Phase 6: provider-owned memory-domain token --------------------- */
+    /* A stub provider mints a host-backed token (plain malloc) and supplies
+     * the copy/sync/destroy verbs. The runtime must (a) accept the token
+     * port, (b) round-trip data through copy_to_host/copy_from_host, (c)
+     * expose it on the v2 struct, (d) fire destroy exactly once at release,
+     * and (e) STILL reject a raw frt_buffer on a provider-owned port. No
+     * Jetson-PI/GGML dependency — the token verbs operate on host memory. */
+    {
+        struct HostToken {
+            std::vector<uint8_t> store;
+            int destroys = 0;
+        };
+        HostToken ht;
+        ht.store.assign(64, 0);
+
+        auto copy_to_host = [](frt_memory_token t, void* dst,
+                               uint64_t dst_off, uint64_t src_off,
+                               uint64_t bytes) -> int {
+            auto* h = reinterpret_cast<HostToken*>(t);
+            if (src_off + bytes > h->store.size()) return -1;
+            std::memcpy(static_cast<uint8_t*>(dst) + dst_off,
+                        h->store.data() + src_off, bytes);
+            return 0;
+        };
+        auto copy_from_host = [](frt_memory_token t, const void* src,
+                                 uint64_t src_off, uint64_t dst_off,
+                                 uint64_t bytes) -> int {
+            auto* h = reinterpret_cast<HostToken*>(t);
+            if (dst_off + bytes > h->store.size()) return -1;
+            std::memcpy(h->store.data() + dst_off,
+                        static_cast<const uint8_t*>(src) + src_off, bytes);
+            return 0;
+        };
+        auto sync = [](frt_memory_token) -> int { return 0; };
+        auto destroy = [](frt_memory_token t) {
+            reinterpret_cast<HostToken*>(t)->destroys += 1;
+        };
+
+        frt_memory_token_verbs verbs{};
+        verbs.struct_size = sizeof(verbs);
+        verbs.copy_to_host = copy_to_host;
+        verbs.copy_from_host = copy_from_host;
+        verbs.sync = sync;
+        verbs.destroy = destroy;
+
+        Owner po;
+        VerbLog vl;
+        frt_runtime_builder pb = frt_runtime_builder_create_provider_owned();
+        const int64_t out_shape[1] = {16};
+        CHECK(frt_runtime_builder_add_port_token(
+                  pb, "acts", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, 0,
+                  out_shape, 1, 0,
+                  (frt_memory_token)&ht, &verbs,
+                  0, 16 * sizeof(float),
+                  FRT_RT_LOCATION_HOST_VISIBLE) == 0,
+              "provider-owned v2 accepts a memory-token port");
+        CHECK(frt_runtime_builder_add_callback_stage_v2(
+                  pb, "infer", 0, nullptr, 0) == 0,
+              "token port runtime needs a callback stage");
+        frt_model_runtime_verbs_v2 v2{};
+        v2.struct_size = sizeof(v2);
+        v2.run_stage = v_run_stage;
+        v2.last_error = v_last_error;
+        frt_model_runtime_v2* m = frt_runtime_builder_finish_model_v2(
+            pb, &v2, &vl, &po, owner_retain, owner_release);
+        CHECK(m != nullptr, "finish provider-owned token runtime");
+
+        /* (c) token surfaces on the v2 struct. */
+        CHECK(m->n_port_tokens == 1 &&
+                  m->port_tokens[0].handle == (frt_memory_token)&ht &&
+                  m->port_tokens[0].location_kind ==
+                      FRT_RT_LOCATION_HOST_VISIBLE &&
+                  m->port_tokens[0].bytes == 16 * sizeof(float),
+              "v2 struct exposes the memory-token descriptor");
+
+        /* (b) round-trip through the provider verbs via the descriptor. */
+        const float write_vals[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+        const auto& tk = m->port_tokens[0];
+        CHECK(tk.verbs->copy_from_host(tk.handle, write_vals, 0, 0,
+                                       sizeof(write_vals)) == 0,
+              "copy_from_host writes into the token");
+        float read_vals[4] = {0, 0, 0, 0};
+        CHECK(tk.verbs->copy_to_host(tk.handle, read_vals, 0, 0,
+                                     sizeof(read_vals)) == 0 &&
+                  std::memcmp(read_vals, write_vals, sizeof(write_vals)) == 0,
+              "copy_to_host round-trips the token contents");
+        CHECK(tk.verbs->sync(tk.handle) == 0, "token sync is a no-op for HOST");
+
+        /* (a)/(e) the port itself is STAGED with no raw frt_buffer. */
+        CHECK(m->n_ports == 1 &&
+                  m->ports[0].update == FRT_RT_PORT_STAGED &&
+                  m->ports[0].buffer == nullptr &&
+                  m->ports[0].offset == 0 && m->ports[0].bytes == 0,
+              "token port is STAGED with no raw frt_buffer window");
+
+        /* (d) destroy has NOT fired while retained. */
+        CHECK(ht.destroys == 0, "token not destroyed while runtime live");
+        m->release(m->owner);
+        CHECK(ht.destroys == 1, "token destroy fires exactly once at release");
+    }
+
+    /* Phase 6: provider-owned still rejects a raw frt_buffer (the token is
+     * the only permitted buffer form). add_port_token itself rejects a null
+     * handle / incomplete verbs. */
+    {
+        frt_runtime_builder pb = frt_runtime_builder_create_provider_owned();
+        const int64_t s[1] = {1};
+        CHECK(frt_runtime_builder_add_port(
+                  pb, "x", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED,
+                  1, s, 1, 0, FAKE_B0, 0, 4) == 0,
+              "add_port records a raw-buffer SWAP port (rejected at finish)");
+        frt_model_runtime_verbs_v2 v2{};
+        v2.struct_size = sizeof(v2);
+        v2.run_stage = v_run_stage;
+        frt_model_runtime_v2* m = frt_runtime_builder_finish_model_v2(
+            pb, &v2, nullptr, nullptr, nullptr, nullptr);
+        CHECK(m == nullptr,
+              "provider-owned finish rejects a raw frt_buffer port");
+    }
+    {
+        frt_runtime_builder pb = frt_runtime_builder_create_provider_owned();
+        const int64_t s[1] = {1};
+        frt_memory_token_verbs empty_verbs{};
+        empty_verbs.struct_size = sizeof(empty_verbs);  /* all null fns */
+        CHECK(frt_runtime_builder_add_port_token(
+                  pb, "x", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, 1, s, 1, 0,
+                  (frt_memory_token)0x1, &empty_verbs, 0, 4,
+                  FRT_RT_LOCATION_HOST_VISIBLE) != 0,
+              "add_port_token rejects a token with incomplete verbs");
+        frt_runtime_builder_discard(pb);
+    }
+
+    /* Phase 6: MIXED port build — one normal STAGED port via add_port + one
+     * token port via add_port_token on the SAME provider-owned builder. This
+     * is the scenario the original diff got wrong: n_port_tokens must equal
+     * n_ports, and port_tokens[i] must align with ports[i] (null handle for
+     * the non-token port, the minted handle for the token port). Before the
+     * fix, add_port pushed nothing into port_tokens, so n_port_tokens was 1
+     * (not 2) and port_tokens[0] held the p1 token misaligned against p0. */
+    {
+        struct HostToken {
+            std::vector<uint8_t> store;
+            int destroys = 0;
+        };
+        HostToken ht;
+        ht.store.assign(32, 0);
+
+        auto copy_to_host = [](frt_memory_token t, void* dst,
+                               uint64_t dst_off, uint64_t src_off,
+                               uint64_t bytes) -> int {
+            auto* h = reinterpret_cast<HostToken*>(t);
+            if (src_off + bytes > h->store.size()) return -1;
+            std::memcpy(static_cast<uint8_t*>(dst) + dst_off,
+                        h->store.data() + src_off, bytes);
+            return 0;
+        };
+        auto copy_from_host = [](frt_memory_token t, const void* src,
+                                 uint64_t src_off, uint64_t dst_off,
+                                 uint64_t bytes) -> int {
+            auto* h = reinterpret_cast<HostToken*>(t);
+            if (dst_off + bytes > h->store.size()) return -1;
+            std::memcpy(h->store.data() + dst_off,
+                        static_cast<const uint8_t*>(src) + src_off, bytes);
+            return 0;
+        };
+        auto sync = [](frt_memory_token) -> int { return 0; };
+        auto destroy = [](frt_memory_token t) {
+            reinterpret_cast<HostToken*>(t)->destroys += 1;
+        };
+        frt_memory_token_verbs verbs{};
+        verbs.struct_size = sizeof(verbs);
+        verbs.copy_to_host = copy_to_host;
+        verbs.copy_from_host = copy_from_host;
+        verbs.sync = sync;
+        verbs.destroy = destroy;
+
+        Owner po;
+        VerbLog vl;
+        frt_runtime_builder pb = frt_runtime_builder_create_provider_owned();
+
+        /* p0: normal STAGED input port via add_port (no token). */
+        const int64_t in_shape[1] = {4};
+        CHECK(frt_runtime_builder_add_port(
+                  pb, "p0", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED,
+                  0, in_shape, 1, 0, nullptr, 0, 0) == 0,
+              "mixed build: add_port records a non-token STAGED input");
+
+        /* p1: token output port via add_port_token. */
+        const int64_t out_shape[1] = {8};
+        CHECK(frt_runtime_builder_add_port_token(
+                  pb, "p1", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, 0,
+                  out_shape, 1, 0,
+                  (frt_memory_token)&ht, &verbs, 0, 8 * sizeof(float),
+                  FRT_RT_LOCATION_HOST_VISIBLE) == 0,
+              "mixed build: add_port_token records a token output");
+
+        CHECK(frt_runtime_builder_add_callback_stage_v2(
+                  pb, "infer", 0, nullptr, 0) == 0,
+              "mixed build: callback stage accepted");
+        frt_model_runtime_verbs_v2 v2{};
+        v2.struct_size = sizeof(v2);
+        v2.run_stage = v_run_stage;
+        v2.last_error = v_last_error;
+        frt_model_runtime_v2* m = frt_runtime_builder_finish_model_v2(
+            pb, &v2, &vl, &po, owner_retain, owner_release);
+        CHECK(m != nullptr, "mixed build finishes provider-owned v2");
+
+        /* The exact invariant the original diff violated. */
+        CHECK(m->n_ports == 2 && m->n_port_tokens == 2,
+              "mixed build: n_port_tokens == n_ports (index-parallel arrays)");
+        CHECK(m->port_tokens[0].handle == nullptr,
+              "mixed build: non-token port p0 has a null token handle");
+        CHECK(m->port_tokens[1].handle == (frt_memory_token)&ht &&
+                  m->port_tokens[1].location_kind ==
+                      FRT_RT_LOCATION_HOST_VISIBLE,
+              "mixed build: token port p1 aligns at index 1 with its handle");
+
+        /* destroy fires only for the real token, exactly once at release. */
+        CHECK(ht.destroys == 0, "mixed build: token not destroyed while live");
+        m->release(m->owner);
+        CHECK(ht.destroys == 1, "mixed build: token destroy fires once");
     }
 
     std::printf(g_fail ? "\n== MODEL RUNTIME ABI FAILED ==\n"

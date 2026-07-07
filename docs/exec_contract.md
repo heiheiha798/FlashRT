@@ -397,6 +397,34 @@ The Rust shell, OpenAI, and scheduler all live in serving / the upper layer, off
 - Therefore the common layer = replay-time execution of Buffer/Graph/Plan + a C ABI, **and not one bit
   more.**
 
+### 7a. Two memory-domain contracts (Phase 6)
+
+FlashRT has two coexisting, non-unified memory-domain contracts. They are NOT
+merged under one backend abstraction — each is honest about what it is:
+
+- **(A) CUDA-export path (same-backend, CUDA↔CUDA).** The `frt_buffer` +
+  `frt_buffer_dptr`/`frt_buffer_wrap` + `frt_graph_bind` + port SWAP window +
+  `FRT_RT_ROLE_INPUT|OUTPUT` role bitmask described throughout this doc. Two
+  graphs sharing one buffer on matching ports = zero-copy hand-off. This is
+  CUDA-specific by construction (device pointer, `cudaStream_t` `native_handle`)
+  and stays confined to the `exec/backend/cuda/` TU. **Unchanged by Phase 6.**
+
+- **(B) Provider-owned token path (cross-provider, FlashRT↔GGML).** A small
+  `frt_memory_token` (opaque) + `frt_memory_token_verbs`
+  (`copy_to_host`/`copy_from_host`/`sync`/`destroy`) + `frt_rt_location_kind`
+  (`HOST_VISIBLE`/`DEVICE_LOCAL`), attached to a provider-owned port via
+  `frt_runtime_builder_add_port_token`. FlashRT **never dereferences** the
+  token — zero-copy is an *advertised* capability (`location_kind=HOST_VISIBLE`),
+  not an assumption. `destroy` fires once at runtime release. This is the only
+  buffer form permitted on provider-owned ports; the builder still rejects a raw
+  `frt_buffer` there. See `docs/phase6_backend_vtable_eval.md`.
+
+The `exec/backend/backend.h` free-function surface is NOT promoted to a runtime
+vtable in Phase 6 — link-time backend selection already suffices, and GGML is
+integrated as a model provider (not a bare exec backend), so a full backend
+vtable would have no consumer. `frt::be::import` is declared (commented) as a
+future cross-domain buffer-registration seam but not implemented for non-CUDA.
+
 ---
 
 ## 8. v1 acceptance checklist
