@@ -80,8 +80,33 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
 - **LLM raw prompt.** `generate(prompt)` takes a raw prompt; the caller must
   apply the chat template (e.g. `llama_chat_apply_template`) before calling.
   No streaming; one blob out. Each call clears KV (independent completion).
-- **CPU backend verified.** `backend="cuda"` is wired through but not yet
-  tested end-to-end on this machine.
+- **CPU and CUDA backends verified.** `backend="cuda"` is verified end-to-end
+  on an RTX 4090 (sm_89). The CUDA build needs its own build dir with
+  `-DGGML_CUDA=ON` (it defaults OFF), plus the same Jetson-PI flags:
+
+  ```bash
+  cmake -S FlashRT/cpp -B FlashRT/cpp/build-jetson-pi-cuda \
+    -DCMAKE_C_COMPILER=.../x86_64-conda-linux-gnu-cc \
+    -DCMAKE_CXX_COMPILER=.../x86_64-conda-linux-gnu-c++ \
+    -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+    -DCMAKE_CUDA_ARCHITECTURES=89 \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+    -DFLASHRT_CPP_WITH_JETSON_PI=ON \
+    -DJETSON_PI_ROOT=/path/to/Jetson-PI \
+    -DGGML_CUDA=ON -DGGML_CUDA_FA=ON
+  cmake --build FlashRT/cpp/build-jetson-pi-cuda -j32 \
+    --target flashrt_cpp_llama_cpp_provider_c
+  ```
+
+  Then point `FLASHRT_PI0_LIB` at `build-jetson-pi-cuda/libflashrt_cpp_llama_cpp_provider_c.so`,
+  set `FLASHRT_PI0_BACKEND=cuda`, and ensure `LD_LIBRARY_PATH` includes the
+  CUDA build's `bin/` (for `libggml-cuda.so`) and `runtime/`. The smoke test
+  then offloads all model layers to the GPU (37/37 for pi0_base).
+
+  Note: the Jetson-PI engine maps `backend == "cuda"` to GPU offload by exact
+  string match; any other value (including typos) silently runs CPU. Treat the
+  `offloaded N/N layers to GPU` log line as the real signal that CUDA was
+  exercised.
 - **No calibration.** The frontends have no `calibrate`/`calibrated`; the
   Jetson-PI providers do not need FlashRT-style FP8 calibration.
 - **`state` is a separate port** for Pi0, not encoded into the prompt (unlike
