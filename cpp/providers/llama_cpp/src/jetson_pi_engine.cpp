@@ -290,7 +290,58 @@ int engine_get_output(void * self, uint32_t port, void * out,
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 6 memory-domain token: the Pi0 actions OUT port carries an opaque
+// token (handle == this Engine*) so a consumer can read the action chunk
+// through frt_memory_token_verbs instead of get_output. The verbs read the
+// LIVE actions_buf at call time — NOT a pointer captured at mint time —
+// because std::vector reallocates on clear()/assign() (set_input clears it
+// for staleness; run_infer refills it). The bounds/return codes mirror
+// engine_get_output: -7 not-ready (buf empty), -5 too-small (partial read).
+// Single-threaded, same contract as engine_get_output (no locking on the
+// engine vtable). location_kind is HOST_VISIBLE: actions_buf is host memory,
+// readable via a plain memcpy, no device sync. destroy is null — the engine
+// owns actions_buf and frees it in release(), which fires AFTER the holder's
+// token-destroy loop (runtime_export.cpp).
+// ---------------------------------------------------------------------------
+int pi0_token_copy_to_host(frt_memory_token token, void * dst,
+                           uint64_t dst_off, uint64_t src_off,
+                           uint64_t bytes) {
+    Engine * e = reinterpret_cast<Engine*>(token);
+    if (!e) return -1;
+    const size_t have_bytes = e->actions_buf.size() * sizeof(float);
+    if (have_bytes == 0) return -7;                 // not ready (set_input cleared it)
+    if (src_off > have_bytes || bytes > have_bytes - src_off) return -5;  // buffer too small
+    std::memcpy(static_cast<char*>(dst) + dst_off,
+                reinterpret_cast<const char*>(e->actions_buf.data()) + src_off,
+                bytes);
+    return 0;
+}
+
+int pi0_token_copy_from_host(frt_memory_token /*token*/, const void * /*src*/,
+                             uint64_t /*src_off*/, uint64_t /*dst_off*/,
+                             uint64_t /*bytes*/) {
+    return -3;  // unsupported: actions is an OUT port — writing into the model's output is not meaningful
+}
+
+int pi0_token_sync(frt_memory_token /*token*/) {
+    return 0;   // HOST_VISIBLE: host can read without a device sync
+}
+
+const frt_memory_token_verbs kPi0ActionsTokenVerbs = {
+    /*struct_size=*/sizeof(frt_memory_token_verbs),
+    /*reserved=*/0,
+    /*copy_to_host=*/pi0_token_copy_to_host,
+    /*copy_from_host=*/pi0_token_copy_from_host,
+    /*sync=*/pi0_token_sync,
+    /*destroy=*/nullptr,  // engine owns actions_buf; freed in release() after the destroy loop
+};
+
 } // namespace
+
+const frt_memory_token_verbs * frt_jetson_pi_actions_token_verbs(void) {
+    return &kPi0ActionsTokenVerbs;
+}
 
 // ---------------------------------------------------------------------------
 // LLM engine (generic GGUF text completion). Distinct IO shape from Pi0
