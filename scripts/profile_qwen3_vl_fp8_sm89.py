@@ -47,8 +47,9 @@ def main():
                    help="warmup iterations before profiling (outside cudaProfiler)")
     p.add_argument("--profile-rounds", type=int, default=1,
                    help="profiled iterations (inside cudaProfiler)")
-    p.add_argument("--use-graph", action="store_true", default=True)
-    p.add_argument("--no-graph", dest="use_graph", action="store_false")
+    p.add_argument("--no-graph", dest="use_graph", action="store_false",
+                   default=True,
+                   help="use the eager (non-graph) path instead of CUDA graphs")
     p.add_argument("--ncu-mode", choices=["prefill", "decode", "none"],
                    default="none",
                    help="for ncu: only profile this phase (skip the other)")

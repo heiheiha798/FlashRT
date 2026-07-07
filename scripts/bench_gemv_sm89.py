@@ -42,11 +42,10 @@ def main():
     args = p.parse_args()
     torch.cuda.set_device(torch.device(args.device))
 
-    sys.path.insert(0, str(REPO_ROOT / "flash_rt"))
     try:
-        import flash_rt_qwen3_vl_kernels as fvk
+        from flash_rt import flash_rt_qwen3_vl_kernels as fvk
     except ImportError:
-        import flash_rt_kernels as fvk
+        from flash_rt import flash_rt_kernels as fvk
 
     shapes_8b = [
         ("8B_qkv",     4096,  5120),

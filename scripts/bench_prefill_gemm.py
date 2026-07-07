@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse, statistics, sys, pathlib
 import torch
 REPO = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "flash_rt"))
+sys.path.insert(0, str(REPO))
 
 PEAK_DENSE_TFLOPS = 165.0  # RTX 4090 FP8 dense (no 2:4 sparsity)
 
@@ -79,7 +79,7 @@ def main():
     p.add_argument("--model", choices=["2B", "8B", "both"], default="both")
     args = p.parse_args()
     torch.cuda.set_device(torch.device(args.device))
-    import flash_rt_qwen3_vl_kernels as fvk
+    from flash_rt import flash_rt_qwen3_vl_kernels as fvk
 
     sel = list(TILES.keys()) if not args.tiles else args.tiles.split(",")
     shapes = []
