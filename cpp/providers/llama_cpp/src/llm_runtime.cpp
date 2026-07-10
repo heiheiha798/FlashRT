@@ -6,6 +6,7 @@
 // run_infer(), get_output(TEXT). No GGML types appear here.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
+#include "checkpoint_identity.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -116,7 +117,7 @@ extern "C" int frt_llama_cpp_llm_runtime_create_with_engine(
         frt_model_runtime_v2** out) {
     if (!out) return -1;
     *out = nullptr;
-    if (!config || config->struct_size < sizeof(frt_llama_cpp_llm_config) ||
+    if (!config || config->struct_size < FRT_LLAMA_CPP_LLM_CONFIG_BASE_SIZE ||
         !config->model_path || !config->model_path[0] ||
         !config->backend || !config->backend[0]) {
         return -1;
@@ -186,6 +187,11 @@ extern "C" int frt_llama_cpp_llm_runtime_create_with_engine(
     rc |= frt_runtime_builder_add_identity(b, "provider", "llama_cpp");
     rc |= frt_runtime_builder_add_identity(b, "model_family", "llm");
     rc |= frt_runtime_builder_add_identity(b, "model_path", config->model_path);
+    if (config->struct_size >= sizeof(*config) && config->model_identity &&
+        config->model_identity[0]) {
+        rc |= frt_runtime_builder_add_identity(
+            b, "weights_sha256", config->model_identity);
+    }
     rc |= frt_runtime_builder_add_identity(b, "backend", config->backend);
     rc |= frt_runtime_builder_add_identity(
         b, "n_ctx", std::to_string(config->n_ctx).c_str());
@@ -246,6 +252,7 @@ extern "C" int frt_llama_cpp_llm_runtime_open_with_engine_factory(
     std::string model_family;
     std::string model_path;
     std::string backend;
+    std::string model_identity;
     bool seen_model_family = false;
     bool seen_model_path = false;
     bool seen_backend = false;
@@ -456,6 +463,11 @@ extern "C" int frt_llama_cpp_llm_runtime_open_with_engine_factory(
     }
     config.model_path = model_path.c_str();
     config.backend = backend.c_str();
+    if (!flashrt::providers::llama_cpp::checkpoint_identity(
+            config.model_path, &model_identity, nullptr)) {
+        return -1;
+    }
+    config.model_identity = model_identity.c_str();
 
     frt_llama_cpp_engine_v1 engine{};
     const int rc = factory->create_llm(factory->self, &config, &engine);

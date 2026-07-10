@@ -74,7 +74,13 @@ typedef struct frt_llama_cpp_pi0_config {
     uint32_t image_channels;
     uint32_t action_steps;
     uint32_t action_dim;
+
+    const char* model_identity;   /* append-only checkpoint content identity */
+    const char* mmproj_identity;  /* append-only checkpoint content identity */
 } frt_llama_cpp_pi0_config;
+
+#define FRT_LLAMA_CPP_PI0_CONFIG_BASE_SIZE \
+    (offsetof(frt_llama_cpp_pi0_config, model_identity))
 
 typedef struct frt_llama_cpp_llm_config {
     uint32_t struct_size;
@@ -90,7 +96,12 @@ typedef struct frt_llama_cpp_llm_config {
     float    top_p;            /* 0 = disabled                                */
     uint32_t seed;             /* RNG seed                                    */
     uint32_t max_tokens;       /* cap on generated tokens per infer           */
+
+    const char* model_identity; /* append-only checkpoint content identity     */
 } frt_llama_cpp_llm_config;
+
+#define FRT_LLAMA_CPP_LLM_CONFIG_BASE_SIZE \
+    (offsetof(frt_llama_cpp_llm_config, model_identity))
 
 typedef struct frt_llama_cpp_mllm_config {
     uint32_t struct_size;
@@ -107,7 +118,13 @@ typedef struct frt_llama_cpp_mllm_config {
     float    top_p;            /* 0 = disabled                                */
     uint32_t seed;             /* RNG seed                                    */
     uint32_t max_tokens;       /* cap on generated tokens per infer           */
+
+    const char* model_identity;  /* append-only checkpoint content identity   */
+    const char* mmproj_identity; /* append-only checkpoint content identity   */
 } frt_llama_cpp_mllm_config;
+
+#define FRT_LLAMA_CPP_MLLM_CONFIG_BASE_SIZE \
+    (offsetof(frt_llama_cpp_mllm_config, model_identity))
 
 typedef struct frt_llama_cpp_engine_v1 {
     uint32_t struct_size;

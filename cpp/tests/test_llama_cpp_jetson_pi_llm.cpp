@@ -5,10 +5,11 @@
 #include "flashrt/providers/llama_cpp/c_api.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,9 @@ int main() {
           "LLM runtime exposes infer/reset/prefill/decode callback stages");
     CHECK(model->n_ports == 6,
           "LLM runtime exposes prompt/text/token/logits/eog/tokens ports");
+    CHECK(model->exp && std::strstr(model->exp->identity,
+                                   "weights_sha256="),
+          "deployment identity includes checkpoint content digest");
     CHECK(model->verbs_v2.get_output(
               model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS,
               nullptr, 0, nullptr, -1) == -1,
@@ -136,6 +140,8 @@ int main() {
     CHECK(finite_logits, "prefill logits contain no NaN/Inf");
 
     std::string staged_text;
+    std::vector<int32_t> baseline_tokens;
+    std::vector<int32_t> baseline_eog;
     for (uint32_t i = 0; i < 16; ++i) {
         CHECK(model->verbs_v2.run_stage(
                   model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0,
@@ -153,6 +159,8 @@ int main() {
                   sizeof(is_eog), &scalar_bytes, -1) == 0 &&
                   scalar_bytes == sizeof(is_eog),
               "decode exposes is_eog");
+        baseline_tokens.push_back(token);
+        baseline_eog.push_back(is_eog);
         if (is_eog) break;
     }
     staged_text.assign(cap, '\0');
@@ -171,6 +179,116 @@ int main() {
         model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN, nullptr, 0,
         &stale_written, -1);
     CHECK(rc == -7, "one-shot infer invalidates staged token output");
+
+    frt_model_runtime_v2* peer = nullptr;
+    rc = frt_llama_cpp_llm_runtime_open_with_engine_factory(
+        json.c_str(), factory, &peer);
+    CHECK(rc == 0 && peer, "open independent peer LLM session");
+    if (peer) {
+        const char* peer_prompt =
+            "Complete this sequence with one number: 3, 6, 9,";
+        CHECK(peer->verbs_v2.set_input(
+                  peer->self, FRT_LLAMA_CPP_LLM_PORT_PROMPT,
+                  peer_prompt, std::strlen(peer_prompt), -1) == 0,
+              "peer set_input distinct prompt");
+        CHECK(peer->verbs_v2.run_stage(
+                  peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0 &&
+                  peer->verbs_v2.run_stage(
+                  peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0,
+              "prepare peer standalone baseline");
+        std::vector<int32_t> peer_baseline_tokens;
+        std::vector<int32_t> peer_baseline_eog;
+        for (uint32_t i = 0; i < 16; ++i) {
+            CHECK(peer->verbs_v2.run_stage(
+                      peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0,
+                  "decode peer standalone baseline");
+            int32_t token = 0;
+            int32_t is_eog = 0;
+            uint64_t scalar_bytes = 0;
+            CHECK(peer->verbs_v2.get_output(
+                      peer->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN, &token,
+                      sizeof(token), &scalar_bytes, -1) == 0 &&
+                      scalar_bytes == sizeof(token) &&
+                      peer->verbs_v2.get_output(
+                      peer->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG, &is_eog,
+                      sizeof(is_eog), &scalar_bytes, -1) == 0,
+                  "capture peer standalone token sequence");
+            peer_baseline_tokens.push_back(token);
+            peer_baseline_eog.push_back(is_eog);
+            if (is_eog) break;
+        }
+        std::string peer_baseline_text(cap, '\0');
+        uint64_t peer_baseline_written = 0;
+        CHECK(peer->verbs_v2.get_output(
+                  peer->self, FRT_LLAMA_CPP_LLM_PORT_TEXT,
+                  peer_baseline_text.data(), peer_baseline_text.size(),
+                  &peer_baseline_written, -1) == 0,
+              "read peer standalone baseline text");
+        peer_baseline_text.resize(peer_baseline_written);
+        CHECK(model->verbs_v2.run_stage(
+                  model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0 &&
+                  peer->verbs_v2.run_stage(
+                  peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0,
+              "reset two independent sessions");
+        CHECK(model->verbs_v2.run_stage(
+                  model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0 &&
+                  peer->verbs_v2.run_stage(
+                  peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0,
+              "prefill two independent sessions");
+        const size_t interleaved_steps =
+            std::max(baseline_tokens.size(), peer_baseline_tokens.size());
+        for (size_t i = 0; i < interleaved_steps; ++i) {
+            uint64_t scalar_bytes = 0;
+            if (i < baseline_tokens.size()) {
+                int32_t token = 0;
+                int32_t is_eog = 0;
+                CHECK(model->verbs_v2.run_stage(
+                          model->self,
+                          FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0 &&
+                          model->verbs_v2.get_output(
+                          model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN,
+                          &token, sizeof(token), &scalar_bytes, -1) == 0 &&
+                          model->verbs_v2.get_output(
+                          model->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG,
+                          &is_eog, sizeof(is_eog), &scalar_bytes, -1) == 0 &&
+                          token == baseline_tokens[i] &&
+                          is_eog == baseline_eog[i],
+                      "interleaved primary token matches standalone baseline");
+            }
+            if (i < peer_baseline_tokens.size()) {
+                int32_t token = 0;
+                int32_t is_eog = 0;
+                CHECK(peer->verbs_v2.run_stage(
+                          peer->self,
+                          FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0 &&
+                          peer->verbs_v2.get_output(
+                          peer->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN,
+                          &token, sizeof(token), &scalar_bytes, -1) == 0 &&
+                          peer->verbs_v2.get_output(
+                          peer->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG,
+                          &is_eog, sizeof(is_eog), &scalar_bytes, -1) == 0 &&
+                          token == peer_baseline_tokens[i] &&
+                          is_eog == peer_baseline_eog[i],
+                      "interleaved peer token matches standalone baseline");
+            }
+        }
+        std::string model_text(cap, '\0');
+        std::string peer_text(cap, '\0');
+        uint64_t model_written = 0;
+        uint64_t peer_written = 0;
+        CHECK(model->verbs_v2.get_output(
+                  model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, model_text.data(),
+                  model_text.size(), &model_written, -1) == 0 &&
+                  peer->verbs_v2.get_output(
+                  peer->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, peer_text.data(),
+                  peer_text.size(), &peer_written, -1) == 0,
+              "read interleaved session outputs");
+        model_text.resize(model_written);
+        peer_text.resize(peer_written);
+        CHECK(model_text == staged_text && peer_text == peer_baseline_text,
+              "distinct sessions reproduce baselines without KV leakage");
+        peer->release(peer->owner);
+    }
 
     model->release(model->owner);
 
