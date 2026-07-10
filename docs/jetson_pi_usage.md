@@ -280,7 +280,7 @@ chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
   `generate()` returns one blob and starts an independent session;
   `reset()`/`prefill()`/repeatable `decode()` expose the token boundary and keep
   provider-private KV state for host-driven generation.
-- **CPU, CUDA, Vulkan, and SYCL backends verified.** `backend="cuda"` is verified
+- **CPU/CUDA/SYCL clean-exit and Vulkan inference paths verified.** `backend="cuda"` is verified
   end-to-end on an RTX 4090 (sm_89) for all three providers — Pi0 (`offloaded
   37/37 layers`, pi0_base), LLM (`29/29`, qwen3-0.6b-q4_k_m), and MLLM
   (`29/29`, Qwen3-VL-2B-Instruct-Q4_K_M; the VIT/mmproj encoder offloads too).
@@ -288,12 +288,12 @@ chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
   path (load → VIT encode → forward → sample) is exercised, but the smoke test
   feeds a raw prompt so the output is template-token noise rather than a
   caption — output coherence requires a caller-applied chat template (see the
-  MLLM note below). `backend="vulkan"` is clean-exit verified on the RTX 4090
-  for Pi0 and LLM (smoke + numerical parity vs the direct `jetson_pi_*` call,
-  both passing with `max_diff = 0` / exact text match). Qwen3-VL MLLM completes
-  one-shot and staged inference with its text layers and VIT on Vulkan0, but
-  the local NVIDIA 550.54.14 ICD crashes later during process-exit teardown,
-  so MLLM is not a clean-exit Vulkan validation. Per §6 of
+  MLLM note below). `backend="vulkan"` runs the intended model and VIT paths on
+  the RTX 4090 for Pi0, LLM, and MLLM. Pi0 reaches numerical parity with
+  `max_diff = 0`, LLM retains exact direct-path text parity, and all three final
+  provider tests reach their success markers. Each process then exits 139 in
+  the local NVIDIA 550.54.14 ICD during process-exit teardown, so none is a
+  clean-exit Vulkan validation. Per §6 of
   the migration plan, compiling a backend does not guarantee every model op is
   supported on it — each model×backend combo is verified separately. The CUDA
   build needs its own build dir with `-DGGML_CUDA=ON` (it defaults OFF), plus
@@ -338,8 +338,8 @@ chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
   `offloaded N/N layers` and `CLIP using <backend>` log lines as confirmation
   that the intended backend was exercised.
 
-  **Vulkan backend** (Pi0 + LLM clean-exit verified; MLLM inference verified
-  with the NVIDIA process-exit caveat below). Build in a separate
+  **Vulkan backend** (Pi0/LLM/MLLM inference verified; all three have the NVIDIA
+  process-exit teardown failure below). Build in a separate
   dir with `-DGGML_VULKAN=ON -DGGML_CUDA=OFF` (Vulkan is SPIR-V; no CUDA arch
   needed) and conda compilers; the `vulkan-shaders-gen` build-time tool needs a
   C++17 host compiler, so export `CC`/`CXX` to the conda compilers for the
@@ -375,17 +375,18 @@ chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
   `FLASHRT_PI0_BACKEND=vulkan` / `FLASHRT_LLM_BACKEND=vulkan`, point
   `FLASHRT_PI0_LIB`/`FLASHRT_LLM_LIB` at the vulkan build's `_c.so`, and ensure
   `LD_LIBRARY_PATH` includes the vulkan build's `bin/` (for `libggml-vulkan.so`).
-  Verified: Pi0 `pi0_base` offloads 36 layers + VIT to Vulkan0, actions
+  Verified: Pi0 `pi0_base` offloads 37/37 layers + VIT to Vulkan0, actions
   (10,32) sane, parity `max_diff = 0` vs the direct `jetson_pi_pi0` call;
-  LLM `qwen3-0.6b-q4_k_m` offloads 28 layers to Vulkan0, greedy text
+  LLM `qwen3-0.6b-q4_k_m` offloads 29/29 layers to Vulkan0, greedy text
   byte-identical to the direct `jetson_pi_llm` call. Qwen3-VL MLLM also
   completes one-shot and staged generation with all 29 text layers and VIT on
-  Vulkan0. On this workstation's NVIDIA 550.54.14 driver, the successful MLLM
-  process can subsequently segfault inside the NVIDIA Vulkan ICD's process-exit
-  destructors. GDB places the failure after the test success marker, outside
-  provider inference and explicit object destruction; attempts to force Vulkan
-  teardown made the driver race more reproducible and were not retained. Treat
-  this as a local driver lifecycle defect, not a clean-exit validation result.
+  Vulkan0. On final rebuilt GPU6 runs, all three tests print their success marker
+  and subsequently segfault inside the NVIDIA 550.54.14 Vulkan ICD's process-exit
+  destructors with exit code 139. Earlier GDB capture places the failure after
+  the test success marker, outside provider inference and explicit object
+  destruction; attempts to force Vulkan teardown made the driver race more
+  reproducible and were not retained. Treat these as inference-success and
+  teardown-fail results, not clean-exit Vulkan validation.
 
   **OpenCL backend.** A dedicated `-DGGML_OPENCL=ON` build succeeds with the
   Khronos headers and NVIDIA ICD. The runtime enumerates platform `NVIDIA CUDA`

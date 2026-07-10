@@ -7,9 +7,9 @@ stable benchmarks and not cross-backend speed claims.
 
 ## Validated Revisions
 
-- FlashRT revision: the local `jetson-pi-link-check` commit containing this
-  matrix and implementation, based on parent
-  `b1bd03194d9b51837824ba2b19b2074ab702286d`.
+- FlashRT implementation revision:
+  `0080e3daa383b077955d3063f2ab755de1996dca` on local branch
+  `jetson-pi-link-check`; this matrix is maintained at the current branch tip.
 - Jetson-PI revision:
   `68dd395b3f89dbd031ae564e335780f702fbd1e7` on local branch `expose-mtmd-only-build`.
 - CUDA/Vulkan/SYCL device used for final accelerator runs: physical GPU 6,
@@ -22,9 +22,9 @@ stable benchmarks and not cross-backend speed claims.
 | Source requirement | Delivered result | Review gate |
 |---|---|---|
 | Phase 0: baseline and contracts | Locked Jetson-PI/GGML revision and build identity; full-file model/mmproj SHA-256; explicit port shape/dtype/ownership; native Pi0 CLI input, action output, and timing baseline. | CLI and FlashRT use the same two RGB fixtures, 32-F32 state, effective prompt, CUDA backend, and fixed-seed policy; all 320 action elements are bit-identical. |
-| Phase 1: in-process Pi0 whole graph | `frt_model_runtime_v2` callback `infer` stage with staged images/prompt/state/actions; provider owns Jetson-PI/MTMD/GGML state and exposes no GGML type in FlashRT ABI. | CPU/CUDA/Vulkan/SYCL model runs plus direct narrow-C-API parity. |
+| Phase 1: in-process Pi0 whole graph | `frt_model_runtime_v2` callback `infer` stage with staged images/prompt/state/actions; provider owns Jetson-PI/MTMD/GGML state and exposes no GGML type in FlashRT ABI. | CPU/CUDA/SYCL clean-exit model runs, Vulkan inference-success/teardown-fail runs, and direct narrow-C-API parity. |
 | Phase 2: Python and C API | One C++ implementation is reached through the FlashRT C ABI, C++ factory, and ctypes `flash_rt.load_model(framework="jetson_pi")`; lifecycle, errors, stale output, and multiple instances are tested. | Native C++ and Python smoke suites, including installed-provider loading. |
-| Phase 3: generic text LLM | Prompt/optional tokens, next-token, EOG, full logits, accumulated text, `reset -> prefill -> decode`, private KV/sampler state, host interruption, and hard token budget. | Qwen3 0.6B, TinyLlama 1.1B, and Gemma 2 2B on CPU/CUDA; Qwen3 also on Vulkan/SYCL; direct parity and interleaved-session isolation. |
+| Phase 3: generic text LLM | Prompt/optional tokens, next-token, EOG, full logits, accumulated text, `reset -> prefill -> decode`, private KV/sampler state, host interruption, and hard token budget. | Qwen3 0.6B, TinyLlama 1.1B, and Gemma 2 2B on CPU/CUDA; Qwen3 on clean-exit SYCL and inference-success/teardown-fail Vulkan; direct parity and interleaved-session isolation. |
 | Phase 4: multimodal LLM | Images + prompt, provider-private MTMD/VIT embeddings, one-shot and repeatable prefill/decode, next-token/EOG/logits/text outputs. | Qwen3-VL 2B CPU/CUDA/SYCL exact direct parity; Vulkan inference reaches success before the recorded NVIDIA ICD teardown fault. |
 | Phase 5: finer Pi0 stages | Stable narrow `context`/`action` C API and FlashRT `context -> action` DAG; pending context is single-use; encoded cross-KV and strictly guarded decoder graph reuse remain provider-private. | Whole/split/direct parity is exact; stale/replaced/failed input invalidation is tested; graph profiling confirms one rebuild plus nine reuses. |
 | Phase 6: backend and zero-copy evolution | Explicit CPU/CUDA/Vulkan/OpenCL/SYCL selection; opaque memory-domain token; host map/unmap; read-only versioned DLPack; dynamic GGML backend package. | Model-by-backend matrix below; OpenCL is an explicit capability gate; pointer identity, mapping lifetime, module loading, and hard-failure paths are tested. |
@@ -38,26 +38,28 @@ stable benchmarks and not cross-backend speed claims.
 |---|---|---|---|---|
 | Pi0 | Pi0 Base F16 + VIT mmproj | CPU | PASS | FlashRT versus direct `jetson_pi_pi0` action parity, `max_abs_diff=0`; shape `(10,32)`; finite actions. |
 | Pi0 | Pi0 Base F16 + VIT mmproj | CUDA | PASS | 37/37 model layers and VIT on CUDA; whole infer repeatability; no context leak; FlashRT/direct parity `max_abs_diff=0`; whole versus context/action and native CLI versus FlashRT are bit-identical. |
-| Pi0 | Pi0 Base F16 + VIT mmproj | Vulkan | PASS | 36 model layers plus VIT on Vulkan; FlashRT/direct parity `max_abs_diff=0`. |
+| Pi0 | Pi0 Base F16 + VIT mmproj | Vulkan | INFERENCE/PARITY PASS; TEARDOWN FAIL | 37/37 model layers plus VIT on Vulkan; FlashRT/direct parity `max_abs_diff=0` reaches `== PI0 PARITY PASSED ==`, then process exit is 139. |
 | Pi0 | Pi0 Base F16 + VIT mmproj | SYCL-on-CUDA | PASS | 37/37 model layers plus VIT on SYCL0; whole/direct and whole/context-action parity `max_abs_diff=0`; repeated inference and host-SWAP/DLPack gates pass. |
 | Text LLM | Qwen3 0.6B Q4_K_M | CPU | PASS | FlashRT/direct greedy text, first token, and complete prefill logits parity; logits `max_abs_diff=0`. |
 | Text LLM | Qwen3 0.6B Q4_K_M | CUDA | PASS | 29/29 layers offloaded; FlashRT/direct text, first token, and complete prefill logits parity with `max_abs_diff=0`; two distinct interleaved sessions reproduce standalone token/EOG sequences. |
-| Text LLM | Qwen3 0.6B Q4_K_M | Vulkan | PASS | 29/29 layers offloaded; FlashRT/direct greedy text exact parity. |
+| Text LLM | Qwen3 0.6B Q4_K_M | Vulkan | INFERENCE/PARITY PASS; TEARDOWN FAIL | 29/29 layers offloaded; FlashRT/direct greedy text exact parity is retained, and the final rebuilt provider test reaches `== JETSON_PI LLM PASSED ==`, then process exit is 139. |
 | Text LLM | Qwen3 0.6B Q4_K_M | SYCL-on-CUDA | PASS | 29/29 layers on SYCL0; staged decode, interleaved session isolation, logits, interruption, and token-budget gates pass with clean exit. |
 | Text LLM | TinyLlama 1.1B | CPU/CUDA | PASS | 23/23 CPU and 23/23 CUDA model matrix runs complete. |
 | Text LLM | Gemma 2 2B | CPU/CUDA | PASS | 27/27 CPU and 27/27 CUDA model matrix runs complete. |
 | MLLM | Qwen3-VL 2B Q4_K_M + F16 mmproj | CPU | PASS | FlashRT and direct `jetson_pi_mllm` produce exact image+text output for the same generated RGB fixture and greedy sampling. |
 | MLLM | Qwen3-VL 2B Q4_K_M + F16 mmproj | CUDA | PASS | 29/29 language layers plus CLIP/VIT on CUDA; FlashRT/direct image+text output is exact; one-shot equals staged prefill/decode; finite logits. |
+| MLLM | Qwen3-VL 2B Q4_K_M + F16 mmproj | Vulkan | INFERENCE PASS; TEARDOWN FAIL | 29/29 language layers plus CLIP/VIT on Vulkan; one-shot/staged, finite-logit, and budget gates reach `== JETSON_PI MLLM PASSED ==`, then process exit is 139. |
 | MLLM | Qwen3-VL 2B Q4_K_M + F16 mmproj | SYCL-on-CUDA | PASS | 29/29 language layers plus CLIP/VIT on SYCL0; FlashRT/direct output exact; one-shot/staged decode, finite logits, and token budget pass. |
 | LLM provider | Qwen3 0.6B | OpenCL | BACKEND CAPABILITY GATE | NVIDIA OpenCL 3.0 platform/device is enumerated, but this fork accepts only Adreno/Qualcomm and Intel families, drops the RTX 4090, and explicit open fails with zero registered devices. |
 | Production package | Qwen3 0.6B | direct-link and `GGML_BACKEND_DL` CPU/CUDA | PASS | Direct-link dependencies resolve to the locked install prefix and CUDA reports 29/29; dynamic-package core/provider ELF has no backend-module `DT_NEEDED`, CPU reports 0/29, CUDA reports 29/29, and C++ plus Python gates pass. |
 
 ## Known Driver-Lifecycle Result
 
-- Qwen3-VL 2B inference reaches the success marker with 29/29 language layers
-  plus CLIP/VIT on Vulkan. The process then segfaults during NVIDIA 550.54.14
-  driver teardown. This is not counted as a clean PASS row, and the provider
-  does not install a fallback or speculative teardown workaround.
+- With the final rebuilt binaries, Pi0, Qwen3 0.6B, and Qwen3-VL 2B all reach
+  their test success markers after running the intended Vulkan model/VIT paths.
+  Each process then segfaults during NVIDIA 550.54.14 driver teardown and exits
+  139. No Vulkan row is counted as a clean PASS, and the provider does not
+  install a fallback or speculative teardown workaround.
 
 ## §14 Invariants
 
@@ -136,6 +138,9 @@ Final-run logs used by this matrix include:
 - `/tmp/mllm-parity-cuda-final-gpu6.log`
 - `/tmp/full-digest-pi0-gpu6.log`
 - `/tmp/final-mllm-vulkan-gpu6.log`
+- `/tmp/final-audit-pi0-vulkan-gpu6.log`
+- `/tmp/final-audit-llm-vulkan-gpu6.log`
+- `/tmp/final-audit-mllm-vulkan-gpu6.log`
 - `/tmp/final-opencl-hard-gate.log`
 - `/tmp/final-sycl-gate3.log`
 - `/tmp/decode-budget-llm-gpu6.log`
