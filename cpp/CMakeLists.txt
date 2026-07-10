@@ -23,7 +23,8 @@ option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
 option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality staging" ON)
 option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
 option(FLASHRT_CPP_WITH_JETSON_PI "Build optional Jetson-PI llama.cpp/mtmd integration checks" OFF)
-set(JETSON_PI_ROOT "" CACHE PATH "Jetson-PI llama.cpp fork root")
+set(JETSON_PI_ROOT "" CACHE PATH "Jetson-PI llama.cpp fork SOURCE root (dev add_subdirectory path)")
+set(JetsonPI_ROOT "" CACHE PATH "Jetson-PI INSTALL prefix (production find_package path)")
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   find_package(CUDAToolkit REQUIRED)
 endif()
@@ -32,29 +33,76 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   find_package(CUDAToolkit REQUIRED)
 endif()
 if(FLASHRT_CPP_WITH_JETSON_PI AND NOT BUILD_TESTING)
-  message(FATAL_ERROR
-    "FLASHRT_CPP_WITH_JETSON_PI currently requires BUILD_TESTING=ON "
-    "(the Jetson-PI integration is exercised through test targets).")
+  message(STATUS
+    "FLASHRT_CPP_WITH_JETSON_PI is exercised through test targets; building anyway.")
 endif()
+
+# §5.2 production deploy: two integration routes.
+#  (1) Dev: -DJETSON_PI_ROOT=<source-tree>  -> add_subdirectory (in-tree build,
+#      the GPU-verified path). The provider links the in-tree jetson_pi_* targets.
+#  (2) Prod: -DJetsonPI_ROOT=<install-prefix> (no JETSON_PI_ROOT) -> find_package
+#      an INSTALLED Jetson-PI via cmake/FindJetsonPI.cmake; the provider links the
+#      imported JetsonPI::jetson_pi_* targets. Used for `cmake --install` layouts.
+# Exactly one of the two must be set. Configuring both is an error: selecting a
+# route implicitly could hide a stale cache entry and link the wrong Jetson-PI.
+# The provider's link expression below uses a variable so the two routes are
+# symmetric and the dev path stays byte-identical to before.
+set(_frt_jetson_pi_pi0  jetson_pi_pi0)
+set(_frt_jetson_pi_llm  jetson_pi_llm)
+set(_frt_jetson_pi_mllm jetson_pi_mllm)
 if(FLASHRT_CPP_WITH_JETSON_PI)
-  if(NOT JETSON_PI_ROOT OR NOT EXISTS "${JETSON_PI_ROOT}/CMakeLists.txt")
-    message(FATAL_ERROR "FLASHRT_CPP_WITH_JETSON_PI requires -DJETSON_PI_ROOT=/path/to/Jetson-PI")
+  if(JETSON_PI_ROOT AND JetsonPI_ROOT)
+    message(FATAL_ERROR
+      "Set exactly one Jetson-PI integration root: "
+      "-DJETSON_PI_ROOT=<source-tree> for the dev add_subdirectory route, or "
+      "-DJetsonPI_ROOT=<install-prefix> for the production find_package route. "
+      "Both are currently set.")
   endif()
-  # FORCE: as a subdirectory embedding, FlashRT must own these Jetson-PI build
-  # options regardless of stale cache or conflicting -D flags from the caller,
-  # so the "mtmd without the full tools tree" isolation holds.
-  set(LLAMA_BUILD_COMMON ON CACHE BOOL "llama: build common utils library" FORCE)
-  set(LLAMA_CURL OFF CACHE BOOL "llama: use libcurl to download model from an URL" FORCE)
-  set(LLAMA_HTTPLIB OFF CACHE BOOL "llama: disable httplib (FlashRT integration needs no HTTP)" FORCE)
-  set(LLAMA_BUILD_TESTS OFF CACHE BOOL "llama: build tests" FORCE)
-  set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "llama: build tools" FORCE)
-  set(JETSON_PI_BUILD_MTMD ON CACHE BOOL "Jetson-PI: build the mtmd library without the full tools tree" FORCE)
-  set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "llama: build examples" FORCE)
-  set(LLAMA_BUILD_SERVER OFF CACHE BOOL "llama: build server example" FORCE)
-  set(LLAMA_TOOLS_INSTALL OFF CACHE BOOL "llama: install tools" FORCE)
-  add_subdirectory("${JETSON_PI_ROOT}"
-                   "${CMAKE_CURRENT_BINARY_DIR}/jetson-pi"
-                   EXCLUDE_FROM_ALL)
+  if(NOT JETSON_PI_ROOT AND NOT JetsonPI_ROOT)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_JETSON_PI requires exactly one explicit integration "
+      "root: -DJETSON_PI_ROOT=<source-tree> for dev, or "
+      "-DJetsonPI_ROOT=<install-prefix> for production.")
+  endif()
+  if(JETSON_PI_ROOT AND EXISTS "${JETSON_PI_ROOT}/CMakeLists.txt")
+    # (1) dev: add_subdirectory the source tree
+    # FORCE: as a subdirectory embedding, FlashRT must own these Jetson-PI build
+    # options regardless of stale cache or conflicting -D flags from the caller,
+    # so the "mtmd without the full tools tree" isolation holds.
+    set(LLAMA_BUILD_COMMON ON CACHE BOOL "llama: build common utils library" FORCE)
+    set(LLAMA_CURL OFF CACHE BOOL "llama: use libcurl to download model from an URL" FORCE)
+    set(LLAMA_HTTPLIB OFF CACHE BOOL "llama: disable httplib (FlashRT integration needs no HTTP)" FORCE)
+    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "llama: build tests" FORCE)
+    set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "llama: build tools" FORCE)
+    set(JETSON_PI_BUILD_MTMD ON CACHE BOOL "Jetson-PI: build the mtmd library without the full tools tree" FORCE)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "llama: build examples" FORCE)
+    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "llama: build server example" FORCE)
+    set(LLAMA_TOOLS_INSTALL OFF CACHE BOOL "llama: install tools" FORCE)
+    add_subdirectory("${JETSON_PI_ROOT}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/jetson-pi"
+                     EXCLUDE_FROM_ALL)
+    message(STATUS "Jetson-PI: dev add_subdirectory path (${JETSON_PI_ROOT})")
+  elseif(JETSON_PI_ROOT)
+    # JETSON_PI_ROOT was set but does not point at a Jetson-PI source tree.
+    # Fail loudly rather than silently fall through to the prod find_package
+    # path (which would then error with a confusing "Jetson-PI not found").
+    message(FATAL_ERROR
+      "JETSON_PI_ROOT is set to '${JETSON_PI_ROOT}' but it is not a Jetson-PI "
+      "source tree (no CMakeLists.txt found there). Fix the path, or unset "
+      "JETSON_PI_ROOT and use -DJetsonPI_ROOT=<install-prefix> for the "
+      "production find_package route.")
+  else()
+    # (2) prod: find an installed Jetson-PI. Scope the module-path addition to
+    # this find so FindJetsonPI.cmake does not leak into unrelated find_package
+    # calls later in the same configure.
+    list(PREPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
+    find_package(JetsonPI REQUIRED)
+    list(POP_FRONT CMAKE_MODULE_PATH)
+    set(_frt_jetson_pi_pi0  JetsonPI::jetson_pi_pi0)
+    set(_frt_jetson_pi_llm  JetsonPI::jetson_pi_llm)
+    set(_frt_jetson_pi_mllm JetsonPI::jetson_pi_mllm)
+    message(STATUS "Jetson-PI: production find_package path (${JetsonPI_ROOT})")
+  endif()
 endif()
 if(FLASHRT_CPP_WITH_EXEC AND NOT TARGET flashrt_exec)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../exec
@@ -135,7 +183,7 @@ if(FLASHRT_CPP_WITH_JETSON_PI)
     PRIVATE providers/llama_cpp/src/jetson_pi_engine.cpp
             providers/llama_cpp/src/jetson_pi_link_check.cpp)
   target_link_libraries(flashrt_cpp_llama_cpp_provider
-    PRIVATE jetson_pi_pi0 jetson_pi_llm jetson_pi_mllm)
+    PRIVATE ${_frt_jetson_pi_pi0} ${_frt_jetson_pi_llm} ${_frt_jetson_pi_mllm})
   target_compile_definitions(flashrt_cpp_llama_cpp_provider
     PRIVATE FLASHRT_CPP_WITH_JETSON_PI=1)
 
@@ -149,13 +197,28 @@ if(FLASHRT_CPP_WITH_JETSON_PI)
     providers/llama_cpp/src/mllm_runtime.cpp
     providers/llama_cpp/src/jetson_pi_engine.cpp)
   target_link_libraries(flashrt_cpp_llama_cpp_provider_c
-    PUBLIC flashrt_runtime jetson_pi_pi0 jetson_pi_llm jetson_pi_mllm)
+    PUBLIC flashrt_runtime ${_frt_jetson_pi_pi0} ${_frt_jetson_pi_llm} ${_frt_jetson_pi_mllm})
   target_include_directories(flashrt_cpp_llama_cpp_provider_c
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/llama_cpp/include)
   target_compile_definitions(flashrt_cpp_llama_cpp_provider_c
     PRIVATE FLASHRT_CPP_WITH_JETSON_PI=1)
   set_target_properties(flashrt_cpp_llama_cpp_provider_c PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
+
+  # §5.2 production install: lay the SHARED provider lib so a deployed FlashRT
+  # has the ctypes dlopen target on the install prefix. Dev add_subdirectory
+  # builds are unaffected (install() is a no-op unless cmake --install runs).
+  include(GNUInstallDirs)
+  if(JetsonPI_ROOT)
+    set_target_properties(flashrt_cpp_llama_cpp_provider_c PROPERTIES
+      INSTALL_RPATH "$ORIGIN;${JetsonPI_LIBRARY_DIRS}")
+  else()
+    set_target_properties(flashrt_cpp_llama_cpp_provider_c PROPERTIES
+      INSTALL_RPATH "$ORIGIN")
+  endif()
+  install(TARGETS flashrt_cpp_llama_cpp_provider_c flashrt_runtime
+          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+          RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 if(BUILD_TESTING)
@@ -201,26 +264,28 @@ if(BUILD_TESTING)
     add_test(NAME llama_cpp_jetson_pi_link
       COMMAND test_llama_cpp_jetson_pi_link)
 
-    add_executable(test_llama_cpp_jetson_pi_engine
-      tests/test_llama_cpp_jetson_pi_engine.cpp)
-    target_link_libraries(test_llama_cpp_jetson_pi_engine
-      PRIVATE flashrt_cpp_llama_cpp_provider jetson_pi_pi0)
-    target_include_directories(test_llama_cpp_jetson_pi_engine
-      PRIVATE ${JETSON_PI_ROOT}/vendor)   # stb_image.h for fixture loading
-    add_test(NAME llama_cpp_jetson_pi_engine
-      COMMAND test_llama_cpp_jetson_pi_engine)
+    if(JETSON_PI_ROOT AND EXISTS "${JETSON_PI_ROOT}/vendor")
+      add_executable(test_llama_cpp_jetson_pi_engine
+        tests/test_llama_cpp_jetson_pi_engine.cpp)
+      target_link_libraries(test_llama_cpp_jetson_pi_engine
+        PRIVATE flashrt_cpp_llama_cpp_provider ${_frt_jetson_pi_pi0})
+      target_include_directories(test_llama_cpp_jetson_pi_engine
+        PRIVATE ${JETSON_PI_ROOT}/vendor)   # stb_image.h (dev tree)
+      add_test(NAME llama_cpp_jetson_pi_engine
+        COMMAND test_llama_cpp_jetson_pi_engine)
+    endif()
 
     add_executable(test_llama_cpp_jetson_pi_llm
       tests/test_llama_cpp_jetson_pi_llm.cpp)
     target_link_libraries(test_llama_cpp_jetson_pi_llm
-      PRIVATE flashrt_cpp_llama_cpp_provider jetson_pi_llm)
+      PRIVATE flashrt_cpp_llama_cpp_provider ${_frt_jetson_pi_llm})
     add_test(NAME llama_cpp_jetson_pi_llm
       COMMAND test_llama_cpp_jetson_pi_llm)
 
     add_executable(test_llama_cpp_jetson_pi_mllm
       tests/test_llama_cpp_jetson_pi_mllm.cpp)
     target_link_libraries(test_llama_cpp_jetson_pi_mllm
-      PRIVATE flashrt_cpp_llama_cpp_provider jetson_pi_mllm)
+      PRIVATE flashrt_cpp_llama_cpp_provider ${_frt_jetson_pi_mllm})
     add_test(NAME llama_cpp_jetson_pi_mllm
       COMMAND test_llama_cpp_jetson_pi_mllm)
 
@@ -229,19 +294,21 @@ if(BUILD_TESTING)
     # verb plumbing does not perturb outputs. Pi0 (actions, <=1e-5) and LLM
     # (greedy text, exact). MLLM deferred (smoke output is template-token
     # noise, not a stable parity target).
-    add_executable(test_llama_cpp_jetson_pi_parity
-      tests/test_llama_cpp_jetson_pi_parity.cpp)
-    target_link_libraries(test_llama_cpp_jetson_pi_parity
-      PRIVATE flashrt_cpp_llama_cpp_provider jetson_pi_pi0)
-    target_include_directories(test_llama_cpp_jetson_pi_parity
-      PRIVATE ${JETSON_PI_ROOT}/vendor)   # stb_image.h for fixture loading
-    add_test(NAME llama_cpp_jetson_pi_parity
-      COMMAND test_llama_cpp_jetson_pi_parity)
+    if(JETSON_PI_ROOT AND EXISTS "${JETSON_PI_ROOT}/vendor")
+      add_executable(test_llama_cpp_jetson_pi_parity
+        tests/test_llama_cpp_jetson_pi_parity.cpp)
+      target_link_libraries(test_llama_cpp_jetson_pi_parity
+        PRIVATE flashrt_cpp_llama_cpp_provider ${_frt_jetson_pi_pi0})
+      target_include_directories(test_llama_cpp_jetson_pi_parity
+        PRIVATE ${JETSON_PI_ROOT}/vendor)   # stb_image.h (dev tree)
+      add_test(NAME llama_cpp_jetson_pi_parity
+        COMMAND test_llama_cpp_jetson_pi_parity)
+    endif()
 
     add_executable(test_llama_cpp_jetson_pi_llm_parity
       tests/test_llama_cpp_jetson_pi_llm_parity.cpp)
     target_link_libraries(test_llama_cpp_jetson_pi_llm_parity
-      PRIVATE flashrt_cpp_llama_cpp_provider jetson_pi_llm)
+      PRIVATE flashrt_cpp_llama_cpp_provider ${_frt_jetson_pi_llm})
     add_test(NAME llama_cpp_jetson_pi_llm_parity
       COMMAND test_llama_cpp_jetson_pi_llm_parity)
   endif()
