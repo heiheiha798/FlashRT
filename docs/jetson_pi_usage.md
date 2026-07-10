@@ -15,6 +15,11 @@ Three providers, selected by `config=`:
 
 ## Build
 
+Two integration routes (§5.2): a **dev** `add_subdirectory` path and a
+**production** `find_package` path. Pick one.
+
+### Dev: `add_subdirectory` (builds Jetson-PI inline from its source tree)
+
 ```bash
 cmake -S FlashRT/cpp -B FlashRT/cpp/build-jetson-pi \
   -DCMAKE_C_COMPILER=.../x86_64-conda-linux-gnu-cc \
@@ -26,6 +31,107 @@ cmake --build FlashRT/cpp/build-jetson-pi -j32 --target flashrt_cpp_llama_cpp_pr
 ```
 
 Produces `FlashRT/cpp/build-jetson-pi/libflashrt_cpp_llama_cpp_provider_c.so`.
+
+### Production: `find_package(JetsonPI)` (link a pre-installed Jetson-PI)
+
+Build and install Jetson-PI as a standalone tree (NOT via FlashRT's
+`add_subdirectory`). With `LLAMA_BUILD_COMMON=ON` + `JETSON_PI_BUILD_MTMD=ON`
+the narrow `jetson_pi_*` libs and `mtmd`/`llama`/`ggml` deps build; install lays
+down `lib64/libjetson_pi_{pi0,llm,mllm}.so`, `lib64/lib{llama,mtmd,ggml*}.so`, and
+`include/jetson_pi_{pi0,llm,mllm}.h`:
+
+```bash
+cmake -S Jetson-PI -B Jetson-PI/build-prod \
+  -DCMAKE_C_COMPILER=.../x86_64-conda-linux-gnu-cc \
+  -DCMAKE_CXX_COMPILER=.../x86_64-conda-linux-gnu-c++ \
+  -DCMAKE_CUDA_COMPILER=.../nvcc -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON -DLLAMA_BUILD_COMMON=ON -DJETSON_PI_BUILD_MTMD=ON \
+  -DLLAMA_CURL=OFF -DLLAMA_HTTPLIB=OFF \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+  -DLLAMA_TOOLS_INSTALL=OFF \
+  -DCMAKE_INSTALL_PREFIX=/path/to/jetson-pi-install-prefix
+cmake --build Jetson-PI/build-prod -j16 \
+  --target jetson_pi_pi0 jetson_pi_llm jetson_pi_mllm
+cmake --install Jetson-PI/build-prod
+```
+
+> `LLAMA_TOOLS_INSTALL=OFF` is load-bearing: with `JETSON_PI_BUILD_MTMD=ON`,
+> `tools/mtmd/CMakeLists.txt` unconditionally `add_executable(llama-mtmd-cli)`
+> but only builds it when the full tools tree is built; the CLI's
+> `install(TARGETS)` rule still runs unless `LLAMA_TOOLS_INSTALL=OFF`, aborting
+> `cmake --install` with `cannot find llama-mtmd-cli` — and that abort happens
+> *before* `libllama.so` is laid down, so `find_package(JetsonPI)` then fails on
+> the missing `llama` lib.
+
+Then configure FlashRT against the installed prefix (no `JETSON_PI_ROOT`):
+
+```bash
+cmake -S FlashRT/cpp -B FlashRT/cpp/build-jetson-pi-prod \
+  -DCMAKE_C_COMPILER=.../x86_64-conda-linux-gnu-cc \
+  -DCMAKE_CXX_COMPILER=.../x86_64-conda-linux-gnu-c++ \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+  -DFLASHRT_CPP_WITH_JETSON_PI=ON \
+  -DJetsonPI_ROOT=/path/to/jetson-pi-install-prefix
+cmake --build FlashRT/cpp/build-jetson-pi-prod -j32 --target flashrt_cpp_llama_cpp_provider_c
+```
+
+`FlashRT/cmake/FindJetsonPI.cmake` resolves the installed libs/headers into
+imported targets `JetsonPI::jetson_pi_pi0` / `::jetson_pi_llm` / `::jetson_pi_mllm`
+(+ `::mtmd` / `::llama` / `::ggml` / per-backend); `ldd` on the built
+`libflashrt_cpp_llama_cpp_provider_c.so` must then resolve to the installed
+prefix's `libjetson_pi_pi0.so.0` / `libllama.so.0` / `libggml-cuda.so.0`, not to
+any in-tree copy. `cmake --install` of FlashRT lays down the SHARED provider
+`_c.so` and `libflashrt_runtime.so` to `${CMAKE_INSTALL_LIBDIR}`. The installed
+provider has an install RPATH containing `$ORIGIN` plus the exact library
+directories resolved under `JetsonPI_ROOT`, so it can be loaded without an
+ambient `LD_LIBRARY_PATH`. Set `-DJETSON_PI_ROOT=<source>` for dev OR
+`-DJetsonPI_ROOT=<prefix>` for prod — exactly one is required. Configuration
+fails explicitly when neither or both are set, preventing an implicit search
+from selecting a stale system installation.
+
+When the installed prefix contains `libggml-cuda`, FlashRT's production
+configure requires the matching CUDA Toolkit CMake package so the imported
+`ggml-cuda` target carries its driver/runtime/cuBLAS link interface. This is a
+build-host requirement; the installed provider itself was verified with only
+its recorded RPATH and the normal NVIDIA runtime loader environment.
+
+> **The Pi0 parity + engine tests are dev-path only.** `test_llama_cpp_jetson_pi_parity`
+> and `test_llama_cpp_jetson_pi_engine` `#include "stb/stb_image.h"`, which lives
+> only in Jetson-PI's `vendor/` source tree; the prod path has no `JETSON_PI_ROOT`,
+> so `cpp/CMakeLists.txt` does not define those two targets on the prod path.
+> The link, LLM, MLLM, and LLM-parity tests do not use stb and remain available
+> with prod `BUILD_TESTING=ON`. A prod-path GPU smoke via the Python frontend
+> (`FLASHRT_PI0_LIB=<installed _c.so>`) exercises the installed artifact
+> end-to-end instead — verified on GPU6/RTX 4090 on 2026-07-10 (`offloaded
+> 37/37`, actions `(10,32)`, no NaN/Inf, nonzero; installed `_c.so` resolves
+> `libflashrt_runtime.so` through `$ORIGIN` and Jetson-PI/mtmd/llama/GGML through
+> its exact install-prefix RPATH, without `LD_LIBRARY_PATH`).
+
+### Pinned Jetson-PI commit (§15.1)
+
+The Jetson-PI fork must be used as a locked version with its own GGML — do not
+mix another llama.cpp/GGML version into the same provider (ABI/symbol/layout
+conflicts). This integration is developed and GPU-verified against Jetson-PI
+commit `1450cec` (branch `expose-mtmd-only-build`, local — not pushed to a
+remote). When upgrading the fork, re-run the parity tests
+(`test_llama_cpp_jetson_pi_parity` / `test_llama_cpp_jetson_pi_llm_parity`) to
+confirm FlashRT's provider path still matches the direct `jetson_pi_*` path
+byte-for-byte.
+
+### Symbol visibility (§15.2)
+
+Each narrow C API lib (`libjetson_pi_pi0` / `libjetson_pi_llm` /
+`libjetson_pi_mllm`) exports only its `jetson_pi_*` C symbols — no `ggml_*` /
+`llama_*` / `mtmd_*` C API symbols are defined in the narrow libs (they are
+imported via the PUBLIC link to `mtmd`/`llama`/`ggml`). Verified by
+`for lib in libjetson_pi_{pi0,llm,mllm}.so; do nm -D --defined-only "$lib" |
+grep -E ' (ggml_|llama_|mtmd_)[A-Za-z]'; done` → empty. (A
+`std::vector<mtmd_bitmap*>` stdlib template weak symbol appears in
+the pi0/mllm libs; that is a benign COMDAT stdlib instantiation referencing the
+`mtmd_bitmap` type, not the mtmd C API.)
+
 
 ## Usage
 
@@ -272,4 +378,3 @@ generated text is a connectivity check (non-empty, printable), not a
 task-accurate caption. Callers wanting a well-formed answer must apply the
 model's chat template (with the image placeholder positioned by the template)
 themselves.
-
