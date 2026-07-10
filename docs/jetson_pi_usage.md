@@ -207,15 +207,17 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
 - **CPU, CUDA, and Vulkan backends verified.** `backend="cuda"` is verified
   end-to-end on an RTX 4090 (sm_89) for all three providers — Pi0 (`offloaded
   37/37 layers`, pi0_base), LLM (`29/29`, qwen3-0.6b-q4_k_m), and MLLM
-  (`37/37`, Qwen2.5-VL-3B-Instruct-q4_0; the VIT/mmproj encoder offloads too).
+  (`29/29`, Qwen3-VL-2B-Instruct-Q4_K_M; the VIT/mmproj encoder offloads too).
   For Pi0 and LLM the generated output is coherent; for MLLM the GPU execution
   path (load → VIT encode → forward → sample) is exercised, but the smoke test
   feeds a raw prompt so the output is template-token noise rather than a
   caption — output coherence requires a caller-applied chat template (see the
-  MLLM note below). `backend="vulkan"` is also verified on the RTX 4090 for
-  Pi0 and LLM (smoke + numerical parity vs the direct `jetson_pi_*` call, both
-  passing with `max_diff = 0` / exact text match); the VIT/mmproj encoder
-  offloads to Vulkan0 too (`clip_ctx: CLIP using Vulkan0 backend`). Per §6 of
+  MLLM note below). `backend="vulkan"` is clean-exit verified on the RTX 4090
+  for Pi0 and LLM (smoke + numerical parity vs the direct `jetson_pi_*` call,
+  both passing with `max_diff = 0` / exact text match). Qwen3-VL MLLM completes
+  one-shot and staged inference with its text layers and VIT on Vulkan0, but
+  the local NVIDIA 550.54.14 ICD crashes later during process-exit teardown,
+  so MLLM is not a clean-exit Vulkan validation. Per §6 of
   the migration plan, compiling a backend does not guarantee every model op is
   supported on it — each model×backend combo is verified separately. The CUDA
   build needs its own build dir with `-DGGML_CUDA=ON` (it defaults OFF), plus
@@ -243,21 +245,25 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
   (`FLASHRT_MLLM_*`) smoke tests — see their sections below.
 
   Note: the Jetson-PI engine accepts `backend` `"cpu"` / `"cuda"` / `"vulkan"`
-  by exact string match; any other value (including typos) is **rejected** by
-  `open` (returns `INVALID` + a null handle), NOT a silent CPU fallback — this
-  honors the project's no-fallback contract. `"cpu"` sets `n_gpu_layers=0`;
-  `"cuda"`/`"vulkan"` set `n_gpu_layers=9999`. The actual device (CUDA0 /
-  Vulkan0) is chosen by GGML's scheduler from the backends registered by
-  `ggml_backend_load_all` (i.e. what was compiled in), **not** pinned by the
-  string — so on a CUDA+Vulkan mixed build, `backend="vulkan"` would split
-  layers across CUDA0+Vulkan0, and on a build lacking the requested backend GGML
-  leaves everything on CPU. The per-build recipes below use a single-backend
-  build (`-DGGML_CUDA=ON` or `-DGGML_VULKAN=ON -DGGML_CUDA=OFF`) to avoid that
-  ambiguity. Treat the `load_tensors: layer N assigned to device <Dev>` /
-  `offloaded N/N layers to <Dev>` log line as the real signal that the intended
-  backend was exercised.
+  / `"opencl"` / `"sycl"` by exact string match. Any other value (including
+  typos) is **rejected** by `open` (returns `INVALID` + a null handle), not a
+  silent CPU fallback. `"cpu"` sets `n_gpu_layers=0`. A non-CPU value resolves
+  the exact GGML registry (`CUDA`, `Vulkan`, `OpenCL`, or `SYCL`), requires at
+  least one non-CPU registered device, and selects registry device 0 as the
+  llama model's offload device and MTMD/CLIP's primary accelerator. A build
+  missing the requested backend or a host with no accelerator therefore fails
+  during open instead of silently treating the request as CPU or another
+  compiled backend. GGML's normal heterogeneous scheduler remains intact: CPU
+  is still present for host work and for individual operations an accelerator
+  backend does not implement. This is per-operation scheduling inside the
+  explicitly selected provider, not backend-request fallback. Environment variables
+  such as `CUDA_VISIBLE_DEVICES` and `GGML_VK_VISIBLE_DEVICES` determine which
+  physical accelerator appears as that registry's device 0. Treat the
+  `offloaded N/N layers` and `CLIP using <backend>` log lines as confirmation
+  that the intended backend was exercised.
 
-  **Vulkan backend** (verified on RTX 4090 for Pi0 + LLM). Build in a separate
+  **Vulkan backend** (Pi0 + LLM clean-exit verified; MLLM inference verified
+  with the NVIDIA process-exit caveat below). Build in a separate
   dir with `-DGGML_VULKAN=ON -DGGML_CUDA=OFF` (Vulkan is SPIR-V; no CUDA arch
   needed) and conda compilers; the `vulkan-shaders-gen` build-time tool needs a
   C++17 host compiler, so export `CC`/`CXX` to the conda compilers for the
@@ -296,8 +302,38 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
   Verified: Pi0 `pi0_base` offloads 36 layers + VIT to Vulkan0, actions
   (10,32) sane, parity `max_diff = 0` vs the direct `jetson_pi_pi0` call;
   LLM `qwen3-0.6b-q4_k_m` offloads 28 layers to Vulkan0, greedy text
-  byte-identical to the direct `jetson_pi_llm` call. MLLM-on-Vulkan is not
-  verified this round (§6: each model×backend combo separately).
+  byte-identical to the direct `jetson_pi_llm` call. Qwen3-VL MLLM also
+  completes one-shot and staged generation with all 29 text layers and VIT on
+  Vulkan0. On this workstation's NVIDIA 550.54.14 driver, the successful MLLM
+  process can subsequently segfault inside the NVIDIA Vulkan ICD's process-exit
+  destructors. GDB places the failure after the test success marker, outside
+  provider inference and explicit object destruction; attempts to force Vulkan
+  teardown made the driver race more reproducible and were not retained. Treat
+  this as a local driver lifecycle defect, not a clean-exit validation result.
+
+  **OpenCL backend.** A dedicated `-DGGML_OPENCL=ON` build succeeds with the
+  Khronos headers and ICD loader. On the current host, `clinfo -l` reports no
+  OpenCL platform, so `backend="opencl"` is intentionally rejected with
+  `requested GGML backend has no registered device: opencl`. This validates the
+  no-fallback gate but does not constitute a model execution result.
+
+  **SYCL backend.** A separate `jetsonpi-backends` conda environment with
+  DPC++ 2025.3.2 can compile the complete provider for
+  `-DGGML_SYCL=ON -DGGML_SYCL_TARGET=NVIDIA -DGGML_SYCL_DNN=OFF`. The build
+  needs the conda sysroot and libstdc++ include paths explicitly, and disables
+  the broken conda `IntelSYCLConfig.cmake` discovery so GGML uses its direct
+  `-fsycl` path. Four vector initializers in Jetson-PI were made Clang-portable
+  without changing their size/value semantics. The installed DPC++ runtime on
+  this host contains OpenCL and Level Zero UR adapters but no NVIDIA CUDA UR
+  adapter: `sycl-ls` therefore lists only the Intel CPU OpenCL device. The
+  NVIDIA-targeted provider is compile-validated, but no SYCL-on-GPU model run
+  is claimed; requesting `backend="sycl"` on an environment without a SYCL
+  accelerator is rejected by the same registered-device gate. Loading or
+  linking this build requires the matching DPC++ runtime (`libsycl`, `libimf`,
+  `libsvml`, `libintlc`) and oneMath cuBLAS backend to be discoverable via
+  `ONEAPI_ROOT` and the runtime loader path. `FindJetsonPI.cmake` checks these
+  dependencies when an installed prefix contains `libggml-sycl` instead of
+  creating a partially linked imported target.
 - **No calibration.** The frontends have no `calibrate`/`calibrated`; the
   Jetson-PI providers do not need FlashRT-style FP8 calibration.
 - **`state` is a separate port** for Pi0, not encoded into the prompt (unlike
@@ -352,7 +388,10 @@ python -m flash_rt.tests.test_jetson_pi_llm_python
 `FLASHRT_LLM_LIB` at the `build-jetson-pi-cuda/libflashrt_cpp_llama_cpp_provider_c.so`
 and add the cuda build's `bin/` to `LD_LIBRARY_PATH` (same recipe as the Pi0
 CUDA section above). Verified on an RTX 4090 (sm_89): `offloaded 29/29 layers
-to GPU` for qwen3-0.6b-q4_k_m.
+to GPU` for qwen3-0.6b-q4_k_m. The same staged/one-shot smoke also passes on
+CPU and CUDA for TinyLlama 1.1B (`llama`, 23 layers) and Gemma 2 2B (`gemma2`,
+27 layers), covering three distinct GGUF architectures rather than a single
+Qwen-specific path.
 
 ## Multimodal LLM (Phase 4)
 
