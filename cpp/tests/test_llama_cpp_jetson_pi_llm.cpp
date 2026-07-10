@@ -295,6 +295,61 @@ int main() {
 
     model->release(model->owner);
 
+    std::string budget_json =
+        std::string("{") +
+        "\"model_family\":\"llm\"," +
+        "\"model_path\":\"" + model_env + "\"," +
+        "\"backend\":\"" + backend + "\"," +
+        "\"n_ctx\":2048,\"n_threads\":0,"
+        "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,"
+        "\"max_tokens\":1}";
+    frt_model_runtime_v2 * budget_model = nullptr;
+    rc = frt_llama_cpp_llm_runtime_open_with_engine_factory(
+        budget_json.c_str(), factory, &budget_model);
+    CHECK(rc == 0 && budget_model, "open max_tokens=1 LLM runtime");
+    if (budget_model) {
+        CHECK(budget_model->verbs_v2.set_input(
+                  budget_model->self, FRT_LLAMA_CPP_LLM_PORT_PROMPT,
+                  prompt, std::strlen(prompt), -1) == 0 &&
+                  budget_model->verbs_v2.run_stage(
+                  budget_model->self,
+                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0 &&
+                  budget_model->verbs_v2.run_stage(
+                  budget_model->self,
+                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0,
+              "max_tokens=1 session permits exactly one decode");
+        int32_t first_is_eog = 1;
+        uint64_t scalar_written = 0;
+        CHECK(budget_model->verbs_v2.get_output(
+                  budget_model->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG,
+                  &first_is_eog, sizeof(first_is_eog), &scalar_written, -1) == 0 &&
+                  first_is_eog == 0,
+              "budget test prompt first token is not EOG");
+        CHECK(budget_model->verbs_v2.run_stage(
+                  budget_model->self,
+                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) != 0 &&
+                  std::strstr(budget_model->verbs_v2.last_error(
+                                  budget_model->self),
+                              "max_tokens"),
+              "staged decode rejects calls beyond max_tokens");
+        int32_t stale_scalar = 0;
+        CHECK(budget_model->verbs_v2.get_output(
+                  budget_model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN,
+                  &stale_scalar, sizeof(stale_scalar), &scalar_written, -1) == -7 &&
+                  budget_model->verbs_v2.get_output(
+                  budget_model->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG,
+                  &stale_scalar, sizeof(stale_scalar), &scalar_written, -1) == -7,
+              "failed decode invalidates staged scalar outputs");
+        CHECK(budget_model->verbs_v2.run_stage(
+                  budget_model->self,
+                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0 &&
+                  budget_model->verbs_v2.run_stage(
+                  budget_model->self,
+                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0,
+              "prefill restores staged decode budget");
+        budget_model->release(budget_model->owner);
+    }
+
     std::printf(g_fail ? "\n== JETSON_PI LLM FAILED ==\n"
                        : "\n== JETSON_PI LLM PASSED ==\n");
     return g_fail;
