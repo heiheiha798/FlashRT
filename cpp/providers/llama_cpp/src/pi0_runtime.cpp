@@ -16,6 +16,7 @@ struct RuntimeOwner {
     int64_t image_shape[4] = {};
     int64_t state_shape[1] = {};
     int64_t action_shape[2] = {};
+    bool staged_context_action = false;
 };
 
 int unsupported_prepare(void* self, uint32_t, frt_shape_key) {
@@ -61,11 +62,10 @@ int run_stage(void* self, uint32_t stage, int stream) {
     (void)stream;
     auto* owner = static_cast<RuntimeOwner*>(self);
     if (!owner) return -1;
-    if (stage != FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER) {
-        owner->last_error = "unknown llama_cpp Pi0 stage";
-        return -1;
-    }
-    const int rc = owner->engine.run_infer(owner->engine.self);
+    const int rc = owner->staged_context_action
+        ? owner->engine.run_stage(owner->engine.self, stage)
+        : (stage == FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER
+               ? owner->engine.run_infer(owner->engine.self) : -1);
     if (rc != 0) {
         owner->last_error = engine_error(owner);
     } else {
@@ -120,6 +120,8 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
     if (!owner) return -5;
     std::memcpy(&owner->engine, engine,
                 std::min<size_t>(engine->struct_size, sizeof(owner->engine)));
+    owner->staged_context_action = engine->struct_size >= sizeof(*engine) &&
+                                   owner->engine.run_stage;
     if (owner->engine.retain) owner->engine.retain(owner->engine.self);
 
     owner->image_shape[0] = static_cast<int64_t>(config->n_views);
@@ -181,6 +183,14 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
 #endif
     rc |= frt_runtime_builder_add_callback_stage_v2(
         b, "infer", 0, nullptr, 0);
+    if (owner->staged_context_action) {
+        rc |= frt_runtime_builder_add_callback_stage_v2(
+            b, "context", 0, nullptr, 0);
+        const uint32_t action_after[1] = {
+            FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT};
+        rc |= frt_runtime_builder_add_callback_stage_v2(
+            b, "action", 0, action_after, 1);
+    }
     rc |= frt_runtime_builder_add_identity(b, "provider", "llama_cpp");
     rc |= frt_runtime_builder_add_identity(b, "model_family", "pi0");
     rc |= frt_runtime_builder_add_identity(b, "model_path", config->model_path);

@@ -156,7 +156,17 @@ actions = model.predict(
     state=robot_state_floats,                  # 1-D float32, ≤ action_dim
 )
 # actions: np.ndarray shape (action_steps, action_dim), float32, raw (no unnorm)
+
+# Optional fine-grained execution. Context owns prompt/image encoding and
+# provider-private encoded KV; action consumes that pending context once.
+model._pipe.set_prompt("put the mug on the plate")
+model._pipe.context({"images": [image, wrist_image], "state": robot_state})
+actions = model._pipe.action()
 ```
+
+The Pi0 runtime exposes callback stages `infer`, `context`, and `action`, with
+an explicit `context -> action` dependency. `infer` remains the compatibility
+whole-tick face and is implemented by the same narrow context/action API.
 
 `LD_LIBRARY_PATH` must include the conda lib dir (for `libgomp.so`, needed by
 `libggml-cpu.so`) and the build dir (for `libjetson_pi_pi0.so` /

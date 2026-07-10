@@ -152,6 +152,12 @@ int engine_set_input(void * self, uint32_t port, const void * data,
     Engine * e = static_cast<Engine*>(self);
     if (!e) return -1;
     e->clear_error();
+    int32_t discard_status = jetson_pi_pi0_discard_context(e->pi0);
+    if (discard_status != JETSON_PI_PI0_OK) {
+        e->set_error(std::string("jetson_pi_pi0_discard_context failed: ") +
+                     jetson_pi_pi0_last_error(e->pi0));
+        return pi0_status_to_engine(discard_status);
+    }
     // Any new input invalidates the previous tick's actions so get_output
     // cannot return stale data without a fresh run_infer.
     e->actions_buf.clear();
@@ -252,6 +258,48 @@ int engine_run_infer(void * self) {
     }
     e->actions_buf.assign(actions.begin(), actions.end());
     return 0;
+}
+
+int engine_run_stage(void * self, uint32_t stage) {
+    Engine * e = static_cast<Engine*>(self);
+    if (!e) return -1;
+    if (stage == FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER) {
+        return engine_run_infer(self);
+    }
+    e->clear_error();
+    if (!e->images_set || !e->prompt_set || !e->state_set) {
+        e->set_error("Pi0 stage requires images, prompt, and state to be set");
+        return -1;
+    }
+    if (stage == FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT) {
+        e->actions_buf.clear();
+        int32_t s = jetson_pi_pi0_context(
+            e->pi0, e->image_ptrs.data(), e->image_ptrs.size(),
+            e->prompt.data(), e->prompt.size(), e->state.data(),
+            e->state.size());
+        if (s != JETSON_PI_PI0_OK) {
+            e->set_error(std::string("jetson_pi_pi0_context failed: ") +
+                         jetson_pi_pi0_last_error(e->pi0));
+            return pi0_status_to_engine(s);
+        }
+        return 0;
+    }
+    if (stage == FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION) {
+        std::vector<float> actions(
+            static_cast<size_t>(e->action_steps) * e->action_dim);
+        size_t written = 0;
+        int32_t s = jetson_pi_pi0_action(
+            e->pi0, actions.data(), actions.size(), &written);
+        if (s != JETSON_PI_PI0_OK) {
+            e->set_error(std::string("jetson_pi_pi0_action failed: ") +
+                         jetson_pi_pi0_last_error(e->pi0));
+            return pi0_status_to_engine(s);
+        }
+        e->actions_buf.assign(actions.begin(), actions.end());
+        return 0;
+    }
+    e->set_error("unknown Pi0 engine stage");
+    return -1;
 }
 
 const char * engine_last_error(void * self) {
@@ -1018,6 +1066,7 @@ frt_llama_cpp_default_engine_factory(void) {
             out->run_infer   = engine_run_infer;
             out->get_output  = engine_get_output;
             out->last_error  = engine_last_error;
+            out->run_stage   = engine_run_stage;
             return 0;
         };
         f.create_llm = [](void * /*self*/,

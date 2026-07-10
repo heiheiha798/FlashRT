@@ -154,6 +154,8 @@ int main() {
     old_engine_api.struct_size = FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE;
     old_engine_api.run_stage = nullptr;
 
+    frt_model_runtime_v2* old_pi0 = nullptr;
+
     frt_llama_cpp_llm_config llm_cfg{};
     llm_cfg.struct_size = sizeof(llm_cfg);
     llm_cfg.model_path = "/models/llm.gguf";
@@ -192,6 +194,12 @@ int main() {
     cfg.image_channels = 3;
     cfg.action_steps = 2;
     cfg.action_dim = 2;
+
+    CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(
+              &cfg, &old_engine_api, &old_pi0) == 0 && old_pi0 &&
+              old_pi0->n_stages_v2 == 1,
+          "old-prefix Pi0 engine exposes only infer schema");
+    if (old_pi0) old_pi0->release(old_pi0->owner);
 
     frt_llama_cpp_engine_v1 asymmetric = engine_api;
     asymmetric.retain = nullptr;

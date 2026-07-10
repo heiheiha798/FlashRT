@@ -119,6 +119,8 @@ PORT_PROMPT = 1
 PORT_STATE = 2
 PORT_ACTIONS = 3
 STAGE_INFER = 0
+STAGE_CONTEXT = 1
+STAGE_ACTION = 2
 
 # frt_model_runtime_v2 abi_version (model_runtime.h: FRT_MODEL_RUNTIME_ABI_VERSION_V2)
 _FRT_MODEL_RUNTIME_ABI_VERSION_V2 = 2
@@ -344,6 +346,64 @@ class Pi0JetsonPiFrontend:
                                 count=self.action_steps * self.action_dim
                                 ).reshape(self.action_steps, self.action_dim).copy()
         return {"actions": actions}
+
+    def context(self, observation):
+        """Run the Pi0 context stage and retain provider-private encoded state."""
+        if self._model is None:
+            raise RuntimeError("Pi0JetsonPiFrontend is closed")
+        images = list(observation["images"]) if "images" in observation else [
+            observation["image"]] + (
+                [observation["wrist_image"]]
+                if "wrist_image" in observation else [])
+        if len(images) != self.num_views:
+            raise ValueError(
+                f"expected {self.num_views} images, got {len(images)}")
+        state = observation.get("state")
+        if state is None:
+            raise ValueError(
+                "observation['state'] is required for the Jetson-PI Pi0 frontend")
+        state = np.asarray(state, dtype=np.float32).reshape(-1)
+        if state.size > self.action_dim:
+            raise ValueError(
+                f"state has {state.size} values, more than action_dim={self.action_dim}")
+        state_padded = np.zeros(self.action_dim, dtype=np.float32)
+        state_padded[:state.size] = state
+        views = self._make_image_views(images)
+        v2 = self._model.verbs_v2
+        self_ = self._model.self
+        self._check(v2.set_input(
+            self_, PORT_IMAGES, ctypes.cast(views, ctypes.c_void_p),
+            ctypes.sizeof(FrtImageView) * len(images), -1),
+            "set_input images")
+        self._check(v2.set_input(
+            self_, PORT_PROMPT, self._prompt, len(self._prompt), -1),
+            "set_input prompt")
+        self._check(v2.set_input(
+            self_, PORT_STATE, state_padded.ctypes.data,
+            state_padded.nbytes, -1), "set_input state")
+        self._check(v2.run_stage(self_, STAGE_CONTEXT, -1),
+                    "run_stage context")
+
+    def action(self):
+        """Consume the pending Pi0 context and return one action chunk."""
+        if self._model is None:
+            raise RuntimeError("Pi0JetsonPiFrontend is closed")
+        v2 = self._model.verbs_v2
+        self._check(v2.run_stage(self._model.self, STAGE_ACTION, -1),
+                    "run_stage action")
+        capacity = self.action_steps * self.action_dim * _F32_BYTES
+        out = (ctypes.c_char * capacity)()
+        written = ctypes.c_uint64(0)
+        self._check(v2.get_output(
+            self._model.self, PORT_ACTIONS, out, capacity,
+            ctypes.byref(written), -1), "get_output actions")
+        if written.value != capacity:
+            raise RuntimeError(
+                f"get_output wrote {written.value} bytes, expected {capacity}")
+        return np.frombuffer(
+            out, dtype=np.float32,
+            count=self.action_steps * self.action_dim).reshape(
+                self.action_steps, self.action_dim).copy()
 
     def close(self):
         if getattr(self, "_model", None) is not None:
