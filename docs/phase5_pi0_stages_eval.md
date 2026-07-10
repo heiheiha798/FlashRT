@@ -1,5 +1,20 @@
 # Phase 5 Evaluation — Finer Pi0 Stages (context / encoder / diffusion / action)
 
+> Implementation update (2026-07-10): the earlier no-go below is superseded at
+> the stable boundary required by the complete migration. Jetson-PI now exposes
+> separate `prepare_context` and `run_action` narrow C API calls, and FlashRT
+> exposes callback stages `context -> action` while preserving `infer` as the
+> compatibility whole-tick face. The context stage owns image preprocessing,
+> VIT, language/image encode, and provider-private encoded cross-KV; action owns
+> the complete ten-step diffusion loop and consumes the pending context once.
+> Whole infer versus split execution is bit-identical (`max_abs_diff=0`) on
+> CUDA and SYCL. This does not claim intermediate diffusion actions or an
+> intra-tick scheduling speedup; the historical analysis remains authoritative
+> for any split finer than the stable context/action boundary.
+
+> Historical evaluation dated 2026-07-07. The implementation update above is
+> authoritative; the remaining text records the original performance gate.
+
 ## 1. Executive summary + recommendation
 
 **Recommendation: NO-GO. Defer Phase 5.**

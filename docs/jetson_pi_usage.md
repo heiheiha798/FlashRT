@@ -39,8 +39,9 @@ Produces `FlashRT/cpp/build-jetson-pi/libflashrt_cpp_llama_cpp_provider_c.so`.
 
 Build and install Jetson-PI as a standalone tree (NOT via FlashRT's
 `add_subdirectory`). With `LLAMA_BUILD_COMMON=ON` + `JETSON_PI_BUILD_MTMD=ON`
-the narrow `jetson_pi_*` libs and `mtmd`/`llama`/`ggml` deps build; install lays
-down `lib64/libjetson_pi_{pi0,llm,mllm}.so`, `lib64/lib{llama,mtmd,ggml*}.so`, and
+the narrow `jetson_pi_*` libs and `mtmd`/`llama`/`ggml` deps build. The default
+direct-link layout installs `lib64/libjetson_pi_{pi0,llm,mllm}.so`,
+`lib64/lib{llama,mtmd,ggml*}.so`, and
 `include/jetson_pi_{pi0,llm,mllm}.h`:
 
 ```bash
@@ -82,10 +83,11 @@ cmake --build FlashRT/cpp/build-jetson-pi-prod -j32 --target flashrt_cpp_llama_c
 
 `FlashRT/cmake/FindJetsonPI.cmake` resolves the installed libs/headers into
 imported targets `JetsonPI::jetson_pi_pi0` / `::jetson_pi_llm` / `::jetson_pi_mllm`
-(+ `::mtmd` / `::llama` / `::ggml` / per-backend); `ldd` on the built
-`libflashrt_cpp_llama_cpp_provider_c.so` must then resolve to the installed
-prefix's `libjetson_pi_pi0.so.0` / `libllama.so.0` / `libggml-cuda.so.0`, not to
-any in-tree copy. `cmake --install` of FlashRT lays down the SHARED provider
+(+ `::mtmd` / `::llama` / `::ggml`; direct-link packages also expose imported
+per-backend targets). For a direct-link package, `ldd` on the built
+`libflashrt_cpp_llama_cpp_provider_c.so` must resolve to the installed prefix's
+`libjetson_pi_pi0.so.0` / `libllama.so.0` / `libggml-cuda.so.0`, not to any
+in-tree copy. `cmake --install` of FlashRT lays down the SHARED provider
 `_c.so` and `libflashrt_runtime.so` to `${CMAKE_INSTALL_LIBDIR}`. The installed
 provider has an install RPATH containing `$ORIGIN` plus the exact library
 directories resolved under `JetsonPI_ROOT`, so it can be loaded without an
@@ -99,6 +101,51 @@ configure requires the matching CUDA Toolkit CMake package so the imported
 `ggml-cuda` target carries its driver/runtime/cuBLAS link interface. This is a
 build-host requirement; the installed provider itself was verified with only
 its recorded RPATH and the normal NVIDIA runtime loader environment.
+
+#### Dynamic GGML backend package
+
+`GGML_BACKEND_DL=ON` keeps backend modules out of the core/provider ELF link
+graph so one installed Jetson-PI package can select CPU or CUDA at runtime. A
+production package must use an explicit absolute backend directory; relying on
+the process executable directory or current working directory is rejected by
+FlashRT's production finder:
+
+```bash
+prefix=/absolute/path/to/jetson-pi-dynamic
+cmake -S Jetson-PI -B Jetson-PI/build-prod-dynamic \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+  -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF \
+  -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON \
+  -DGGML_BACKEND_DIR="${prefix}/bin" \
+  -DLLAMA_BUILD_COMMON=ON -DJETSON_PI_BUILD_MTMD=ON \
+  -DLLAMA_CURL=OFF -DLLAMA_HTTPLIB=OFF \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+  -DLLAMA_TOOLS_INSTALL=OFF -DCMAKE_INSTALL_PREFIX="${prefix}"
+cmake --build Jetson-PI/build-prod-dynamic -j16
+cmake --install Jetson-PI/build-prod-dynamic
+```
+
+The resulting core/narrow libraries live in `lib64/`; runtime modules live in
+`bin/libggml-{cpu,cuda}.so`. `FindJetsonPI.cmake` reads the same prefix's
+`ggml-config.cmake`, requires its absolute `GGML_BACKEND_DIR` to remain inside
+`JetsonPI_ROOT`, and verifies every module named by `GGML_AVAILABLE_BACKENDS`.
+The modules are not added to `INTERFACE_LINK_LIBRARIES`. Consequently
+`readelf -d` on `libggml.so`, `libjetson_pi_llm.so`, and FlashRT's provider has
+no `NEEDED` entry for `libggml-cpu.so` or `libggml-cuda.so`; runtime logs show
+`load_backend: loaded ... from <prefix>/bin/...` instead. The installed FlashRT
+`_c.so` was exercised from outside that directory through both C++ and Python:
+CPU reports `offloaded 0/29`, CUDA on GPU6 reports `offloaded 29/29`, and both
+pass staged decode, KV-isolation, and token-budget gates without a backend
+fallback. The pure-CPU run sets `CUDA_VISIBLE_DEVICES=`; leaving a CUDA device
+visible makes llama.cpp create a CUDA context even when all model weights remain
+on CPU, so that configuration is not used as pure-CPU evidence.
+
+The narrow LLM/MLLM one-shot APIs support a no-inference size-query. The
+reported capacity is `max_tokens` times the largest serialized token piece in
+the loaded vocabulary, so callers do not assume a fixed UTF-8 byte count per
+token. FlashRT stores the actual generated text and its Python frontends query
+that completed output size before allocating the readback buffer.
 
 > **The Pi0 parity + engine tests are dev-path only.** `test_llama_cpp_jetson_pi_parity`
 > and `test_llama_cpp_jetson_pi_engine` `#include "stb/stb_image.h"`, which lives
@@ -116,9 +163,10 @@ its recorded RPATH and the normal NVIDIA runtime loader environment.
 
 The Jetson-PI fork must be used as a locked version with its own GGML — do not
 mix another llama.cpp/GGML version into the same provider (ABI/symbol/layout
-conflicts). This integration is developed and GPU-verified against Jetson-PI
-commit `1450cec` (branch `expose-mtmd-only-build`, local — not pushed to a
-remote). When upgrading the fork, re-run the parity tests
+conflicts). The final migration is developed, independently reviewed, and
+GPU-verified against Jetson-PI commit
+`68dd395b3f89dbd031ae564e335780f702fbd1e7` on branch `expose-mtmd-only-build` (local, not pushed).
+When upgrading the fork, re-run the parity tests
 (`test_llama_cpp_jetson_pi_parity` / `test_llama_cpp_jetson_pi_llm_parity`) to
 confirm FlashRT's provider path still matches the direct `jetson_pi_*` path
 byte-for-byte.
@@ -206,14 +254,33 @@ FLASHRT_PI0_ACTION_STEPS=10 FLASHRT_PI0_ACTION_DIM=32 \
 python -m flash_rt.tests.test_jetson_pi_pi0_python
 ```
 
+## Native Pi0 CLI baseline
+
+Jetson-PI's interactive `llama-mtmd-cli` now emits the complete policy output
+after a successful Pi0 request:
+
+```text
+Pi0 action shape: [10, 32]
+Pi0 action: [0.491152287,...]
+```
+
+The action is row-major F32 and uses nine significant digits, which preserve a
+round trip back to F32. `test_llama_cpp_jetson_pi_parity` accepts
+`FLASHRT_PI0_CLI_ACTION_LOG=<log>` and then requires the parsed CLI action to be
+byte-identical to the FlashRT whole-infer result. The exact GPU6 command,
+including the explicit test template needed because Pi0 Base has no embedded
+chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
+
 ## Limitations
 - **Pi0 raw action chunk.** `predict` returns the model's `action_steps ×
   action_dim` output without unnormalization or LIBERO 7-D slicing. The caller
   is responsible for post-processing (use `meta/stats.json` to unnormalize).
 - **LLM raw prompt.** `generate(prompt)` takes a raw prompt; the caller must
   apply the chat template (e.g. `llama_chat_apply_template`) before calling.
-  No streaming; one blob out. Each call clears KV (independent completion).
-- **CPU, CUDA, and Vulkan backends verified.** `backend="cuda"` is verified
+  `generate()` returns one blob and starts an independent session;
+  `reset()`/`prefill()`/repeatable `decode()` expose the token boundary and keep
+  provider-private KV state for host-driven generation.
+- **CPU, CUDA, Vulkan, and SYCL backends verified.** `backend="cuda"` is verified
   end-to-end on an RTX 4090 (sm_89) for all three providers — Pi0 (`offloaded
   37/37 layers`, pi0_base), LLM (`29/29`, qwen3-0.6b-q4_k_m), and MLLM
   (`29/29`, Qwen3-VL-2B-Instruct-Q4_K_M; the VIT/mmproj encoder offloads too).
@@ -321,28 +388,37 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
   this as a local driver lifecycle defect, not a clean-exit validation result.
 
   **OpenCL backend.** A dedicated `-DGGML_OPENCL=ON` build succeeds with the
-  Khronos headers and ICD loader. On the current host, `clinfo -l` reports no
-  OpenCL platform, so `backend="opencl"` is intentionally rejected with
-  `requested GGML backend has no registered device: opencl`. This validates the
-  no-fallback gate but does not constitute a model execution result.
+  Khronos headers and NVIDIA ICD. The runtime enumerates platform `NVIDIA CUDA`
+  and device `NVIDIA GeForce RTX 4090 (OpenCL 3.0 CUDA)`, but this fork's
+  `ggml-opencl` implementation accepts only Adreno/Qualcomm and Intel GPU
+  families. It prints `Unsupported GPU`, drops the NVIDIA device, and explicit
+  `backend="opencl"` then fails with
+  `requested GGML backend has no registered device: opencl`. This is an honest
+  backend capability gate, not a missing download and not a model execution
+  result; no CPU fallback is installed.
 
-  **SYCL backend.** A separate `jetsonpi-backends` conda environment with
-  DPC++ 2025.3.2 can compile the complete provider for
-  `-DGGML_SYCL=ON -DGGML_SYCL_TARGET=NVIDIA -DGGML_SYCL_DNN=OFF`. The build
-  needs the conda sysroot and libstdc++ include paths explicitly, and disables
-  the broken conda `IntelSYCLConfig.cmake` discovery so GGML uses its direct
-  `-fsycl` path. Four vector initializers in Jetson-PI were made Clang-portable
-  without changing their size/value semantics. The installed DPC++ runtime on
-  this host contains OpenCL and Level Zero UR adapters but no NVIDIA CUDA UR
-  adapter: `sycl-ls` therefore lists only the Intel CPU OpenCL device. The
-  NVIDIA-targeted provider is compile-validated, but no SYCL-on-GPU model run
-  is claimed; requesting `backend="sycl"` on an environment without a SYCL
-  accelerator is rejected by the same registered-device gate. Loading or
-  linking this build requires the matching DPC++ runtime (`libsycl`, `libimf`,
-  `libsvml`, `libintlc`) and oneMath cuBLAS backend to be discoverable via
-  `ONEAPI_ROOT` and the runtime loader path. `FindJetsonPI.cmake` checks these
-  dependencies when an installed prefix contains `libggml-sycl` instead of
-  creating a partially linked imported target.
+  **SYCL backend.** A separate `jetsonpi-sycl-cuda` conda environment uses
+  DPC++ 2025.3.0, GCC 13.4, CUDA 12.4, and oneMath cuBLAS to build
+  `-DGGML_SYCL=ON -DGGML_SYCL_TARGET=NVIDIA -DGGML_SYCL_DNN=OFF`. The matching
+  Unified Runtime loader and CUDA adapter are selected explicitly at runtime:
+
+  ```bash
+  export LD_PRELOAD=/path/to/ur-cuda-2025.3.0/lib64/libur_loader.so.0
+  export UR_ADAPTERS_FORCE_LOAD=/path/to/ur-cuda-2025.3.0/lib64/libur_adapter_cuda.so
+  export ONEAPI_DEVICE_SELECTOR=cuda:6
+  export FLASHRT_LLM_BACKEND=sycl  # likewise PI0/MLLM
+  ```
+
+  GPU6/RTX 4090 end-to-end results: LLM offloads 29/29 layers; MLLM offloads
+  29/29 language layers and CLIP/VIT to SYCL0; Pi0 offloads 37/37 model layers
+  and VIT. LLM staged decode, MLLM staged/image parity, and Pi0 whole-versus-
+  context/action parity all pass; Pi0 action `max_abs_diff=0`. A focused SYCL
+  backend-op test passes nearest and F32 bilinear upscale (half-pixel and
+  align-corners), transpose, and up/downsample cases, 11/11 total. Bicubic is
+  still explicitly unsupported and is not claimed. The installed-prefix build
+  links `libsycl`, `libimf`, `libsvml`, `libirng`, `libintlc`, oneMath cuBLAS,
+  and the CUDA driver explicitly; `FindJetsonPI.cmake` validates the equivalent
+  direct-link dependencies instead of creating a partially linked target.
 - **No calibration.** The frontends have no `calibrate`/`calibrated`; the
   Jetson-PI providers do not need FlashRT-style FP8 calibration.
 - **`state` is a separate port** for Pi0, not encoded into the prompt (unlike
@@ -465,8 +541,8 @@ python -m flash_rt.tests.test_jetson_pi_mllm_python
 `FLASHRT_MLLM_BACKEND=cuda` switches the test to the GPU forward pass (LLM
 layers + VIT/mmproj encoder both offloaded); point `FLASHRT_MLLM_LIB` at the
 `build-jetson-pi-cuda/libflashrt_cpp_llama_cpp_provider_c.so` (same CUDA recipe
-as the Pi0 section above). Verified on an RTX 4090 (sm_89): `offloaded 37/37
-layers to GPU` for Qwen2.5-VL-3B-Instruct-q4_0.
+as the Pi0 section above). Verified on an RTX 4090 (sm_89): Qwen3-VL 2B
+offloads 29/29 language layers and the CLIP/VIT encoder to CUDA0.
 
 Note: the engine injects one media marker per supplied image *after* the prompt
 text (see `jetson_pi_mllm.cpp`); the smoke test feeds a raw prompt, so the

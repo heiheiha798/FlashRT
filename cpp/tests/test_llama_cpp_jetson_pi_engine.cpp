@@ -272,6 +272,9 @@ int main() {
             int trc = tk.verbs->copy_to_host(tk.handle, via_token.data(),
                                              0, 0, action_bytes);
             CHECK(trc == 0, "copy_to_host reads the actions chunk via token");
+            CHECK(tk.verbs->copy_to_host(tk.handle, nullptr, 0, 0,
+                                         sizeof(float)) == -1,
+                  "copy_to_host rejects a null destination");
             if (trc == 0) {
                 CHECK(std::memcmp(via_token.data(), actions.data(),
                                   static_cast<size_t>(action_bytes)) == 0,

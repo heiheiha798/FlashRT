@@ -63,7 +63,6 @@ int main() {
     const float    top_p = 0.0f;
     const uint32_t seed = 1;
     const uint32_t max_tokens = 64;
-    const uint64_t cap = static_cast<uint64_t>(max_tokens) * 8u;  // UTF-8 worst-case
 
     // ---- PATH A: FlashRT frt_model_runtime_v2 wrapper ----------------------
     std::string text_flashrt;
@@ -103,8 +102,14 @@ int main() {
             CHECK(model->verbs_v2.run_stage(
                       model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER, -1) == 0,
                   "FlashRT run_stage infer");
-            text_flashrt.assign(cap, '\0');
             uint64_t written = 0;
+            rc = model->verbs_v2.get_output(
+                model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT,
+                nullptr, 0, &written, -1);
+            CHECK(rc == -5 && written > 0,
+                  "FlashRT query generated text size");
+            text_flashrt.assign(written, '\0');
+            written = 0;
             rc = model->verbs_v2.get_output(
                 model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, &text_flashrt[0],
                 text_flashrt.size(), &written, -1);
@@ -165,10 +170,15 @@ int main() {
             g_fail = 1;
         } else {
             CHECK(true, "direct jetson_pi_llm_open");
-            text_native.assign(cap, '\0');
             size_t written = 0;
             s = jetson_pi_llm_generate(llm, prompt, std::strlen(prompt),
-                                       &text_native[0], text_native.size(),
+                                       nullptr, 0, &written);
+            CHECK(s == JETSON_PI_LLM_BUFFER_TOO_SMALL && written > 0,
+                  "direct query generated text bound");
+            text_native.assign(written, '\0');
+            written = 0;
+            s = jetson_pi_llm_generate(llm, prompt, std::strlen(prompt),
+                                       text_native.data(), text_native.size(),
                                        &written);
             CHECK(s == JETSON_PI_LLM_OK && written > 0,
                   "direct jetson_pi_llm_generate produced text");

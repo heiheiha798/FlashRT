@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <string>
 #include <thread>
@@ -85,10 +86,27 @@ bool view_to_rgb(const frt_image_view & v, uint32_t expected_w,
         default:
             return false;  // reject unknown pixel formats (no silent fallback)
     }
-    const int stride = (v.stride_bytes > 0) ? v.stride_bytes : w * ch_src;
-    if (v.bytes < static_cast<uint64_t>(stride) * h) return false;
+    if (v.stride_bytes < 0) return false;
+    const uint64_t row_bytes = static_cast<uint64_t>(w) * ch_src;
+    const uint64_t stride = v.stride_bytes == 0
+        ? row_bytes : static_cast<uint64_t>(v.stride_bytes);
+    if (stride < row_bytes) return false;
+    const uint64_t preceding_rows = static_cast<uint64_t>(h - 1);
+    if (preceding_rows != 0 &&
+        stride > (std::numeric_limits<uint64_t>::max() - row_bytes) /
+                     preceding_rows) {
+        return false;
+    }
+    const uint64_t required_bytes = preceding_rows * stride + row_bytes;
+    const uint64_t rgb_bytes = static_cast<uint64_t>(w) * h * 3;
+    if (v.bytes < required_bytes ||
+        required_bytes > static_cast<uint64_t>(
+            std::numeric_limits<ptrdiff_t>::max()) ||
+        rgb_bytes > std::numeric_limits<size_t>::max()) {
+        return false;
+    }
 
-    out.resize(static_cast<size_t>(w) * h * 3);
+    out.resize(static_cast<size_t>(rgb_bytes));
     const uint8_t * src = static_cast<const uint8_t*>(v.data);
     for (int y = 0; y < h; ++y) {
         const uint8_t * row = src + static_cast<ptrdiff_t>(y) * stride;
@@ -170,6 +188,9 @@ int engine_set_input(void * self, uint32_t port, const void * data,
     e->actions_buf.clear();
     switch (port) {
         case FRT_LLAMA_CPP_PI0_PORT_IMAGES: {
+            e->images_set = false;
+            e->image_ptrs.clear();
+            e->rgb_scratch.clear();
             if (!data || bytes % sizeof(frt_image_view) != 0) {
                 e->set_error("images payload must be frt_image_view[]");
                 return -1;
@@ -183,7 +204,6 @@ int engine_set_input(void * self, uint32_t port, const void * data,
             std::vector<uint8_t> packed;
             packed.reserve(static_cast<size_t>(e->n_views) * e->image_width *
                            e->image_height * 3);
-            e->image_ptrs.clear();
             for (uint32_t i = 0; i < e->n_views; ++i) {
                 std::vector<uint8_t> rgb;
                 if (!view_to_rgb(views[i], e->image_width, e->image_height,
@@ -208,6 +228,8 @@ int engine_set_input(void * self, uint32_t port, const void * data,
             return 0;
         }
         case FRT_LLAMA_CPP_PI0_PORT_PROMPT: {
+            e->prompt_set = false;
+            e->prompt.clear();
             if (!data || bytes == 0) {
                 e->set_error("empty prompt");
                 return -1;
@@ -217,6 +239,8 @@ int engine_set_input(void * self, uint32_t port, const void * data,
             return 0;
         }
         case FRT_LLAMA_CPP_PI0_PORT_STATE: {
+            e->state_set = false;
+            e->state.clear();
             if (!data) {
                 e->set_error("null state");
                 return -1;
@@ -372,6 +396,8 @@ int pi0_token_copy_to_host(frt_memory_token token, void * dst,
                            uint64_t bytes) {
     Engine * e = reinterpret_cast<Engine*>(token);
     if (!e) return -1;
+    if (bytes == 0) return 0;
+    if (!dst) return -1;
     const size_t have_bytes = e->actions_buf.size() * sizeof(float);
     if (have_bytes == 0) return -7;                 // not ready (set_input cleared it)
     if (src_off > have_bytes || bytes > have_bytes - src_off) return -5;  // buffer too small
@@ -442,7 +468,6 @@ namespace {
 
 struct LlmEngine {
     jetson_pi_llm * llm = nullptr;
-    uint32_t max_tokens = 0;
 
     std::string prompt;            // set_input(PROMPT) stash
     std::vector<int32_t> tokens;
@@ -479,31 +504,33 @@ int llm_engine_set_input(void * self, uint32_t port, const void * data,
     LlmEngine * e = static_cast<LlmEngine*>(self);
     if (!e) return -1;
     e->clear_error();
+    if (port != FRT_LLAMA_CPP_LLM_PORT_PROMPT &&
+        port != FRT_LLAMA_CPP_LLM_PORT_TOKENS) {
+        e->set_error("unknown llm input port");
+        return -1;
+    }
+    e->prompt_set = false;
+    e->prompt.clear();
+    e->tokens.clear();
+    e->text_buf.clear();
+    e->logits_buf.clear();
+    e->next_token_ready = false;
     if (port == FRT_LLAMA_CPP_LLM_PORT_PROMPT) {
         if (!data || bytes == 0) {
             e->set_error("empty prompt");
             return -1;
         }
         e->prompt.assign(static_cast<const char*>(data), bytes);
-        e->tokens.clear();
         e->prompt_set = true;
-    } else if (port == FRT_LLAMA_CPP_LLM_PORT_TOKENS) {
+    } else {
         if (!data || bytes == 0 || bytes % sizeof(int32_t) != 0) {
             e->set_error("tokens payload must be a non-empty int32 array");
             return -1;
         }
         const auto * begin = static_cast<const int32_t*>(data);
         e->tokens.assign(begin, begin + bytes / sizeof(int32_t));
-        e->prompt.clear();
         e->prompt_set = true;
-    } else {
-        e->set_error("unknown llm input port");
-        return -1;
     }
-    // New input invalidates any previous output.
-    e->text_buf.clear();
-    e->logits_buf.clear();
-    e->next_token_ready = false;
     return 0;
 }
 
@@ -615,15 +642,18 @@ int llm_engine_run_infer(void * self) {
         e->set_error("infer requires prompt to be set");
         return -1;
     }
-    // Worst-case output buffer: max_tokens * 8 bytes (utf-8 can be up to 4
-    // bytes/char; 8 is conservative headroom). jetson_pi_llm_generate reports
-    // the same worst-case for size-query.
-    const size_t cap = static_cast<size_t>(e->max_tokens) * 8u;
+    size_t cap = 0;
+    int32_t s = jetson_pi_llm_generate(e->llm, e->prompt.data(),
+                                       e->prompt.size(), nullptr, 0, &cap);
+    if (s != JETSON_PI_LLM_BUFFER_TOO_SMALL || cap == 0) {
+        e->set_error(std::string("jetson_pi_llm_generate size query failed: ") +
+                     jetson_pi_llm_last_error(e->llm));
+        return -8;
+    }
     e->text_buf.assign(cap, '\0');
     size_t written = 0;
-    int32_t s = jetson_pi_llm_generate(e->llm, e->prompt.data(),
-                                       e->prompt.size(),
-                                       &e->text_buf[0], cap, &written);
+    s = jetson_pi_llm_generate(e->llm, e->prompt.data(), e->prompt.size(),
+                               e->text_buf.data(), cap, &written);
     if (s != JETSON_PI_LLM_OK) {
         e->set_error(std::string("jetson_pi_llm_generate failed: ") +
                      jetson_pi_llm_last_error(e->llm));
@@ -720,7 +750,6 @@ const char * llm_engine_last_error(void * self) {
 
 struct MllmEngine {
     jetson_pi_mllm * mllm = nullptr;
-    uint32_t max_tokens = 0;
 
     // Per-tick transient state.
     std::vector<uint8_t> rgb_scratch;
@@ -765,30 +794,40 @@ int mllm_engine_set_input(void * self, uint32_t port, const void * data,
     e->clear_error();
     switch (port) {
         case FRT_LLAMA_CPP_MLLM_PORT_IMAGES: {
-            if (!data || bytes % sizeof(frt_image_view) != 0) {
+            e->images_set = false;
+            e->image_ptrs.clear();
+            e->rgb_scratch.clear();
+            e->n_images = 0;
+            e->image_height = 0;
+            e->image_width = 0;
+            e->text_buf.clear();
+            e->logits_buf.clear();
+            e->next_token_ready = false;
+            if (bytes % sizeof(frt_image_view) != 0 ||
+                (bytes != 0 && !data)) {
                 e->set_error("images payload must be frt_image_view[]");
                 return -1;
             }
             const uint64_t n = bytes / sizeof(frt_image_view);
             if (n == 0) {
                 // n_images == 0 means text-only; allow but record zero.
-                e->image_ptrs.clear();
-                e->rgb_scratch.clear();
-                e->n_images = 0;
                 e->images_set = true;
-                e->text_buf.clear();
-                e->logits_buf.clear();
-                e->next_token_ready = false;
                 return 0;
+            }
+            if (n > std::numeric_limits<uint32_t>::max()) {
+                e->set_error("images view count exceeds uint32_t");
+                return -1;
             }
             const auto * views = static_cast<const frt_image_view*>(data);
             // All images must share the first view's H/W (jetson_pi_mllm
             // takes a single image_height/image_width for all images).
-            std::vector<uint8_t> packed;
+            if (views[0].width <= 0 || views[0].height <= 0) {
+                e->set_error("invalid frt_image_view at index 0");
+                return -1;
+            }
             const uint32_t w = static_cast<uint32_t>(views[0].width);
             const uint32_t h = static_cast<uint32_t>(views[0].height);
-            packed.reserve(n * w * h * 3);
-            e->image_ptrs.clear();
+            std::vector<uint8_t> packed;
             for (uint64_t i = 0; i < n; ++i) {
                 std::vector<uint8_t> rgb;
                 if (!view_to_rgb(views[i], w, h, rgb)) {
@@ -808,21 +847,20 @@ int mllm_engine_set_input(void * self, uint32_t port, const void * data,
             e->image_height = h;
             e->image_width = w;
             e->images_set = true;
-            e->text_buf.clear();
-            e->logits_buf.clear();
-            e->next_token_ready = false;
             return 0;
         }
         case FRT_LLAMA_CPP_MLLM_PORT_PROMPT: {
+            e->prompt_set = false;
+            e->prompt.clear();
+            e->text_buf.clear();
+            e->logits_buf.clear();
+            e->next_token_ready = false;
             if (!data || bytes == 0) {
                 e->set_error("empty prompt");
                 return -1;
             }
             e->prompt.assign(static_cast<const char*>(data), bytes);
             e->prompt_set = true;
-            e->text_buf.clear();
-            e->logits_buf.clear();
-            e->next_token_ready = false;
             return 0;
         }
         case FRT_LLAMA_CPP_MLLM_PORT_TEXT:
@@ -939,14 +977,23 @@ int mllm_engine_run_infer(void * self) {
         e->set_error("infer requires images and prompt to be set");
         return -1;
     }
-    const size_t cap = static_cast<size_t>(e->max_tokens) * 8u;
+    size_t cap = 0;
+    int32_t s = jetson_pi_mllm_infer(
+        e->mllm, e->image_ptrs.data(), e->n_images,
+        e->image_height, e->image_width,
+        e->prompt.data(), e->prompt.size(), nullptr, 0, &cap);
+    if (s != JETSON_PI_MLLM_BUFFER_TOO_SMALL || cap == 0) {
+        e->set_error(std::string("jetson_pi_mllm_infer size query failed: ") +
+                     jetson_pi_mllm_last_error(e->mllm));
+        return -8;
+    }
     e->text_buf.assign(cap, '\0');
     size_t written = 0;
-    int32_t s = jetson_pi_mllm_infer(e->mllm,
-                                     e->image_ptrs.data(), e->n_images,
-                                     e->image_height, e->image_width,
-                                     e->prompt.data(), e->prompt.size(),
-                                     &e->text_buf[0], cap, &written);
+    s = jetson_pi_mllm_infer(e->mllm,
+                             e->image_ptrs.data(), e->n_images,
+                             e->image_height, e->image_width,
+                             e->prompt.data(), e->prompt.size(),
+                             e->text_buf.data(), cap, &written);
     if (s != JETSON_PI_MLLM_OK) {
         e->set_error(std::string("jetson_pi_mllm_infer failed: ") +
                      jetson_pi_mllm_last_error(e->mllm));
@@ -1154,7 +1201,6 @@ frt_llama_cpp_default_engine_factory(void) {
                 return -5;
             }
             e->llm = llm;
-            e->max_tokens = config->max_tokens ? config->max_tokens : 512;
 
             out->struct_size = sizeof(*out);
             out->reserved    = 0;
@@ -1210,7 +1256,6 @@ frt_llama_cpp_default_engine_factory(void) {
                 return -5;
             }
             e->mllm = mllm;
-            e->max_tokens = config->max_tokens ? config->max_tokens : 512;
 
             out->struct_size = sizeof(*out);
             out->reserved    = 0;

@@ -176,9 +176,15 @@ class MllmJetsonPiFrontend:
         rc = v2.run_stage(self_, STAGE_INFER, -1)
         self._check(rc, "run_stage infer")
 
-        cap = self.max_tokens * 8
-        out = (ctypes.c_char * cap)()
         written = ctypes.c_uint64(0)
+        rc = v2.get_output(self_, PORT_TEXT, None, 0,
+                           ctypes.byref(written), -1)
+        if rc != -5 or written.value == 0:
+            self._check(rc, "query text output size")
+            raise RuntimeError("query text output size returned zero bytes")
+        cap = written.value
+        out = (ctypes.c_char * cap)()
+        written.value = 0
         rc = v2.get_output(self_, PORT_TEXT, out, cap,
                            ctypes.byref(written), -1)
         self._check(rc, "get_output text")
@@ -231,9 +237,15 @@ class MllmJetsonPiFrontend:
             self._model.self, PORT_IS_EOG, ctypes.byref(is_eog),
             ctypes.sizeof(is_eog), ctypes.byref(written), -1)
         self._check(rc, "get_output is_eog")
-        cap = self.max_tokens * 8
-        out = (ctypes.c_char * cap)()
         written = ctypes.c_uint64(0)
+        rc = v2.get_output(self._model.self, PORT_TEXT, None, 0,
+                           ctypes.byref(written), -1)
+        if rc != -5 or written.value == 0:
+            self._check(rc, "query text output size")
+            raise RuntimeError("query text output size returned zero bytes")
+        cap = written.value
+        out = (ctypes.c_char * cap)()
+        written.value = 0
         rc = v2.get_output(self._model.self, PORT_TEXT, out, cap,
                            ctypes.byref(written), -1)
         self._check(rc, "get_output text")
