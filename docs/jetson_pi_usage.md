@@ -4,6 +4,9 @@
 llama.cpp/GGML providers through the FlashRT `frt_model_runtime_v2` C ABI
 via ctypes. No torch/jax, no GPU arch detection.
 
+The completed correctness/backend/performance gate record is maintained in
+`docs/jetson_pi_validation_matrix.md`.
+
 Three providers, selected by `config=`:
 - **`config="pi0"`** (default for VLA) — Pi0 whole-graph infer via
   `jetson_pi_pi0`. Returns a `VLAModel` (`.predict(images, prompt, state)`).
@@ -339,18 +342,17 @@ python -m flash_rt.tests.test_jetson_pi_pi0_python
 - **`state` is a separate port** for Pi0, not encoded into the prompt (unlike
   Pi0.5). `VLAModel.predict` detects that `set_prompt` does not accept `state`
   and routes it through `observation["state"]` automatically.
-- **Deployment identity includes a fast file checkpoint identity.** The
-  standard JSON open path hashes each model/mmproj file with the file rule
-  `SHA256(first 64 KiB + decimal file size)[:16]` and appends the digest to the
-  canonical runtime identity. This is intentionally not a full-file digest:
-  changing the checkpoint prefix or file size changes the identity, while a
-  same-size edit entirely after the first 64 KiB does not. The fingerprint also
-  includes backend, port schema, callback-stage DAG, and execution layout, so
-  backend or stage-schema changes alter the deployment fingerprint. Failure to
-  open, size, or read a checkpoint for identity is an open failure, not a
-  path-only fallback. The config structs carry these digests in append-only
-  tails, so existing explicit-engine callers using the old prefix remain
-  ABI-compatible.
+- **Deployment identity includes the checkpoint contents.** The standard JSON
+  open path streams each complete model/mmproj file through SHA-256, appends
+  the complete 64-digit hexadecimal digest to the canonical runtime identity,
+  and fails the open if any checkpoint cannot be opened or read. There is no
+  path-only fallback. The fingerprint also includes backend, port schema, callback-stage
+  DAG, and execution layout, so weights, quantization, backend, or stage-schema
+  changes alter the deployment fingerprint. The config structs carry these
+  digests in append-only tails, so existing explicit-engine callers using the
+  old prefix remain ABI-compatible. Full-file hashing adds deterministic model
+  open work in exchange for satisfying deployment identity exactly; it is not
+  part of the inference hot path.
 
 ## Generic GGUF LLM (Phase 3)
 

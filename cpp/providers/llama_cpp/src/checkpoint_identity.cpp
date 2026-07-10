@@ -6,9 +6,12 @@
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace flashrt::providers::llama_cpp {
 namespace {
+
+thread_local std::string g_runtime_open_error;
 
 constexpr std::array<uint32_t, 64> kSha256Round = {
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
@@ -123,37 +126,47 @@ bool checkpoint_identity(const char* path, std::string* identity,
         if (error) *error = "invalid checkpoint identity arguments";
         return false;
     }
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    std::ifstream file(path, std::ios::binary);
     if (!file) {
         if (error) *error = std::string("failed to open checkpoint for identity: ") + path;
         return false;
     }
-    const std::streamoff end = file.tellg();
-    if (end < 0) {
-        if (error) *error = std::string("failed to size checkpoint for identity: ") + path;
-        return false;
+    Sha256 hash;
+    std::vector<char> chunk(1024 * 1024);
+    while (file) {
+        file.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+        const std::streamsize read = file.gcount();
+        if (read > 0) hash.update(chunk.data(), static_cast<size_t>(read));
     }
-    file.seekg(0, std::ios::beg);
-    std::array<char, 64 * 1024> prefix{};
-    const size_t requested = static_cast<size_t>(std::min<std::streamoff>(end, prefix.size()));
-    file.read(prefix.data(), static_cast<std::streamsize>(requested));
-    if (static_cast<size_t>(file.gcount()) != requested) {
+    if (!file.eof()) {
         if (error) *error = std::string("failed to read checkpoint for identity: ") + path;
         return false;
     }
-    Sha256 hash;
-    hash.update(prefix.data(), requested);
-    const std::string size_text = std::to_string(static_cast<uint64_t>(end));
-    hash.update(size_text.data(), size_text.size());
     const auto digest = hash.finish();
-    char hex[17];
-    for (size_t i = 0; i < 8; ++i) {
+    char hex[65];
+    for (size_t i = 0; i < digest.size(); ++i) {
         std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
     }
-    hex[16] = '\0';
+    hex[64] = '\0';
     *identity = hex;
     if (error) error->clear();
     return true;
 }
 
+void clear_runtime_open_error() {
+    g_runtime_open_error.clear();
+}
+
+void set_runtime_open_error(const std::string& error) {
+    g_runtime_open_error = error;
+}
+
+const char* runtime_open_error() {
+    return g_runtime_open_error.c_str();
+}
+
 }  // namespace flashrt::providers::llama_cpp
+
+extern "C" const char* frt_llama_cpp_runtime_open_error(void) {
+    return flashrt::providers::llama_cpp::runtime_open_error();
+}

@@ -181,6 +181,11 @@ typedef struct frt_llama_cpp_engine_factory_v1 {
     const char* (*last_error)(void* self);
 } frt_llama_cpp_engine_factory_v1;
 
+/* Description of the most recent runtime-open failure on the calling thread.
+ * Always returns a non-null borrowed string, valid until the next
+ * frt_llama_cpp_*_runtime_open_with_engine_factory call on that thread. */
+const char* frt_llama_cpp_runtime_open_error(void);
+
 int frt_llama_cpp_pi0_runtime_create_with_engine(
     const frt_llama_cpp_pi0_config* config,
     const frt_llama_cpp_engine_v1* engine,
