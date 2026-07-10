@@ -450,6 +450,18 @@ int main() {
         auto destroy = [](frt_memory_token t) {
             reinterpret_cast<HostToken*>(t)->destroys += 1;
         };
+        auto map_host = [](frt_memory_token t, uint64_t offset,
+                           uint64_t bytes, uint32_t access,
+                           void** out_ptr) -> int {
+            auto* h = reinterpret_cast<HostToken*>(t);
+            if (!out_ptr || access != FRT_RT_HOST_MAP_READ ||
+                offset + bytes > h->store.size()) return -1;
+            *out_ptr = h->store.data() + offset;
+            return 0;
+        };
+        auto unmap_host = [](frt_memory_token, void* ptr) -> int {
+            return ptr ? 0 : -1;
+        };
 
         frt_memory_token_verbs verbs{};
         verbs.struct_size = sizeof(verbs);
@@ -457,6 +469,8 @@ int main() {
         verbs.copy_from_host = copy_from_host;
         verbs.sync = sync;
         verbs.destroy = destroy;
+        verbs.map_host = map_host;
+        verbs.unmap_host = unmap_host;
 
         Owner po;
         VerbLog vl;
@@ -501,6 +515,14 @@ int main() {
                   std::memcmp(read_vals, write_vals, sizeof(write_vals)) == 0,
               "copy_to_host round-trips the token contents");
         CHECK(tk.verbs->sync(tk.handle) == 0, "token sync is a no-op for HOST");
+        void* mapped = nullptr;
+        CHECK(tk.verbs->map_host(tk.handle, 0, sizeof(write_vals),
+                                 FRT_RT_HOST_MAP_READ, &mapped) == 0 &&
+                  mapped == ht.store.data() &&
+                  std::memcmp(mapped, write_vals, sizeof(write_vals)) == 0,
+              "HOST_VISIBLE token exposes a zero-copy host SWAP window");
+        CHECK(tk.verbs->unmap_host(tk.handle, mapped) == 0,
+              "host SWAP window unmaps explicitly");
 
         /* (a)/(e) the port itself is STAGED with no raw frt_buffer. */
         CHECK(m->n_ports == 1 &&
@@ -546,6 +568,47 @@ int main() {
                   FRT_RT_LOCATION_HOST_VISIBLE) != 0,
               "add_port_token rejects a token with incomplete verbs");
         frt_runtime_builder_discard(pb);
+    }
+    {
+        uint8_t storage[4]{};
+        frt_memory_token_verbs prefix_verbs{};
+        prefix_verbs.struct_size = FRT_MEMORY_TOKEN_VERBS_COPY_SYNC_SIZE;
+        prefix_verbs.copy_to_host = [](frt_memory_token t, void* dst,
+                                       uint64_t dst_off, uint64_t src_off,
+                                       uint64_t bytes) -> int {
+            std::memcpy(static_cast<uint8_t*>(dst) + dst_off,
+                        reinterpret_cast<uint8_t*>(t) + src_off, bytes);
+            return 0;
+        };
+        prefix_verbs.copy_from_host = [](frt_memory_token t, const void* src,
+                                         uint64_t src_off, uint64_t dst_off,
+                                         uint64_t bytes) -> int {
+            std::memcpy(reinterpret_cast<uint8_t*>(t) + dst_off,
+                        static_cast<const uint8_t*>(src) + src_off, bytes);
+            return 0;
+        };
+        prefix_verbs.sync = [](frt_memory_token) -> int { return 0; };
+        frt_runtime_builder pb = frt_runtime_builder_create_provider_owned();
+        const int64_t s[1] = {4};
+        CHECK(frt_runtime_builder_add_port_token(
+                  pb, "legacy", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_U8,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, 0, s, 1, 0,
+                  reinterpret_cast<frt_memory_token>(storage), &prefix_verbs,
+                  0, sizeof(storage), FRT_RT_LOCATION_HOST_VISIBLE) == 0,
+              "add_port_token accepts the original copy/sync verbs prefix");
+        CHECK(frt_runtime_builder_add_callback_stage_v2(
+                  pb, "infer", 0, nullptr, 0) == 0,
+              "legacy-prefix token runtime accepts callback stage");
+        frt_model_runtime_verbs_v2 v2{};
+        v2.struct_size = sizeof(v2);
+        v2.run_stage = v_run_stage;
+        v2.last_error = v_last_error;
+        frt_model_runtime_v2* m = frt_runtime_builder_finish_model_v2(
+            pb, &v2, nullptr, nullptr, nullptr, nullptr);
+        CHECK(m && m->port_tokens[0].verbs->struct_size ==
+                      FRT_MEMORY_TOKEN_VERBS_COPY_SYNC_SIZE,
+              "legacy-prefix token remains tail-probeable by consumers");
+        if (m) m->release(m->owner);
     }
 
     /* Phase 6: MIXED port build — one normal STAGED port via add_port + one

@@ -66,6 +66,44 @@ _LastErrorFn = ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_void_p)
 _RunStageFn = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int)
 _RetainReleaseFn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+_TokenCopyToHostFn = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)
+_TokenCopyFromHostFn = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)
+_TokenSyncFn = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
+_TokenDestroyFn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+_TokenMapHostFn = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+    ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p))
+_TokenUnmapHostFn = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+
+class _FrtMemoryTokenVerbs(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("copy_to_host", _TokenCopyToHostFn),
+        ("copy_from_host", _TokenCopyFromHostFn),
+        ("sync", _TokenSyncFn),
+        ("destroy", _TokenDestroyFn),
+        ("map_host", _TokenMapHostFn),
+        ("unmap_host", _TokenUnmapHostFn),
+    ]
+
+
+class _FrtMemoryTokenDesc(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("handle", ctypes.c_void_p),
+        ("verbs", ctypes.POINTER(_FrtMemoryTokenVerbs)),
+        ("offset", ctypes.c_uint64),
+        ("bytes", ctypes.c_uint64),
+        ("location_kind", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+    ]
 
 
 class _FrtVerbsV1(ctypes.Structure):
@@ -110,7 +148,63 @@ class FrtModelRuntimeV2(ctypes.Structure):
         ("stages_v2", ctypes.c_void_p),
         ("n_stages_v2", ctypes.c_uint64),
         ("verbs_v2", _FrtVerbsV2),
+        ("port_tokens", ctypes.POINTER(_FrtMemoryTokenDesc)),
+        ("n_port_tokens", ctypes.c_uint64),
     ]
+
+
+class _MappedActions(np.ndarray):
+    def __new__(cls, frontend, token, pointer):
+        count = frontend.action_steps * frontend.action_dim
+        buffer = (ctypes.c_float * count).from_address(pointer)
+        view = np.ctypeslib.as_array(buffer).reshape(
+            frontend.action_steps, frontend.action_dim).view(cls)
+        view._frontend = frontend
+        view._token = token
+        view._pointer = pointer
+        view._closed = False
+        view._owns_mapping = True
+        view._owner = frontend._model.owner
+        view._release = frontend._model.release
+        frontend._model.retain(view._owner)
+        view.setflags(write=False)
+        return view
+
+    def __array_finalize__(self, source):
+        if source is None:
+            return
+        self._frontend = getattr(source, "_frontend", None)
+        self._token = getattr(source, "_token", None)
+        self._pointer = getattr(source, "_pointer", None)
+        self._closed = True
+        self._owns_mapping = False
+        self._owner = None
+        self._release = None
+
+    def close(self):
+        if self._closed or not self._owns_mapping:
+            return
+        rc = self._token.verbs.contents.unmap_host(
+            self._token.handle, self._pointer)
+        if rc != 0:
+            raise RuntimeError(f"unmap_host actions failed (rc={rc})")
+        self._closed = True
+        self._release(self._owner)
+
+    def __dlpack__(self, *, stream=None, max_version=None,
+                   dl_device=None, copy=None):
+        if self._closed:
+            raise RuntimeError("cannot export a closed actions host view")
+        dlpack_view = self._frontend._map_actions()
+        return np.ndarray.__dlpack__(
+            dlpack_view, stream=stream, max_version=max_version,
+            dl_device=dl_device, copy=copy)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # Port indices (c_api.h: FRT_LLAMA_CPP_PI0_PORT_*)
@@ -404,6 +498,33 @@ class Pi0JetsonPiFrontend:
             out, dtype=np.float32,
             count=self.action_steps * self.action_dim).reshape(
                 self.action_steps, self.action_dim).copy()
+
+    def action_view(self):
+        """Map the latest actions as a read-only zero-copy NumPy/DLPack view.
+
+        The returned ndarray implements ``__dlpack__``. Close it before
+        setting new inputs or running another stage; those operations reject
+        while a host view is mapped so the backing pointer cannot go stale.
+        """
+        return self._map_actions()
+
+    def _map_actions(self):
+        if self._model is None:
+            raise RuntimeError("Pi0JetsonPiFrontend is closed")
+        if self._model.n_port_tokens != self._model.n_ports:
+            raise RuntimeError("provider runtime has invalid port token layout")
+        token = self._model.port_tokens[PORT_ACTIONS]
+        if not token.handle or not token.verbs:
+            raise RuntimeError("actions port does not expose a memory token")
+        verbs = token.verbs.contents
+        if verbs.struct_size < ctypes.sizeof(_FrtMemoryTokenVerbs):
+            raise RuntimeError("actions token does not support host mapping")
+        pointer = ctypes.c_void_p()
+        rc = verbs.map_host(
+            token.handle, token.offset, token.bytes, 1, ctypes.byref(pointer))
+        if rc != 0 or not pointer.value:
+            raise RuntimeError(f"map_host actions failed (rc={rc})")
+        return _MappedActions(self, token, pointer.value)
 
     def close(self):
         if getattr(self, "_model", None) is not None:

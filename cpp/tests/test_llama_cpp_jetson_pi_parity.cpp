@@ -194,6 +194,27 @@ int main() {
                 actions_flashrt.data(), n_bytes, &written, -1);
             CHECK(rc == 0 && written == n_bytes,
                   "FlashRT get_output actions shape matches config");
+            const frt_memory_token_desc & actions_token =
+                model->port_tokens[FRT_LLAMA_CPP_PI0_PORT_ACTIONS];
+            void * mapped_actions = nullptr;
+            CHECK(actions_token.verbs->struct_size >=
+                      sizeof(frt_memory_token_verbs) &&
+                  actions_token.verbs->map_host(
+                      actions_token.handle, actions_token.offset,
+                      actions_token.bytes, FRT_RT_HOST_MAP_READ,
+                      &mapped_actions) == 0 && mapped_actions != nullptr &&
+                  std::memcmp(mapped_actions, actions_flashrt.data(), n_bytes) == 0,
+                  "Pi0 actions token maps a byte-identical zero-copy host view");
+            CHECK(model->verbs_v2.set_input(
+                      model->self, FRT_LLAMA_CPP_PI0_PORT_PROMPT,
+                      prompt.data(), prompt.size(), -1) == -6,
+                  "Pi0 input mutation is rejected while host view is mapped");
+            CHECK(actions_token.verbs->unmap_host(
+                      actions_token.handle, mapped_actions) == 0,
+                  "Pi0 zero-copy host view unmaps explicitly");
+            CHECK(actions_token.verbs->unmap_host(
+                      actions_token.handle, mapped_actions) != 0,
+                  "Pi0 zero-copy host view rejects duplicate unmap");
 
             CHECK(model->verbs_v2.run_stage(
                       model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) == 0,

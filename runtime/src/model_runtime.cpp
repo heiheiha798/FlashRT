@@ -162,7 +162,7 @@ extern "C" int frt_runtime_builder_add_port_token(
     if (!valid_port_args(name, direction, FRT_RT_PORT_STAGED, shape, rank))
         return -1;
     if (!handle || !verbs ||
-        verbs->struct_size < sizeof(frt_memory_token_verbs) ||
+        verbs->struct_size < FRT_MEMORY_TOKEN_VERBS_COPY_SYNC_SIZE ||
         !verbs->copy_to_host || !verbs->copy_from_host || !verbs->sync) {
         return -1;  /* a token port needs the full copy/sync verb set */
     }
