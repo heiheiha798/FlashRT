@@ -293,9 +293,8 @@ if(BUILD_TESTING)
 
     # Numerical-parity tests (jetsonpi迁移.txt §14): FlashRT provider path vs
     # a DIRECT jetson_pi_* call, same inputs/backend. Proves the port/stage/
-    # verb plumbing does not perturb outputs. Pi0 (actions, <=1e-5) and LLM
-    # (greedy text, exact). MLLM deferred (smoke output is template-token
-    # noise, not a stable parity target).
+    # verb plumbing does not perturb outputs. Pi0 uses action tolerance;
+    # LLM/MLLM use greedy sampling and exact generated-text equality.
     if(JETSON_PI_ROOT AND EXISTS "${JETSON_PI_ROOT}/vendor")
       add_executable(test_llama_cpp_jetson_pi_parity
         tests/test_llama_cpp_jetson_pi_parity.cpp)
@@ -307,11 +306,18 @@ if(BUILD_TESTING)
         COMMAND test_llama_cpp_jetson_pi_parity)
     endif()
 
-    add_executable(test_llama_cpp_jetson_pi_llm_parity
-      tests/test_llama_cpp_jetson_pi_llm_parity.cpp)
+      add_executable(test_llama_cpp_jetson_pi_llm_parity
+        tests/test_llama_cpp_jetson_pi_llm_parity.cpp)
     target_link_libraries(test_llama_cpp_jetson_pi_llm_parity
       PRIVATE flashrt_cpp_llama_cpp_provider ${_frt_jetson_pi_llm})
-    add_test(NAME llama_cpp_jetson_pi_llm_parity
-      COMMAND test_llama_cpp_jetson_pi_llm_parity)
+      add_test(NAME llama_cpp_jetson_pi_llm_parity
+        COMMAND test_llama_cpp_jetson_pi_llm_parity)
+
+      add_executable(test_llama_cpp_jetson_pi_mllm_parity
+        tests/test_llama_cpp_jetson_pi_mllm_parity.cpp)
+      target_link_libraries(test_llama_cpp_jetson_pi_mllm_parity
+        PRIVATE flashrt_cpp_llama_cpp_provider ${_frt_jetson_pi_mllm})
+      add_test(NAME llama_cpp_jetson_pi_mllm_parity
+        COMMAND test_llama_cpp_jetson_pi_mllm_parity)
   endif()
 endif()

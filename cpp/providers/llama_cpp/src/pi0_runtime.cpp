@@ -234,6 +234,9 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
         const char* config_json,
         const frt_llama_cpp_engine_factory_v1* factory,
         frt_model_runtime_v2** out) {
+    flashrt::providers::llama_cpp::clear_runtime_open_error();
+    flashrt::providers::llama_cpp::set_runtime_open_error(
+        "invalid Pi0 runtime open arguments or JSON config");
     if (!out) return -1;
     *out = nullptr;
     if (!factory ||
@@ -412,10 +415,12 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
     config.model_path = model_path.c_str();
     config.mmproj_path = mmproj_path.c_str();
     config.backend = backend.c_str();
+    std::string identity_error;
     if (!flashrt::providers::llama_cpp::checkpoint_identity(
-            config.model_path, &model_identity, nullptr) ||
+            config.model_path, &model_identity, &identity_error) ||
         !flashrt::providers::llama_cpp::checkpoint_identity(
-            config.mmproj_path, &mmproj_identity, nullptr)) {
+            config.mmproj_path, &mmproj_identity, &identity_error)) {
+        flashrt::providers::llama_cpp::set_runtime_open_error(identity_error);
         return -1;
     }
     config.model_identity = model_identity.c_str();
@@ -424,12 +429,17 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
     frt_llama_cpp_engine_v1 engine{};
     const int rc = factory->create_pi0(factory->self, &config, &engine);
     if (rc != 0) {
+        const char* error = factory->last_error(factory->self);
+        flashrt::providers::llama_cpp::set_runtime_open_error(
+            error ? error : "Pi0 engine factory failed without an error");
         return rc;
     }
     if (engine.struct_size < FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE ||
         !engine.self || !engine.retain || !engine.release ||
         !engine.set_input || !engine.run_infer || !engine.get_output ||
         !engine.last_error) {
+        flashrt::providers::llama_cpp::set_runtime_open_error(
+            "factory returned an invalid Pi0 engine");
         return -1;
     }
     frt_model_runtime_v2* model = nullptr;
@@ -437,7 +447,12 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
         frt_llama_cpp_pi0_runtime_create_with_engine(&config, &engine,
                                                      &model);
     engine.release(engine.self);
-    if (create_rc != 0) return create_rc;
+    if (create_rc != 0) {
+        flashrt::providers::llama_cpp::set_runtime_open_error(
+            "failed to create Pi0 model runtime");
+        return create_rc;
+    }
     *out = model;
+    flashrt::providers::llama_cpp::clear_runtime_open_error();
     return 0;
 }

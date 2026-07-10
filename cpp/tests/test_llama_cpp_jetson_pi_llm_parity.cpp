@@ -29,7 +29,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <cmath>
 #include <string>
+#include <vector>
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
@@ -65,6 +67,8 @@ int main() {
 
     // ---- PATH A: FlashRT frt_model_runtime_v2 wrapper ----------------------
     std::string text_flashrt;
+    std::vector<float> logits_flashrt;
+    int32_t token_flashrt = 0;
     {
         const frt_llama_cpp_engine_factory_v1 * factory =
             frt_llama_cpp_default_engine_factory();
@@ -107,12 +111,39 @@ int main() {
             CHECK(rc == 0 && written > 0, "FlashRT get_output text non-empty");
             text_flashrt.resize(written);
             std::printf("    FlashRT text: %s\n", text_flashrt.c_str());
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0 &&
+                  model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0,
+                  "FlashRT staged prefill");
+            uint64_t logits_bytes = 0;
+            CHECK(model->verbs_v2.get_output(
+                      model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS,
+                      nullptr, 0, &logits_bytes, -1) != 0 && logits_bytes > 0,
+                  "FlashRT query logits size");
+            logits_flashrt.resize(logits_bytes / sizeof(float));
+            CHECK(model->verbs_v2.get_output(
+                      model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS,
+                      logits_flashrt.data(), logits_bytes, &logits_bytes,
+                      -1) == 0 &&
+                  model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE,
+                      -1) == 0,
+                  "FlashRT read logits and decode first token");
+            uint64_t token_bytes = 0;
+            CHECK(model->verbs_v2.get_output(
+                      model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN,
+                      &token_flashrt, sizeof(token_flashrt), &token_bytes,
+                      -1) == 0,
+                  "FlashRT read first token");
             model->release(model->owner);
         }
     }
 
     // ---- PATH B: direct jetson_pi_llm call ---------------------------------
     std::string text_native;
+    std::vector<float> logits_native;
+    int32_t token_native = 0;
     {
         jetson_pi_llm_config jc{};
         jc.struct_size = sizeof(jc);
@@ -146,6 +177,24 @@ int main() {
             }
             text_native.resize(written);
             std::printf("    native  text: %s\n", text_native.c_str());
+            CHECK(jetson_pi_llm_reset(llm) == JETSON_PI_LLM_OK &&
+                  jetson_pi_llm_prefill(llm, prompt, std::strlen(prompt)) ==
+                      JETSON_PI_LLM_OK,
+                  "direct staged prefill");
+            size_t logits_count = 0;
+            CHECK(jetson_pi_llm_get_logits(
+                      llm, nullptr, 0, &logits_count) ==
+                      JETSON_PI_LLM_BUFFER_TOO_SMALL && logits_count > 0,
+                  "direct query logits size");
+            logits_native.resize(logits_count);
+            CHECK(jetson_pi_llm_get_logits(
+                      llm, logits_native.data(), logits_native.size(),
+                      &logits_count) == JETSON_PI_LLM_OK,
+                  "direct read logits");
+            int32_t is_eog = 0;
+            CHECK(jetson_pi_llm_decode_step(
+                      llm, &token_native, &is_eog) == JETSON_PI_LLM_OK,
+                  "direct decode first token");
             jetson_pi_llm_close(llm);
         }
     }
@@ -170,6 +219,17 @@ int main() {
                     cmn < text_native.size()  ? (unsigned char)text_native[cmn]  : 0);
         g_fail = 1;
     }
+    CHECK(token_flashrt == token_native,
+          "FlashRT first token matches direct narrow API");
+    bool logits_match = logits_flashrt.size() == logits_native.size();
+    float logits_max_diff = 0.0f;
+    for (size_t i = 0; logits_match && i < logits_flashrt.size(); ++i) {
+        const float diff = std::fabs(logits_flashrt[i] - logits_native[i]);
+        if (diff > logits_max_diff) logits_max_diff = diff;
+        if (diff > 1e-6f) logits_match = false;
+    }
+    std::printf("    logits max abs diff = %.9g\n", logits_max_diff);
+    CHECK(logits_match, "FlashRT prefill logits match direct narrow API");
 
     std::printf(g_fail ? "\n== LLM PARITY FAILED ==\n"
                        : "\n== LLM PARITY PASSED ==\n");

@@ -329,7 +329,10 @@ int main() {
     const std::string identity_model = identity_prefix + "-model.gguf";
     const std::string identity_mmproj = identity_prefix + "-mmproj.gguf";
     {
-        std::ofstream(identity_model, std::ios::binary) << "model-a";
+        std::string model_bytes(64 * 1024 + 16, 'a');
+        model_bytes.back() = 'x';
+        std::ofstream(identity_model, std::ios::binary)
+            .write(model_bytes.data(), model_bytes.size());
         std::ofstream(identity_mmproj, std::ios::binary) << "mmproj-a";
     }
     const std::string open_json =
@@ -361,8 +364,10 @@ int main() {
     CHECK(factory_engine.releases == 2,
           "opened runtime releases retained factory engine");
     {
+        std::string model_bytes(64 * 1024 + 16, 'a');
+        model_bytes.back() = 'y';
         std::ofstream(identity_model, std::ios::binary | std::ios::trunc)
-            << "model-b";
+            .write(model_bytes.data(), model_bytes.size());
     }
     frt_model_runtime_v2* changed_checkpoint = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
@@ -370,8 +375,8 @@ int main() {
               changed_checkpoint &&
               changed_checkpoint->exp->fingerprint != first_fingerprint &&
               std::strstr(changed_checkpoint->exp->identity,
-                          "weights_sha256="),
-          "checkpoint prefix changes deployment fingerprint");
+                          "weights_sha256=ee5c5dda1cef40957d80fafab7b0eeddeea052e221a311ee80ec4972cbdc5d5f"),
+          "same-size checkpoint tail change alters deployment fingerprint");
     const uint64_t model_changed_fingerprint =
         changed_checkpoint ? changed_checkpoint->exp->fingerprint : 0;
     if (changed_checkpoint) changed_checkpoint->release(changed_checkpoint->owner);
@@ -385,8 +390,44 @@ int main() {
               changed_mmproj &&
               changed_mmproj->exp->fingerprint != model_changed_fingerprint &&
               std::strstr(changed_mmproj->exp->identity,
-                          "mmproj_sha256="),
+                          "mmproj_sha256=d772e18bbe6501374cfab6a5d76a93f9288b8f2bcb4ec9694356b32e3bcf4c1c"),
           "mmproj prefix changes deployment fingerprint");
+
+    const std::string cuda_json =
+        "{\"model_family\":\"pi0\",\"model_path\":\"" +
+        identity_model + "\",\"mmproj_path\":\"" + identity_mmproj +
+        "\",\"backend\":\"cuda\",\"n_views\":2,"
+        "\"image_height\":224,\"image_width\":224,"
+        "\"image_channels\":3,\"action_steps\":2,\"action_dim\":2}";
+    frt_model_runtime_v2* cuda_identity = nullptr;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              cuda_json.c_str(), &factory_api, &cuda_identity) == 0 &&
+              cuda_identity &&
+              changed_mmproj &&
+              cuda_identity->exp->fingerprint !=
+                  changed_mmproj->exp->fingerprint,
+          "backend change alters deployment fingerprint");
+    bool same_port_schema = cuda_identity && changed_mmproj &&
+                            cuda_identity->n_ports == changed_mmproj->n_ports;
+    if (same_port_schema) {
+        for (uint64_t i = 0; i < cuda_identity->n_ports; ++i) {
+            const frt_runtime_port_desc& lhs = cuda_identity->ports[i];
+            const frt_runtime_port_desc& rhs = changed_mmproj->ports[i];
+            same_port_schema &= std::strcmp(lhs.name, rhs.name) == 0 &&
+                                lhs.modality == rhs.modality &&
+                                lhs.dtype == rhs.dtype &&
+                                lhs.layout == rhs.layout &&
+                                lhs.direction == rhs.direction &&
+                                lhs.update == rhs.update &&
+                                lhs.required == rhs.required &&
+                                lhs.rank == rhs.rank;
+            for (uint32_t dim = 0; same_port_schema && dim < lhs.rank; ++dim) {
+                same_port_schema &= lhs.shape[dim] == rhs.shape[dim];
+            }
+        }
+    }
+    CHECK(same_port_schema, "backend switch preserves port schema");
+    if (cuda_identity) cuda_identity->release(cuda_identity->owner);
     if (changed_mmproj) changed_mmproj->release(changed_mmproj->owner);
 
     const int creates_before_missing_checkpoint = factory.creates;
@@ -402,8 +443,10 @@ int main() {
               missing_checkpoint_json.c_str(), &factory_api,
               &missing_checkpoint) == -1 &&
               missing_checkpoint == nullptr &&
-              factory.creates == creates_before_missing_checkpoint,
-          "missing checkpoint hard-fails before factory creation");
+              factory.creates == creates_before_missing_checkpoint &&
+              std::strstr(frt_llama_cpp_runtime_open_error(),
+                          "failed to open checkpoint for identity"),
+          "missing checkpoint reports identity error before factory creation");
 
     frt_model_runtime_v2* missing = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
@@ -411,6 +454,9 @@ int main() {
               &factory_api, &missing) == -1 &&
               missing == nullptr,
           "open rejects incomplete JSON config");
+    CHECK(std::strstr(frt_llama_cpp_runtime_open_error(),
+                      "invalid Pi0 runtime open arguments or JSON config"),
+          "incomplete JSON reports runtime-open validation error");
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               "{\"model_family\":\"pi0\",\"model_path\":\"/models/pi0.gguf\","
               "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","

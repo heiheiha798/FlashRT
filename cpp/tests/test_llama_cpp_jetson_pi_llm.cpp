@@ -44,6 +44,9 @@ int main() {
     CHECK(frt_llama_cpp_llm_runtime_open_with_engine_factory(
               bogus_json, factory, &bogus) != 0 && bogus == nullptr,
           "open LLM with bogus model path fails without crashing");
+    CHECK(std::strstr(frt_llama_cpp_runtime_open_error(),
+                      "failed to open checkpoint for identity"),
+          "bogus model path reports checkpoint identity error");
 
     // Real model.
     const char * prompt = "What is 2 plus 2? The answer is";

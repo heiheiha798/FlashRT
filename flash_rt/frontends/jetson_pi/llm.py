@@ -54,6 +54,13 @@ class LlmJetsonPiFrontend:
 
         self._lib.frt_llama_cpp_default_engine_factory.argtypes = []
         self._lib.frt_llama_cpp_default_engine_factory.restype = ctypes.c_void_p
+        try:
+            self._lib.frt_llama_cpp_runtime_open_error.argtypes = []
+            self._lib.frt_llama_cpp_runtime_open_error.restype = ctypes.c_char_p
+        except AttributeError as exc:
+            raise RuntimeError(
+                "provider .so is older than the Python frontend expects: "
+                "missing frt_llama_cpp_runtime_open_error") from exc
         self._lib.frt_llama_cpp_llm_runtime_open_with_engine_factory.argtypes = [
             ctypes.c_char_p,
             ctypes.c_void_p,
@@ -93,7 +100,9 @@ class LlmJetsonPiFrontend:
         rc = self._lib.frt_llama_cpp_llm_runtime_open_with_engine_factory(
             config_json, factory_ptr, ctypes.byref(model_ptr))
         if rc != 0 or not model_ptr.value:
-            err = factory.last_error(factory.self) or b""
+            err = self._lib.frt_llama_cpp_runtime_open_error() or b""
+            if not err:
+                err = factory.last_error(factory.self) or b""
             raise RuntimeError(
                 f"frt_llama_cpp_llm_runtime_open_with_engine_factory failed "
                 f"(rc={rc}): {(err.decode(errors='replace') if err else 'no error')}")
