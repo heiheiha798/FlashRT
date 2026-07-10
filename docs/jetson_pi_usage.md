@@ -162,6 +162,13 @@ actions = model.predict(
 model._pipe.set_prompt("put the mug on the plate")
 model._pipe.context({"images": [image, wrist_image], "state": robot_state})
 actions = model._pipe.action()
+
+# Read-only zero-copy host SWAP view over the latest action chunk. NumPy's
+# native DLPack protocol lets torch/jax consume the same storage.
+actions_view = model._pipe.action_view()
+torch_actions = torch.from_dlpack(actions_view)
+actions_view.close()  # DLPack consumer keeps its own map alive
+del torch_actions     # required before replacing inputs or running a stage
 ```
 
 The Pi0 runtime exposes callback stages `infer`, `context`, and `action`, with

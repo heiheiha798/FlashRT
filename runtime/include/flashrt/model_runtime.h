@@ -121,6 +121,11 @@ enum frt_rt_location_kind {
     FRT_RT_LOCATION_DEVICE_LOCAL = 1   /* provider-owned device memory; sync first */
 };
 
+enum frt_rt_host_map_access {
+    FRT_RT_HOST_MAP_READ  = 1,
+    FRT_RT_HOST_MAP_WRITE = 2
+};
+
 /* ------------------------------------------------------------------ */
 /* Payload types (STAGED lane).                                        */
 /* ------------------------------------------------------------------ */
@@ -182,10 +187,10 @@ typedef struct frt_runtime_port_desc {
 /* ------------------------------------------------------------------ */
 typedef struct frt_memory_token_s* frt_memory_token;
 
-/* Provider-supplied verbs against its own backing store. Every entry is
- * always callable: a producer that omits the struct (or supplies a smaller
- * struct_size) gets stubs returning -3 unsupported, matching the verbs
- * discipline. `destroy` is the only void entry; FlashRT calls it exactly
+/* Provider-supplied verbs against its own backing store. The original
+ * copy/sync prefix is mandatory and always callable. Append-only tail verbs
+ * such as map_host/unmap_host must be struct_size-probed before use.
+ * `destroy` is the only void entry; FlashRT calls it exactly
  * once when the runtime's holder refcount hits zero (on the provider-owned
  * v2 path the holder IS the token's lifetime owner — there is no separate
  * per-port/per-export counter, and no v2 wrap/override path exists, so the
@@ -212,7 +217,19 @@ typedef struct frt_memory_token_verbs {
      * holder's refcount hits zero. May be null if the provider owns the
      * store externally (then FlashRT never destroys it). */
     void (*destroy)(frt_memory_token token);
+
+    /* Append-only host SWAP window. map_host returns a provider-owned host
+     * pointer for [offset, offset + bytes); the caller must keep the runtime
+     * alive and call unmap_host exactly once before any operation that can
+     * mutate/reallocate the backing store. Access is frt_rt_host_map_access.
+     * Providers compiled against the original prefix omit these fields. */
+    int (*map_host)(frt_memory_token token, uint64_t offset, uint64_t bytes,
+                    uint32_t access, void** out_ptr);
+    int (*unmap_host)(frt_memory_token token, void* ptr);
 } frt_memory_token_verbs;
+
+#define FRT_MEMORY_TOKEN_VERBS_COPY_SYNC_SIZE \
+    ((uint32_t)offsetof(frt_memory_token_verbs, map_host))
 
 /* A token bound to one provider-owned port. The provider retains the
  * backing store until `verbs.destroy` fires; FlashRT's only job is to fire

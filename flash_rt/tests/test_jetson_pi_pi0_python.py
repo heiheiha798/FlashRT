@@ -96,6 +96,26 @@ def main():
         check(False, "actions contain NaN/Inf")
     check(bool(np.any(actions != 0)), "actions are not all zero")
 
+    actions_view = model._pipe.action_view()
+    check(not actions_view.flags.writeable,
+          "actions host SWAP view is read-only")
+    check(np.shares_memory(actions_view, np.asarray(actions_view)),
+          "actions host SWAP view is zero-copy")
+    check(np.array_equal(actions_view, actions),
+          "actions host SWAP view matches copied output")
+    dlpack_actions = np.from_dlpack(actions_view)
+    check(np.array_equal(dlpack_actions, actions),
+          "actions host SWAP view exports DLPack")
+    actions_view.close()
+    try:
+        model._pipe.set_prompt(prompt)
+        model._pipe.context({"images": [image, wrist], "state": state})
+        check(False, "live DLPack consumer retains its host mapping")
+    except RuntimeError as exc:
+        check("mapped" in str(exc),
+              "live DLPack consumer retains its host mapping")
+    del dlpack_actions
+
     model._pipe.context({"images": [image, wrist], "state": state})
     split_actions = model._pipe.action()
     check(np.array_equal(split_actions, actions),

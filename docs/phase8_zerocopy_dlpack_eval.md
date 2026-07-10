@@ -1,6 +1,16 @@
-# Phase 8 Evaluation — Zero-copy / DLPack / host SWAP for provider-owned ports (TODO-5)
+# Phase 8 — Zero-copy / DLPack / host SWAP for provider-owned ports
 
-> Status: 2026-07-08. Evaluates CLAUDE.md **TODO-5** (§11 DLPack / host SWAP zero-copy). Mirrors the Phase 5 / Phase 7 (TODO-2) evaluation structure.
+> Implementation update (2026-07-10): the earlier no-go evaluation below is
+> superseded by the complete-migration requirement. `frt_memory_token_verbs`
+> now has append-only `map_host`/`unmap_host` verbs. Pi0 actions exposes a
+> read-only HOST_VISIBLE SWAP window; the Python frontend returns a zero-copy
+> NumPy view whose native `__dlpack__` exports the same storage. New input or
+> stage execution is rejected while the view is mapped, preventing vector
+> reallocation and stale pointers. The original copy_to_host path remains.
+
+> Historical evaluation dated 2026-07-08. The implementation update above is
+> authoritative; the remaining text records why this work was previously
+> deferred before the complete-migration scope was requested.
 
 ## 1. Executive summary + recommendation
 
