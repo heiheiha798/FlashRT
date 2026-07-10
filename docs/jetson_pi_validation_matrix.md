@@ -45,6 +45,10 @@ stable benchmarks and not cross-backend speed claims.
   fixed-seed output for identical inputs; no previous context leaks.
 - Pi0 actions are checked for shape, nonzero values, and NaN/Inf absence.
 - LLM/MLLM prefill exposes finite vocabulary logits; decode is host-repeatable.
+- Host interruption is explicit: callers stop generation by not issuing another
+  decode stage. Each staged session enforces its configured `max_tokens`; one
+  extra decode hard-fails. The narrow API restores the budget on `prefill`,
+  while FlashRT conventionally starts sessions with reset+prefill.
 - Same-session KV is reused across decode steps; distinct LLM sessions are
   tested with different prompts and compared token-by-token with standalone
   baselines.
@@ -89,6 +93,8 @@ Final-run logs used by this matrix include:
 - `/tmp/final-mllm-vulkan-gpu6.log`
 - `/tmp/final-opencl-hard-gate.log`
 - `/tmp/final-sycl-gate3.log`
+- `/tmp/decode-budget-llm-gpu6.log`
+- `/tmp/decode-budget-mllm-gpu6.log`
 
 ## Reproduction
 

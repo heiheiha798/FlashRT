@@ -387,7 +387,10 @@ want a dict-shaped interface.
 The provider runtime exposes callback stages `infer`, `reset`, `prefill`, and
 repeatable `decode`, with STAGED `prompt`, optional `tokens`, `next_token`,
 `logits`, `is_eog`, and accumulated `text` ports. KV state and sampling remain
-provider-private.
+provider-private. The host interrupts at a token boundary by stopping decode
+calls. Each staged session enforces `max_tokens`; the narrow API starts a fresh
+decode budget on `prefill`, while the FlashRT DAG convention uses
+`reset`+`prefill` to start a new session.
 
 ### Run the LLM smoke test
 
@@ -440,7 +443,8 @@ output text, not actions). `fe.infer({"images": [...], "prompt": ...})` returns
 
 The caller is responsible for applying the chat template; the engine only does
 raw prompt + media markers → text. Each `generate` call clears KV (independent
-completion, no multi-turn).
+completion, no multi-turn). Staged decode uses the same token-boundary
+interruption and `max_tokens` budget contract as the text LLM face.
 
 ### Run the MLLM smoke test
 

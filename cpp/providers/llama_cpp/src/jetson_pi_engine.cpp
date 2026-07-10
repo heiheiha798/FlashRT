@@ -565,6 +565,8 @@ int llm_engine_run_stage(void * self, uint32_t stage) {
         return llm_engine_refresh_logits(e);
     }
     if (stage == FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE) {
+        e->next_token_ready = false;
+        e->logits_buf.clear();
         int32_t is_eog = 0;
         const int32_t s = jetson_pi_llm_decode_step(
             e->llm, &e->next_token, &is_eog);
@@ -888,6 +890,8 @@ int mllm_engine_run_stage(void * self, uint32_t stage) {
         return mllm_engine_refresh_logits(e);
     }
     if (stage == FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE) {
+        e->next_token_ready = false;
+        e->logits_buf.clear();
         int32_t is_eog = 0;
         const int32_t s = jetson_pi_mllm_decode_step(
             e->mllm, &e->next_token, &is_eog);
