@@ -9,10 +9,11 @@
 #include "flashrt/providers/llama_cpp/c_api.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
 #include <string>
 #include <vector>
 
@@ -120,9 +121,12 @@ int main() {
         std::printf("ok  : run_stage infer\n");
     }
 
-    const uint64_t cap = 16u * 8u;
-    std::string text(cap, '\0');
     uint64_t written = 0;
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT, nullptr, 0, &written, -1);
+    CHECK(rc == -5 && written > 0, "query one-shot text size");
+    std::string text(written, '\0');
+    written = 0;
     rc = model->verbs_v2.get_output(
         model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT, &text[0], text.size(),
         &written, -1);
@@ -136,13 +140,42 @@ int main() {
         }
         CHECK(printable, "generated text contains printable chars");
     }
+    frt_image_view bad_view = view;
+    bad_view.stride_bytes = 1;
+    CHECK(model->verbs_v2.set_input(
+              model->self, FRT_LLAMA_CPP_MLLM_PORT_IMAGES,
+              &bad_view, sizeof(bad_view), -1) != 0,
+          "undersized image stride is rejected");
+    CHECK(model->verbs_v2.run_stage(
+              model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER, -1) != 0,
+          "failed image replacement invalidates previous images");
+    CHECK(model->verbs_v2.set_input(
+              model->self, FRT_LLAMA_CPP_MLLM_PORT_IMAGES,
+              &view, sizeof(view), -1) == 0,
+          "restore valid images after failed replacement");
+    CHECK(model->verbs_v2.set_input(
+              model->self, FRT_LLAMA_CPP_MLLM_PORT_PROMPT,
+              nullptr, 0, -1) != 0,
+          "invalid prompt replacement is rejected");
+    CHECK(model->verbs_v2.run_stage(
+              model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER, -1) != 0,
+          "failed prompt replacement invalidates previous prompt");
+    CHECK(model->verbs_v2.set_input(
+              model->self, FRT_LLAMA_CPP_MLLM_PORT_PROMPT,
+              prompt, std::strlen(prompt), -1) == 0,
+          "restore valid prompt after failed replacement");
 
     rc = model->verbs_v2.run_stage(
         model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_RESET, -1);
     CHECK(rc == 0, "run_stage reset");
+    const auto prefill_start = std::chrono::steady_clock::now();
     rc = model->verbs_v2.run_stage(
         model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_PREFILL, -1);
+    const auto prefill_end = std::chrono::steady_clock::now();
     CHECK(rc == 0, "run_stage prefill");
+    std::printf("    staged MLLM prefill latency: %.3f ms\n",
+                std::chrono::duration<double, std::milli>(
+                    prefill_end - prefill_start).count());
 
     uint64_t logits_bytes = 0;
     rc = model->verbs_v2.get_output(
@@ -161,9 +194,16 @@ int main() {
     for (float value : logits) finite = finite && std::isfinite(value);
     CHECK(finite, "prefill logits contain no NaN/Inf");
 
+    double decode_ms = 0.0;
+    uint32_t decoded_tokens = 0;
     for (uint32_t i = 0; i < 16; ++i) {
+        const auto decode_start = std::chrono::steady_clock::now();
         rc = model->verbs_v2.run_stage(
             model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE, -1);
+        const auto decode_end = std::chrono::steady_clock::now();
+        decode_ms += std::chrono::duration<double, std::milli>(
+            decode_end - decode_start).count();
+        ++decoded_tokens;
         CHECK(rc == 0, "run_stage decode");
         int32_t token = 0;
         int32_t is_eog = 0;
@@ -180,7 +220,15 @@ int main() {
               "decode exposes is_eog");
         if (is_eog) break;
     }
-    std::string staged(cap, '\0');
+    std::printf("    staged MLLM decode throughput: %.2f token/s "
+                "(%u tokens in %.3f ms)\n",
+                decoded_tokens * 1000.0 / decode_ms,
+                decoded_tokens, decode_ms);
+    written = 0;
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT, nullptr, 0, &written, -1);
+    CHECK(rc == -5 && written > 0, "query staged text size");
+    std::string staged(written, '\0');
     written = 0;
     rc = model->verbs_v2.get_output(
         model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT, staged.data(), staged.size(),

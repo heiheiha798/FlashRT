@@ -31,6 +31,10 @@
 //   FLASHRT_PI0_BACKEND      (optional) "cpu" (default) or "cuda".
 //                            CUDA may have ULP drift from atomics/warp reductions;
 //                            the 1e-5 tolerance is headroom. CPU expects ~0.
+//   FLASHRT_PI0_CLI_ACTION_LOG (optional) log emitted by llama-mtmd-cli for
+//                            the same fixture and effective prompt. When set,
+//                            the `Pi0 action: [...]` line must be bit-identical
+//                            to FlashRT's action chunk.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
@@ -42,6 +46,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -234,12 +239,28 @@ int main() {
                       state_bytes.data(), state_bytes.size() - sizeof(float), -1) != 0,
                   "invalid replacement input is rejected");
             CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) == -7,
-                  "failed replacement input discards pending context");
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) != 0,
+                  "failed state replacement invalidates the previous state");
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) != 0,
+                  "failed replacement input blocks action execution");
             CHECK(model->verbs_v2.set_input(
                       model->self, FRT_LLAMA_CPP_PI0_PORT_STATE,
                       state_bytes.data(), state_bytes.size(), -1) == 0,
                   "restore valid Pi0 state after invalid replacement");
+            frt_image_view bad_views[2] = {views[0], views[1]};
+            bad_views[0].stride_bytes = 1;
+            CHECK(model->verbs_v2.set_input(
+                      model->self, FRT_LLAMA_CPP_PI0_PORT_IMAGES,
+                      bad_views, sizeof(bad_views), -1) != 0,
+                  "undersized Pi0 image stride is rejected");
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) != 0,
+                  "failed image replacement invalidates previous images");
+            CHECK(model->verbs_v2.set_input(
+                      model->self, FRT_LLAMA_CPP_PI0_PORT_IMAGES,
+                      views, sizeof(views), -1) == 0,
+                  "restore valid Pi0 images after failed replacement");
             CHECK(model->verbs_v2.run_stage(
                       model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) == 0,
                   "FlashRT rebuilds context after failed replacement");
@@ -370,6 +391,48 @@ int main() {
                 max_diff, n_elems, diverge_idx);
     CHECK(max_diff <= 1e-5f,
           "FlashRT actions match direct jetson_pi_pi0 (max_diff <= 1e-5)");
+
+    const char * cli_action_log = std::getenv("FLASHRT_PI0_CLI_ACTION_LOG");
+    if (cli_action_log && cli_action_log[0]) {
+        std::ifstream log(cli_action_log);
+        CHECK(log.good(), "open native Pi0 CLI action log");
+        std::vector<float> actions_cli;
+        std::string line;
+        const std::string prefix = "Pi0 action: [";
+        while (std::getline(log, line)) {
+            if (line.rfind(prefix, 0) != 0 || line.back() != ']') {
+                continue;
+            }
+            std::string payload = line.substr(
+                prefix.size(), line.size() - prefix.size() - 1);
+            for (char & ch : payload) {
+                if (ch == ',') ch = ' ';
+            }
+            std::istringstream values(payload);
+            float value = 0.0f;
+            while (values >> value) actions_cli.push_back(value);
+            if (!values.eof()) actions_cli.clear();
+            break;
+        }
+        CHECK(actions_cli.size() == n_elems,
+              "native Pi0 CLI log contains the complete action chunk");
+        if (actions_cli.size() == n_elems) {
+            float cli_max_diff = 0.0f;
+            size_t cli_diverge_idx = 0;
+            for (size_t i = 0; i < n_elems; ++i) {
+                const float d = std::fabs(actions_flashrt[i] - actions_cli[i]);
+                if (d > cli_max_diff) {
+                    cli_max_diff = d;
+                    cli_diverge_idx = i;
+                }
+            }
+            std::printf("    CLI max abs diff = %.9g  (n_elems=%zu, first diverge idx=%zu)\n",
+                        cli_max_diff, n_elems, cli_diverge_idx);
+            CHECK(std::memcmp(actions_flashrt.data(), actions_cli.data(),
+                              n_bytes) == 0,
+                  "FlashRT actions are bit-identical to native Pi0 CLI");
+        }
+    }
 
     std::printf(g_fail ? "\n== PI0 PARITY FAILED ==\n"
                        : "\n== PI0 PARITY PASSED ==\n");

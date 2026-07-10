@@ -37,7 +37,7 @@ int main() {
     std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
     for (size_t i = 0; i < rgb.size(); i += 3) rgb[i] = 255;
 
-    std::string flashrt_text(max_tokens * 8u, '\0');
+    std::string flashrt_text;
     {
         const auto* factory = frt_llama_cpp_default_engine_factory();
         std::string json =
@@ -72,6 +72,12 @@ int main() {
             uint64_t written = 0;
             rc = model->verbs_v2.get_output(
                 model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT,
+                nullptr, 0, &written, -1);
+            CHECK(rc == -5 && written > 0, "query FlashRT MLLM text size");
+            flashrt_text.assign(written, '\0');
+            written = 0;
+            rc = model->verbs_v2.get_output(
+                model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT,
                 flashrt_text.data(), flashrt_text.size(), &written, -1);
             CHECK(rc == 0 && written > 0, "read FlashRT MLLM text");
             flashrt_text.resize(written);
@@ -79,7 +85,7 @@ int main() {
         }
     }
 
-    std::string direct_text(max_tokens * 8u, '\0');
+    std::string direct_text;
     {
         jetson_pi_mllm_config config{};
         config.struct_size = sizeof(config);
@@ -97,6 +103,13 @@ int main() {
         if (handle) {
             const uint8_t* images[] = {rgb.data()};
             size_t written = 0;
+            rc = jetson_pi_mllm_infer(
+                handle, images, 1, height, width, prompt,
+                std::strlen(prompt), nullptr, 0, &written);
+            CHECK(rc == JETSON_PI_MLLM_BUFFER_TOO_SMALL && written > 0,
+                  "query direct MLLM text bound");
+            direct_text.assign(written, '\0');
+            written = 0;
             rc = jetson_pi_mllm_infer(
                 handle, images, 1, height, width, prompt,
                 std::strlen(prompt), direct_text.data(), direct_text.size(),

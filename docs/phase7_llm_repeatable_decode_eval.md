@@ -1,6 +1,18 @@
 # Phase 7 Evaluation — LLM Repeatable Decode (prefill / decode-step / logits)
 
-> Status: 2026-07-07. Evaluates CLAUDE.md **TODO-2** (§8.1 LLM `prefill once → decode (host-repeatable)` + `next_token`/`logits` ports). Mirrors the Phase 5 (finer-Pi0-stages) evaluation structure.
+> Implementation update (2026-07-10): the earlier no-go below is superseded by
+> the complete-migration requirement. Jetson-PI LLM and MLLM narrow APIs now
+> expose `reset`, `prefill`, repeatable `decode_step`, and `get_logits`; one-shot
+> generate is implemented through the same staged path. FlashRT exposes
+> `reset -> prefill -> decode`, optional token input, next-token/EOG/logits/text
+> outputs, and Python `reset()`/`prefill()`/`decode()` methods. Tests cover exact
+> one-shot/staged parity, finite/full logits parity, host interruption by
+> stopping at token boundaries, distinct interleaved KV sessions, and strict
+> `max_tokens` budgets on CPU, CUDA, Vulkan, and SYCL.
+
+> Historical evaluation dated 2026-07-07. The implementation update above is
+> authoritative; the remaining text records why this work was initially
+> deferred before the complete-migration scope was requested.
 
 ## 1. Executive summary + recommendation
 

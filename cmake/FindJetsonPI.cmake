@@ -4,10 +4,10 @@
 #
 # The narrow C API libs (jetson_pi_pi0 / jetson_pi_llm / jetson_pi_mllm) are the
 # FlashRT provider's real link surface; they in turn need mtmd / llama / ggml
-# (+ the ggml-* backend libs) at link and runtime. This module finds them all
-# under one install prefix and exposes them as imported targets so the provider
-# links JetsonPI::jetson_pi_pi0 etc. exactly as it links the in-tree targets in
-# the dev path.
+# (+ either directly linked ggml-* backend libs or runtime backend modules).
+# This module finds them all under one install prefix and exposes the linked
+# libraries as imported targets so the provider links JetsonPI::jetson_pi_pi0
+# etc. exactly as it links the in-tree targets in the dev path.
 #
 # Usage:
 #   find_package(JetsonPI REQUIRED)
@@ -21,7 +21,9 @@
 #   JetsonPI::mtmd  JetsonPI::llama  JetsonPI::ggml  JetsonPI::ggml-base
 #   JetsonPI::ggml-cpu  JetsonPI::ggml-cuda  JetsonPI::ggml-vulkan
 #   JetsonPI::ggml-opencl  JetsonPI::ggml-sycl
-# (backend libs are linked only when they exist in the selected prefix.)
+# Backend imported targets exist only for a direct-link GGML package. For a
+# GGML_BACKEND_DL package, JetsonPI_BACKEND_DIR and JetsonPI_BACKEND_MODULES
+# identify the validated runtime modules and none are linked into the provider.
 #
 # Module-mode search: Jetson-PI does not ship a config-file package for the
 # narrow C API libs (installing an install(EXPORT) graph would require
@@ -40,6 +42,17 @@ if(NOT JetsonPI_ROOT)
 endif()
 
 set(_JetsonPI_HINT_PATHS ${JetsonPI_ROOT})
+
+unset(ggml_DIR CACHE)
+find_package(ggml CONFIG QUIET
+  PATHS ${_JetsonPI_HINT_PATHS}
+  NO_DEFAULT_PATH)
+if(NOT ggml_FOUND)
+  message(FATAL_ERROR
+    "JetsonPI_ROOT='${JetsonPI_ROOT}' has no matching ggml-config.cmake. "
+    "Install Jetson-PI and its bundled GGML into the same prefix.")
+endif()
+set(JetsonPI_BACKEND_DL ${GGML_BACKEND_DL})
 
 # NO_DEFAULT_PATH: same no-system-mix rule as the find_library path below.
 # Without it, a stray system header could paper over a bad JetsonPI_ROOT.
@@ -76,17 +89,69 @@ _jetsonpi_find_lib(JetsonPI_mtmd_LIBRARY     mtmd)
 _jetsonpi_find_lib(JetsonPI_llama_LIBRARY    llama)
 _jetsonpi_find_lib(JetsonPI_ggml_LIBRARY     ggml)
 _jetsonpi_find_lib(JetsonPI_ggml_base_LIBRARY    ggml-base)
-_jetsonpi_find_lib(JetsonPI_ggml_cpu_LIBRARY     ggml-cpu)
-_jetsonpi_find_lib(JetsonPI_ggml_cuda_LIBRARY    ggml-cuda)
-_jetsonpi_find_lib(JetsonPI_ggml_vulkan_LIBRARY  ggml-vulkan)
-_jetsonpi_find_lib(JetsonPI_ggml_opencl_LIBRARY  ggml-opencl)
-_jetsonpi_find_lib(JetsonPI_ggml_sycl_LIBRARY    ggml-sycl)
 _jetsonpi_find_lib(JetsonPI_onemath_cublas_LIBRARY onemath_blas_cublas)
 
-if (JetsonPI_ggml_opencl_LIBRARY)
+set(JetsonPI_BACKEND_MODULES "")
+if(JetsonPI_BACKEND_DL)
+  if(NOT GGML_BACKEND_DIR OR NOT IS_ABSOLUTE "${GGML_BACKEND_DIR}")
+    message(FATAL_ERROR
+      "The Jetson-PI GGML package uses GGML_BACKEND_DL, but its installed "
+      "ggml-config.cmake does not contain an absolute GGML_BACKEND_DIR. "
+      "Rebuild Jetson-PI with -DGGML_BACKEND_DIR=<install-prefix>/bin so "
+      "runtime backend discovery is explicit and independent of cwd.")
+  endif()
+  get_filename_component(_JetsonPI_root_real "${JetsonPI_ROOT}" REALPATH)
+  get_filename_component(JetsonPI_BACKEND_DIR "${GGML_BACKEND_DIR}" REALPATH)
+  string(FIND "${JetsonPI_BACKEND_DIR}/" "${_JetsonPI_root_real}/"
+    _JetsonPI_backend_prefix_index)
+  if(NOT _JetsonPI_backend_prefix_index EQUAL 0)
+    message(FATAL_ERROR
+      "GGML_BACKEND_DIR='${GGML_BACKEND_DIR}' is outside "
+      "JetsonPI_ROOT='${JetsonPI_ROOT}'. Install core libraries and runtime "
+      "backend modules as one coherent deployment package.")
+  endif()
+
+  foreach(_JetsonPI_backend IN LISTS GGML_AVAILABLE_BACKENDS)
+    string(REPLACE "-" "_" _JetsonPI_backend_id "${_JetsonPI_backend}")
+    set(_JetsonPI_backend_var "JetsonPI_${_JetsonPI_backend_id}_MODULE")
+    unset(${_JetsonPI_backend_var} CACHE)
+    find_file(${_JetsonPI_backend_var}
+      NAMES "${CMAKE_SHARED_MODULE_PREFIX}${_JetsonPI_backend}${CMAKE_SHARED_MODULE_SUFFIX}"
+      HINTS "${JetsonPI_BACKEND_DIR}"
+      DOC "Jetson-PI ${_JetsonPI_backend} runtime module"
+      NO_DEFAULT_PATH)
+    if(NOT ${_JetsonPI_backend_var})
+      message(FATAL_ERROR
+        "Jetson-PI's ggml-config.cmake declares backend "
+        "'${_JetsonPI_backend}', but its runtime module is missing from "
+        "GGML_BACKEND_DIR='${JetsonPI_BACKEND_DIR}'.")
+    endif()
+    list(APPEND JetsonPI_BACKEND_MODULES "${${_JetsonPI_backend_var}}")
+    if(_JetsonPI_backend STREQUAL "ggml-cpu")
+      set(JetsonPI_ggml_cpu_LIBRARY "${${_JetsonPI_backend_var}}")
+    elseif(_JetsonPI_backend STREQUAL "ggml-cuda")
+      set(JetsonPI_ggml_cuda_LIBRARY "${${_JetsonPI_backend_var}}")
+    elseif(_JetsonPI_backend STREQUAL "ggml-vulkan")
+      set(JetsonPI_ggml_vulkan_LIBRARY "${${_JetsonPI_backend_var}}")
+    elseif(_JetsonPI_backend STREQUAL "ggml-opencl")
+      set(JetsonPI_ggml_opencl_LIBRARY "${${_JetsonPI_backend_var}}")
+    elseif(_JetsonPI_backend STREQUAL "ggml-sycl")
+      set(JetsonPI_ggml_sycl_LIBRARY "${${_JetsonPI_backend_var}}")
+    endif()
+  endforeach()
+else()
+  set(JetsonPI_BACKEND_DIR "")
+  _jetsonpi_find_lib(JetsonPI_ggml_cpu_LIBRARY     ggml-cpu)
+  _jetsonpi_find_lib(JetsonPI_ggml_cuda_LIBRARY    ggml-cuda)
+  _jetsonpi_find_lib(JetsonPI_ggml_vulkan_LIBRARY  ggml-vulkan)
+  _jetsonpi_find_lib(JetsonPI_ggml_opencl_LIBRARY  ggml-opencl)
+  _jetsonpi_find_lib(JetsonPI_ggml_sycl_LIBRARY    ggml-sycl)
+endif()
+
+if (JetsonPI_ggml_opencl_LIBRARY AND NOT JetsonPI_BACKEND_DL)
   find_package(OpenCL REQUIRED)
 endif()
-if (JetsonPI_ggml_sycl_LIBRARY)
+if (JetsonPI_ggml_sycl_LIBRARY AND NOT JetsonPI_BACKEND_DL)
   find_library(JetsonPI_sycl_LIBRARY NAMES sycl HINTS ENV ONEAPI_ROOT PATH_SUFFIXES lib lib64)
   find_library(JetsonPI_imf_LIBRARY NAMES imf HINTS ENV ONEAPI_ROOT PATH_SUFFIXES lib lib64)
   find_library(JetsonPI_svml_LIBRARY NAMES svml HINTS ENV ONEAPI_ROOT PATH_SUFFIXES lib lib64)
@@ -120,17 +185,17 @@ if (JetsonPI_FOUND)
   # Target names use hyphens to match the soname (libggml-cuda.so) and the
   # header comment above (JetsonPI::ggml-cuda / ::ggml-vulkan).
   set(_JetsonPI_ggml_backends "")
-  if (JetsonPI_ggml_cuda_LIBRARY)
+  if (JetsonPI_ggml_cuda_LIBRARY AND NOT JetsonPI_BACKEND_DL)
     find_package(CUDAToolkit REQUIRED)
     list(APPEND _JetsonPI_ggml_backends JetsonPI::ggml-cuda)
   endif()
-  if (JetsonPI_ggml_vulkan_LIBRARY)
+  if (JetsonPI_ggml_vulkan_LIBRARY AND NOT JetsonPI_BACKEND_DL)
     list(APPEND _JetsonPI_ggml_backends JetsonPI::ggml-vulkan)
   endif()
-  if (JetsonPI_ggml_opencl_LIBRARY)
+  if (JetsonPI_ggml_opencl_LIBRARY AND NOT JetsonPI_BACKEND_DL)
     list(APPEND _JetsonPI_ggml_backends JetsonPI::ggml-opencl)
   endif()
-  if (JetsonPI_ggml_sycl_LIBRARY)
+  if (JetsonPI_ggml_sycl_LIBRARY AND NOT JetsonPI_BACKEND_DL)
     list(APPEND _JetsonPI_ggml_backends JetsonPI::ggml-sycl)
   endif()
 
@@ -151,14 +216,16 @@ if (JetsonPI_FOUND)
     endif()
   endfunction()
 
-  # ggml aggregates the base + cpu + whichever backends were built.
-  set(_ggml_deps "JetsonPI::ggml-base;JetsonPI::ggml-cpu;${_JetsonPI_ggml_backends}")
+  set(_ggml_deps "JetsonPI::ggml-base")
   _jetsonpi_import_target(JetsonPI::ggml-base   JetsonPI_ggml_base_LIBRARY   "")
-  _jetsonpi_import_target(JetsonPI::ggml-cpu    JetsonPI_ggml_cpu_LIBRARY    "JetsonPI::ggml-base")
-  _jetsonpi_import_target(JetsonPI::ggml-cuda   JetsonPI_ggml_cuda_LIBRARY   "JetsonPI::ggml-base;CUDA::cudart;CUDA::cublas;CUDA::cuda_driver")
-  _jetsonpi_import_target(JetsonPI::ggml-vulkan JetsonPI_ggml_vulkan_LIBRARY "JetsonPI::ggml-base")
-  _jetsonpi_import_target(JetsonPI::ggml-opencl JetsonPI_ggml_opencl_LIBRARY "JetsonPI::ggml-base;OpenCL::OpenCL")
-  _jetsonpi_import_target(JetsonPI::ggml-sycl   JetsonPI_ggml_sycl_LIBRARY   "JetsonPI::ggml-base;${JetsonPI_onemath_cublas_LIBRARY};${JetsonPI_sycl_LIBRARY};${JetsonPI_imf_LIBRARY};${JetsonPI_svml_LIBRARY};${JetsonPI_intlc_LIBRARY};CUDA::cublas;CUDA::cuda_driver")
+  if(NOT JetsonPI_BACKEND_DL)
+    list(APPEND _ggml_deps JetsonPI::ggml-cpu ${_JetsonPI_ggml_backends})
+    _jetsonpi_import_target(JetsonPI::ggml-cpu    JetsonPI_ggml_cpu_LIBRARY    "JetsonPI::ggml-base")
+    _jetsonpi_import_target(JetsonPI::ggml-cuda   JetsonPI_ggml_cuda_LIBRARY   "JetsonPI::ggml-base;CUDA::cudart;CUDA::cublas;CUDA::cuda_driver")
+    _jetsonpi_import_target(JetsonPI::ggml-vulkan JetsonPI_ggml_vulkan_LIBRARY "JetsonPI::ggml-base")
+    _jetsonpi_import_target(JetsonPI::ggml-opencl JetsonPI_ggml_opencl_LIBRARY "JetsonPI::ggml-base;OpenCL::OpenCL")
+    _jetsonpi_import_target(JetsonPI::ggml-sycl   JetsonPI_ggml_sycl_LIBRARY   "JetsonPI::ggml-base;${JetsonPI_onemath_cublas_LIBRARY};${JetsonPI_sycl_LIBRARY};${JetsonPI_imf_LIBRARY};${JetsonPI_svml_LIBRARY};${JetsonPI_intlc_LIBRARY};CUDA::cublas;CUDA::cuda_driver")
+  endif()
   _jetsonpi_import_target(JetsonPI::ggml        JetsonPI_ggml_LIBRARY        "${_ggml_deps}")
   _jetsonpi_import_target(JetsonPI::llama       JetsonPI_llama_LIBRARY       "JetsonPI::ggml")
   _jetsonpi_import_target(JetsonPI::mtmd        JetsonPI_mtmd_LIBRARY        "JetsonPI::llama;JetsonPI::ggml")
@@ -182,10 +249,15 @@ if (JetsonPI_FOUND)
   endforeach()
   list(REMOVE_DUPLICATES JetsonPI_LIBRARY_DIRS)
 
-  message(STATUS "Jetson-PI found (module mode): ${JetsonPI_INCLUDE_DIR}")
+  if(JetsonPI_BACKEND_DL)
+    message(STATUS
+      "Jetson-PI found (module mode, dynamic GGML backends in ${JetsonPI_BACKEND_DIR}): ${JetsonPI_INCLUDE_DIR}")
+  else()
+    message(STATUS "Jetson-PI found (module mode): ${JetsonPI_INCLUDE_DIR}")
+  endif()
 endif()
 
-mark_as_advanced(JetsonPI_INCLUDE_DIR
+mark_as_advanced(JetsonPI_INCLUDE_DIR JetsonPI_BACKEND_DIR
   JetsonPI_pi0_LIBRARY JetsonPI_llm_LIBRARY JetsonPI_mllm_LIBRARY
   JetsonPI_mtmd_LIBRARY JetsonPI_llama_LIBRARY
   JetsonPI_ggml_LIBRARY JetsonPI_ggml_base_LIBRARY
