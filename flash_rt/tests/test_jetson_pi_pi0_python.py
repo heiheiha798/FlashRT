@@ -104,8 +104,10 @@ def main():
     check(np.array_equal(actions_view, actions),
           "actions host SWAP view matches copied output")
     dlpack_actions = np.from_dlpack(actions_view)
-    check(np.array_equal(dlpack_actions, actions),
-          "actions host SWAP view exports DLPack")
+    check(not dlpack_actions.flags.writeable and
+          dlpack_actions.ctypes.data == actions_view.ctypes.data and
+          np.array_equal(dlpack_actions, actions),
+          "NumPy consumes actions DLPack zero-copy and read-only")
     actions_view.close()
     try:
         model._pipe.set_prompt(prompt)
@@ -116,7 +118,25 @@ def main():
               "live DLPack consumer retains its host mapping")
     del dlpack_actions
 
+    try:
+        import torch
+    except ImportError:
+        print("SKIP - PyTorch DLPack legacy-protocol rejection check")
+        torch_legacy_checked = False
+    else:
+        torch_legacy_checked = True
+        torch_view = model._pipe.action_view()
+        try:
+            torch.from_dlpack(torch_view)
+            check(False, "PyTorch legacy DLPack cannot erase read-only access")
+        except BufferError as exc:
+            check("readonly" in str(exc),
+                  "PyTorch legacy DLPack cannot erase read-only access")
+        torch_view.close()
+
     model._pipe.context({"images": [image, wrist], "state": state})
+    if torch_legacy_checked:
+        check(True, "failed legacy DLPack export releases its host mapping")
     split_actions = model._pipe.action()
     check(np.array_equal(split_actions, actions),
           "context/action stages are bit-identical to predict")

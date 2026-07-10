@@ -166,13 +166,19 @@ model._pipe.set_prompt("put the mug on the plate")
 model._pipe.context({"images": [image, wrist_image], "state": robot_state})
 actions = model._pipe.action()
 
-# Read-only zero-copy host SWAP view over the latest action chunk. NumPy's
-# native DLPack protocol lets torch/jax consume the same storage.
+# Read-only zero-copy host SWAP view over the latest action chunk. Versioned
+# DLPack consumers retain the provider's read-only access contract.
 actions_view = model._pipe.action_view()
-torch_actions = torch.from_dlpack(actions_view)
+numpy_actions = np.from_dlpack(actions_view)
 actions_view.close()  # DLPack consumer keeps its own map alive
-del torch_actions     # required before replacing inputs or running a stage
+del numpy_actions     # required before replacing inputs or running a stage
 ```
+
+The Python smoke test verifies NumPy's versioned DLPack path is zero-copy,
+read-only, and keeps the mapping live. PyTorch 2.6 requests the legacy DLPack
+protocol, which cannot signal read-only storage; that export is intentionally
+rejected instead of exposing a writable tensor over provider-owned actions.
+No implicit copy fallback is installed.
 
 The Pi0 runtime exposes callback stages `infer`, `context`, and `action`, with
 an explicit `context -> action` dependency. `infer` remains the compatibility
