@@ -304,11 +304,23 @@ fe = flash_rt.load_model(
 
 text = fe.generate("What is 2 plus 2? The answer is")
 # text: str, the generated completion (no chat template applied by the engine)
+
+# Host-driven KV-cache session. prefill accepts exactly one of prompt/tokens.
+logits = fe.prefill("What is 2 plus 2? The answer is")
+step = fe.decode()  # {"token": int, "is_eog": bool, "text": accumulated str}
+logits = fe.get_logits()
+fe.reset()
+logits = fe.prefill(tokens=[151644, 198])  # caller-owned int32 token IDs
 ```
 
 The returned object is an `LlmJetsonPiFrontend` (not a `VLAModel` — LLMs are
 not VLA). `fe.infer({"prompt": ...})` returns `{"text": ...}` for callers that
 want a dict-shaped interface.
+
+The provider runtime exposes callback stages `infer`, `reset`, `prefill`, and
+repeatable `decode`, with STAGED `prompt`, optional `tokens`, `next_token`,
+`logits`, `is_eog`, and accumulated `text` ports. KV state and sampling remain
+provider-private.
 
 ### Run the LLM smoke test
 
@@ -340,6 +352,10 @@ fe = flash_rt.load_model(
     temp=0.0, top_k=0, top_p=0.0, seed=1, max_tokens=64,
     lib_path=None,            # auto-discover, or set FLASHRT_MLLM_LIB
 )
+
+logits = fe.prefill([image], "Describe this image.")
+step = fe.decode()
+fe.reset()
 
 text = fe.generate(
     [image_rgb_224x224],      # list of HxWx3 uint8 numpy (may be empty for text-only)

@@ -1,6 +1,7 @@
 #include "flashrt/providers/llama_cpp/c_api.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -107,7 +108,7 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
         !config->action_steps || !config->action_dim) {
         return -1;
     }
-    if (!engine || engine->struct_size < sizeof(frt_llama_cpp_engine_v1) ||
+    if (!engine || engine->struct_size < FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE ||
         !engine->self || !engine->set_input || !engine->run_infer ||
         !engine->get_output || !engine->last_error ||
         static_cast<bool>(engine->retain) !=
@@ -117,7 +118,8 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
 
     auto* owner = new (std::nothrow) RuntimeOwner();
     if (!owner) return -5;
-    owner->engine = *engine;
+    std::memcpy(&owner->engine, engine,
+                std::min<size_t>(engine->struct_size, sizeof(owner->engine)));
     if (owner->engine.retain) owner->engine.retain(owner->engine.self);
 
     owner->image_shape[0] = static_cast<int64_t>(config->n_views);
@@ -395,7 +397,7 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
     if (rc != 0) {
         return rc;
     }
-    if (engine.struct_size < sizeof(frt_llama_cpp_engine_v1) ||
+    if (engine.struct_size < FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE ||
         !engine.self || !engine.retain || !engine.release ||
         !engine.set_input || !engine.run_infer || !engine.get_output ||
         !engine.last_error) {

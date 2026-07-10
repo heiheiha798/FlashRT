@@ -7,6 +7,7 @@
 
 #include "flashrt/providers/llama_cpp/c_api.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -20,6 +21,11 @@ struct RuntimeOwner {
     std::string last_error;
     int64_t prompt_shape[1] = {-1};   // variable-length UTF-8
     int64_t text_shape[1] = {-1};     // variable-length UTF-8 output
+    int64_t token_shape[1] = {1};
+    int64_t eog_shape[1] = {1};
+    int64_t logits_shape[1] = {-1};
+    int64_t tokens_shape[1] = {-1};
+    bool staged_decode = false;
 };
 
 int unsupported_prepare(void* self, uint32_t, frt_shape_key) {
@@ -65,11 +71,18 @@ int run_stage(void* self, uint32_t stage, int stream) {
     (void)stream;
     auto* owner = static_cast<RuntimeOwner*>(self);
     if (!owner) return -1;
-    if (stage != FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER) {
-        owner->last_error = "unknown llama_cpp LLM stage";
+    int rc = 0;
+    if (stage == FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER) {
+        rc = owner->engine.run_infer(owner->engine.self);
+    } else if (owner->staged_decode && owner->engine.run_stage &&
+               (stage == FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET ||
+                stage == FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL ||
+                stage == FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE)) {
+        rc = owner->engine.run_stage(owner->engine.self, stage);
+    } else {
+        owner->last_error = "unknown or unsupported llama_cpp LLM stage";
         return -1;
     }
-    const int rc = owner->engine.run_infer(owner->engine.self);
     if (rc != 0) {
         owner->last_error = engine_error(owner);
     } else {
@@ -108,7 +121,7 @@ extern "C" int frt_llama_cpp_llm_runtime_create_with_engine(
         !config->backend || !config->backend[0]) {
         return -1;
     }
-    if (!engine || engine->struct_size < sizeof(frt_llama_cpp_engine_v1) ||
+    if (!engine || engine->struct_size < FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE ||
         !engine->self || !engine->set_input || !engine->run_infer ||
         !engine->get_output || !engine->last_error ||
         static_cast<bool>(engine->retain) !=
@@ -118,7 +131,11 @@ extern "C" int frt_llama_cpp_llm_runtime_create_with_engine(
 
     auto* owner = new (std::nothrow) RuntimeOwner();
     if (!owner) return -5;
-    owner->engine = *engine;
+    std::memcpy(&owner->engine, engine,
+                std::min<size_t>(engine->struct_size, sizeof(owner->engine)));
+    owner->staged_decode =
+        engine->struct_size >= sizeof(frt_llama_cpp_engine_v1) &&
+        owner->engine.run_stage;
     if (owner->engine.retain) owner->engine.retain(owner->engine.self);
 
     frt_runtime_builder b = frt_runtime_builder_create_provider_owned();
@@ -138,10 +155,52 @@ extern "C" int frt_llama_cpp_llm_runtime_create_with_engine(
         nullptr, 0, 0);
     rc |= frt_runtime_builder_add_callback_stage_v2(
         b, "infer", 0, nullptr, 0);
+    if (owner->staged_decode) {
+        rc |= frt_runtime_builder_add_port(
+            b, "next_token", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_I32,
+            FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0,
+            owner->token_shape, 1, 0, nullptr, 0, 0);
+        rc |= frt_runtime_builder_add_port(
+            b, "logits", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_F32,
+            FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0,
+            owner->logits_shape, 1, 0, nullptr, 0, 0);
+        rc |= frt_runtime_builder_add_port(
+            b, "is_eog", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_I32,
+            FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0,
+            owner->eog_shape, 1, 0, nullptr, 0, 0);
+        rc |= frt_runtime_builder_add_port(
+            b, "tokens", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_I32,
+            FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 0,
+            owner->tokens_shape, 1, 0, nullptr, 0, 0);
+        rc |= frt_runtime_builder_add_callback_stage_v2(
+            b, "reset", 0, nullptr, 0);
+        const uint32_t prefill_after[1] = {
+            FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET};
+        rc |= frt_runtime_builder_add_callback_stage_v2(
+            b, "prefill", 0, prefill_after, 1);
+        const uint32_t decode_after[1] = {
+            FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL};
+        rc |= frt_runtime_builder_add_callback_stage_v2(
+            b, "decode", 0, decode_after, 1);
+    }
     rc |= frt_runtime_builder_add_identity(b, "provider", "llama_cpp");
     rc |= frt_runtime_builder_add_identity(b, "model_family", "llm");
     rc |= frt_runtime_builder_add_identity(b, "model_path", config->model_path);
     rc |= frt_runtime_builder_add_identity(b, "backend", config->backend);
+    rc |= frt_runtime_builder_add_identity(
+        b, "n_ctx", std::to_string(config->n_ctx).c_str());
+    rc |= frt_runtime_builder_add_identity(
+        b, "n_threads", std::to_string(config->n_threads).c_str());
+    rc |= frt_runtime_builder_add_identity(
+        b, "temp", std::to_string(config->temp).c_str());
+    rc |= frt_runtime_builder_add_identity(
+        b, "top_k", std::to_string(config->top_k).c_str());
+    rc |= frt_runtime_builder_add_identity(
+        b, "top_p", std::to_string(config->top_p).c_str());
+    rc |= frt_runtime_builder_add_identity(
+        b, "seed", std::to_string(config->seed).c_str());
+    rc |= frt_runtime_builder_add_identity(
+        b, "max_tokens", std::to_string(config->max_tokens).c_str());
     if (rc != 0) {
         frt_runtime_builder_discard(b);
         destroy_owner(owner);
@@ -403,7 +462,7 @@ extern "C" int frt_llama_cpp_llm_runtime_open_with_engine_factory(
     if (rc != 0) {
         return rc;
     }
-    if (engine.struct_size < sizeof(frt_llama_cpp_engine_v1) ||
+    if (engine.struct_size < FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE ||
         !engine.self || !engine.retain || !engine.release ||
         !engine.set_input || !engine.run_infer || !engine.get_output ||
         !engine.last_error) {

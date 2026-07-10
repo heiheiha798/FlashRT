@@ -52,7 +52,7 @@ def main():
         top_k=0,
         top_p=0.0,
         seed=1,
-        max_tokens=64,
+        max_tokens=16,
         lib_path=os.environ.get("FLASHRT_MLLM_LIB"))
 
     red_image = np.zeros((224, 224, 3), dtype=np.uint8)
@@ -74,6 +74,22 @@ def main():
     if isinstance(text, str) and text:
         printable = any(0x20 <= ord(c) < 0x7f for c in text)
         check(printable, "generated text contains printable chars")
+
+    prompt = "Describe this image in one sentence."
+    fe.reset()
+    logits = fe.prefill([red_image], prompt)
+    check(logits.ndim == 1 and logits.size > 0,
+          "prefill returns a non-empty logits vector")
+    check(bool(np.isfinite(logits).all()), "prefill logits are finite")
+    step = None
+    for _ in range(16):
+        step = fe.decode()
+        check(isinstance(step["token"], int), "decode returns token id")
+        check(isinstance(step["is_eog"], bool), "decode returns EOG flag")
+        if step["is_eog"]:
+            break
+    check(step is not None and step["text"] == text,
+          "host-driven decode text matches one-shot generate")
 
     del fe
 

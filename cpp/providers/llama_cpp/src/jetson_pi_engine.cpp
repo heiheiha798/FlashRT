@@ -356,7 +356,12 @@ struct LlmEngine {
     uint32_t max_tokens = 0;
 
     std::string prompt;            // set_input(PROMPT) stash
+    std::vector<int32_t> tokens;
     std::string text_buf;          // run_infer output, get_output(TEXT) source
+    std::vector<float> logits_buf;
+    int32_t next_token = 0;
+    int32_t is_eog = 0;
+    bool next_token_ready = false;
     bool prompt_set = false;
 
     std::string last_error;
@@ -365,6 +370,8 @@ struct LlmEngine {
     void set_error(const std::string & m) { last_error = m; }
     void clear_error() { last_error.clear(); }
 };
+
+int llm_engine_run_infer(void * self);
 
 void llm_engine_retain(void * self) {
     static_cast<LlmEngine*>(self)->refs.fetch_add(1, std::memory_order_relaxed);
@@ -383,19 +390,130 @@ int llm_engine_set_input(void * self, uint32_t port, const void * data,
     LlmEngine * e = static_cast<LlmEngine*>(self);
     if (!e) return -1;
     e->clear_error();
-    if (port != FRT_LLAMA_CPP_LLM_PORT_PROMPT) {
-        e->set_error("llm engine only accepts the prompt input port");
+    if (port == FRT_LLAMA_CPP_LLM_PORT_PROMPT) {
+        if (!data || bytes == 0) {
+            e->set_error("empty prompt");
+            return -1;
+        }
+        e->prompt.assign(static_cast<const char*>(data), bytes);
+        e->tokens.clear();
+        e->prompt_set = true;
+    } else if (port == FRT_LLAMA_CPP_LLM_PORT_TOKENS) {
+        if (!data || bytes == 0 || bytes % sizeof(int32_t) != 0) {
+            e->set_error("tokens payload must be a non-empty int32 array");
+            return -1;
+        }
+        const auto * begin = static_cast<const int32_t*>(data);
+        e->tokens.assign(begin, begin + bytes / sizeof(int32_t));
+        e->prompt.clear();
+        e->prompt_set = true;
+    } else {
+        e->set_error("unknown llm input port");
         return -1;
     }
-    if (!data || bytes == 0) {
-        e->set_error("empty prompt");
-        return -1;
-    }
-    e->prompt.assign(static_cast<const char*>(data), bytes);
-    e->prompt_set = true;
     // New input invalidates any previous output.
     e->text_buf.clear();
+    e->logits_buf.clear();
+    e->next_token_ready = false;
     return 0;
+}
+
+int llm_engine_refresh_logits(LlmEngine * e) {
+    size_t n_logits = 0;
+    int32_t s = jetson_pi_llm_get_logits(e->llm, nullptr, 0, &n_logits);
+    if (s != JETSON_PI_LLM_BUFFER_TOO_SMALL || n_logits == 0) {
+        e->set_error(std::string("jetson_pi_llm_get_logits size query failed: ") +
+                     jetson_pi_llm_last_error(e->llm));
+        return -8;
+    }
+    e->logits_buf.resize(n_logits);
+    s = jetson_pi_llm_get_logits(e->llm, e->logits_buf.data(),
+                                 e->logits_buf.size(), &n_logits);
+    if (s != JETSON_PI_LLM_OK) {
+        e->logits_buf.clear();
+        e->set_error(std::string("jetson_pi_llm_get_logits failed: ") +
+                     jetson_pi_llm_last_error(e->llm));
+        return -8;
+    }
+    return 0;
+}
+
+int llm_engine_run_stage(void * self, uint32_t stage) {
+    LlmEngine * e = static_cast<LlmEngine*>(self);
+    if (!e) return -1;
+    e->clear_error();
+    if (stage == FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER) {
+        return llm_engine_run_infer(self);
+    }
+    if (stage == FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET) {
+        const int32_t s = jetson_pi_llm_reset(e->llm);
+        if (s != JETSON_PI_LLM_OK) {
+            e->set_error(std::string("jetson_pi_llm_reset failed: ") +
+                         jetson_pi_llm_last_error(e->llm));
+            return -8;
+        }
+        e->text_buf.clear();
+        e->logits_buf.clear();
+        e->next_token_ready = false;
+        return 0;
+    }
+    if (stage == FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL) {
+        if (!e->prompt_set) {
+            e->set_error("prefill requires prompt to be set");
+            return -1;
+        }
+        const int32_t s = e->tokens.empty()
+            ? jetson_pi_llm_prefill(e->llm, e->prompt.data(), e->prompt.size())
+            : jetson_pi_llm_prefill_tokens(e->llm, e->tokens.data(),
+                                           e->tokens.size());
+        if (s != JETSON_PI_LLM_OK) {
+            e->set_error(std::string("jetson_pi_llm_prefill failed: ") +
+                         jetson_pi_llm_last_error(e->llm));
+            return -8;
+        }
+        e->text_buf.clear();
+        e->next_token_ready = false;
+        return llm_engine_refresh_logits(e);
+    }
+    if (stage == FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE) {
+        int32_t is_eog = 0;
+        const int32_t s = jetson_pi_llm_decode_step(
+            e->llm, &e->next_token, &is_eog);
+        if (s != JETSON_PI_LLM_OK) {
+            e->set_error(std::string("jetson_pi_llm_decode_step failed: ") +
+                         jetson_pi_llm_last_error(e->llm));
+            return -8;
+        }
+        e->next_token_ready = true;
+        e->is_eog = is_eog;
+        e->logits_buf.clear();
+        if (!is_eog) {
+            size_t piece_size = 0;
+            int32_t piece_status = jetson_pi_llm_token_to_piece(
+                e->llm, e->next_token, nullptr, 0, &piece_size);
+            if (piece_status != JETSON_PI_LLM_BUFFER_TOO_SMALL) {
+                e->set_error(std::string("token piece size query failed: ") +
+                             jetson_pi_llm_last_error(e->llm));
+                return -8;
+            }
+            if (piece_size == 0) return llm_engine_refresh_logits(e);
+            const size_t old_size = e->text_buf.size();
+            e->text_buf.resize(old_size + piece_size);
+            piece_status = jetson_pi_llm_token_to_piece(
+                e->llm, e->next_token, e->text_buf.data() + old_size,
+                piece_size, &piece_size);
+            if (piece_status != JETSON_PI_LLM_OK) {
+                e->text_buf.resize(old_size);
+                e->set_error(std::string("token_to_piece failed: ") +
+                             jetson_pi_llm_last_error(e->llm));
+                return -8;
+            }
+            return llm_engine_refresh_logits(e);
+        }
+        return 0;
+    }
+    e->set_error("unknown llm engine stage");
+    return -1;
 }
 
 int llm_engine_run_infer(void * self) {
@@ -422,6 +540,8 @@ int llm_engine_run_infer(void * self) {
         return -8;
     }
     e->text_buf.resize(written);
+    e->logits_buf.clear();
+    e->next_token_ready = false;
     return 0;
 }
 
@@ -431,12 +551,52 @@ int llm_engine_get_output(void * self, uint32_t port, void * out,
     LlmEngine * e = static_cast<LlmEngine*>(self);
     if (!e) return -1;
     e->clear_error();
-    if (port != FRT_LLAMA_CPP_LLM_PORT_TEXT) {
-        e->set_error("llm engine only exports the text output port");
-        return -1;
-    }
     if (!written) {
         e->set_error("get_output requires written");
+        return -1;
+    }
+    if (port == FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN) {
+        *written = sizeof(e->next_token);
+        if (!e->next_token_ready) {
+            e->set_error("next token not ready");
+            return -7;
+        }
+        if (!out || capacity < sizeof(e->next_token)) {
+            e->set_error("next token output buffer too small");
+            return -5;
+        }
+        std::memcpy(out, &e->next_token, sizeof(e->next_token));
+        return 0;
+    }
+    if (port == FRT_LLAMA_CPP_LLM_PORT_IS_EOG) {
+        *written = sizeof(e->is_eog);
+        if (!e->next_token_ready) {
+            e->set_error("is_eog not ready");
+            return -7;
+        }
+        if (!out || capacity < sizeof(e->is_eog)) {
+            e->set_error("is_eog output buffer too small");
+            return -5;
+        }
+        std::memcpy(out, &e->is_eog, sizeof(e->is_eog));
+        return 0;
+    }
+    if (port == FRT_LLAMA_CPP_LLM_PORT_LOGITS) {
+        const uint64_t need = e->logits_buf.size() * sizeof(float);
+        *written = need;
+        if (need == 0) {
+            e->set_error("logits not ready");
+            return -7;
+        }
+        if (!out || capacity < need) {
+            e->set_error("logits output buffer too small");
+            return -5;
+        }
+        std::memcpy(out, e->logits_buf.data(), need);
+        return 0;
+    }
+    if (port != FRT_LLAMA_CPP_LLM_PORT_TEXT) {
+        e->set_error("unknown llm output port");
         return -1;
     }
     const uint64_t need = e->text_buf.size();
@@ -479,6 +639,10 @@ struct MllmEngine {
     uint32_t image_width = 0;
     std::string prompt;
     std::string text_buf;
+    std::vector<float> logits_buf;
+    int32_t next_token = 0;
+    int32_t is_eog = 0;
+    bool next_token_ready = false;
     bool images_set = false;
     bool prompt_set = false;
 
@@ -488,6 +652,8 @@ struct MllmEngine {
     void set_error(const std::string & m) { last_error = m; }
     void clear_error() { last_error.clear(); }
 };
+
+int mllm_engine_run_infer(void * self);
 
 void mllm_engine_retain(void * self) {
     static_cast<MllmEngine*>(self)->refs.fetch_add(1, std::memory_order_relaxed);
@@ -520,6 +686,8 @@ int mllm_engine_set_input(void * self, uint32_t port, const void * data,
                 e->n_images = 0;
                 e->images_set = true;
                 e->text_buf.clear();
+                e->logits_buf.clear();
+                e->next_token_ready = false;
                 return 0;
             }
             const auto * views = static_cast<const frt_image_view*>(data);
@@ -550,6 +718,8 @@ int mllm_engine_set_input(void * self, uint32_t port, const void * data,
             e->image_width = w;
             e->images_set = true;
             e->text_buf.clear();
+            e->logits_buf.clear();
+            e->next_token_ready = false;
             return 0;
         }
         case FRT_LLAMA_CPP_MLLM_PORT_PROMPT: {
@@ -560,6 +730,8 @@ int mllm_engine_set_input(void * self, uint32_t port, const void * data,
             e->prompt.assign(static_cast<const char*>(data), bytes);
             e->prompt_set = true;
             e->text_buf.clear();
+            e->logits_buf.clear();
+            e->next_token_ready = false;
             return 0;
         }
         case FRT_LLAMA_CPP_MLLM_PORT_TEXT:
@@ -567,6 +739,103 @@ int mllm_engine_set_input(void * self, uint32_t port, const void * data,
             e->set_error("unknown/invalid mllm input port");
             return -1;
     }
+}
+
+int mllm_engine_refresh_logits(MllmEngine * e) {
+    size_t n_logits = 0;
+    int32_t s = jetson_pi_mllm_get_logits(e->mllm, nullptr, 0, &n_logits);
+    if (s != JETSON_PI_MLLM_BUFFER_TOO_SMALL || n_logits == 0) {
+        e->set_error(std::string("jetson_pi_mllm_get_logits size query failed: ") +
+                     jetson_pi_mllm_last_error(e->mllm));
+        return -8;
+    }
+    e->logits_buf.resize(n_logits);
+    s = jetson_pi_mllm_get_logits(e->mllm, e->logits_buf.data(),
+                                  e->logits_buf.size(), &n_logits);
+    if (s != JETSON_PI_MLLM_OK) {
+        e->logits_buf.clear();
+        e->set_error(std::string("jetson_pi_mllm_get_logits failed: ") +
+                     jetson_pi_mllm_last_error(e->mllm));
+        return -8;
+    }
+    return 0;
+}
+
+int mllm_engine_run_stage(void * self, uint32_t stage) {
+    MllmEngine * e = static_cast<MllmEngine*>(self);
+    if (!e) return -1;
+    e->clear_error();
+    if (stage == FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER) {
+        return mllm_engine_run_infer(self);
+    }
+    if (stage == FRT_LLAMA_CPP_MLLM_STAGE_INDEX_RESET) {
+        const int32_t s = jetson_pi_mllm_reset(e->mllm);
+        if (s != JETSON_PI_MLLM_OK) {
+            e->set_error(std::string("jetson_pi_mllm_reset failed: ") +
+                         jetson_pi_mllm_last_error(e->mllm));
+            return -8;
+        }
+        e->text_buf.clear();
+        e->logits_buf.clear();
+        e->next_token_ready = false;
+        return 0;
+    }
+    if (stage == FRT_LLAMA_CPP_MLLM_STAGE_INDEX_PREFILL) {
+        if (!e->images_set || !e->prompt_set) {
+            e->set_error("prefill requires images and prompt to be set");
+            return -1;
+        }
+        const int32_t s = jetson_pi_mllm_prefill(
+            e->mllm, e->image_ptrs.data(), e->n_images,
+            e->image_height, e->image_width,
+            e->prompt.data(), e->prompt.size());
+        if (s != JETSON_PI_MLLM_OK) {
+            e->set_error(std::string("jetson_pi_mllm_prefill failed: ") +
+                         jetson_pi_mllm_last_error(e->mllm));
+            return -8;
+        }
+        e->text_buf.clear();
+        e->next_token_ready = false;
+        return mllm_engine_refresh_logits(e);
+    }
+    if (stage == FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE) {
+        int32_t is_eog = 0;
+        const int32_t s = jetson_pi_mllm_decode_step(
+            e->mllm, &e->next_token, &is_eog);
+        if (s != JETSON_PI_MLLM_OK) {
+            e->set_error(std::string("jetson_pi_mllm_decode_step failed: ") +
+                         jetson_pi_mllm_last_error(e->mllm));
+            return -8;
+        }
+        e->next_token_ready = true;
+        e->is_eog = is_eog;
+        e->logits_buf.clear();
+        if (is_eog) return 0;
+        size_t piece_size = 0;
+        int32_t piece_status = jetson_pi_mllm_token_to_piece(
+            e->mllm, e->next_token, nullptr, 0, &piece_size);
+        if (piece_status != JETSON_PI_MLLM_BUFFER_TOO_SMALL) {
+            e->set_error(std::string("token piece size query failed: ") +
+                         jetson_pi_mllm_last_error(e->mllm));
+            return -8;
+        }
+        if (piece_size > 0) {
+            const size_t old_size = e->text_buf.size();
+            e->text_buf.resize(old_size + piece_size);
+            piece_status = jetson_pi_mllm_token_to_piece(
+                e->mllm, e->next_token, e->text_buf.data() + old_size,
+                piece_size, &piece_size);
+            if (piece_status != JETSON_PI_MLLM_OK) {
+                e->text_buf.resize(old_size);
+                e->set_error(std::string("token_to_piece failed: ") +
+                             jetson_pi_mllm_last_error(e->mllm));
+                return -8;
+            }
+        }
+        return mllm_engine_refresh_logits(e);
+    }
+    e->set_error("unknown mllm engine stage");
+    return -1;
 }
 
 int mllm_engine_run_infer(void * self) {
@@ -592,6 +861,8 @@ int mllm_engine_run_infer(void * self) {
         return -8;
     }
     e->text_buf.resize(written);
+    e->logits_buf.clear();
+    e->next_token_ready = false;
     return 0;
 }
 
@@ -601,12 +872,43 @@ int mllm_engine_get_output(void * self, uint32_t port, void * out,
     MllmEngine * e = static_cast<MllmEngine*>(self);
     if (!e) return -1;
     e->clear_error();
-    if (port != FRT_LLAMA_CPP_MLLM_PORT_TEXT) {
-        e->set_error("mllm engine only exports the text output port");
-        return -1;
-    }
     if (!written) {
         e->set_error("get_output requires written");
+        return -1;
+    }
+    if (port == FRT_LLAMA_CPP_MLLM_PORT_NEXT_TOKEN ||
+        port == FRT_LLAMA_CPP_MLLM_PORT_IS_EOG) {
+        if (!e->next_token_ready) {
+            e->set_error("decode output not ready");
+            return -7;
+        }
+        const uint64_t need = sizeof(int32_t);
+        *written = need;
+        if (!out || capacity < need) {
+            e->set_error("decode scalar output buffer too small");
+            return -5;
+        }
+        const int32_t value = port == FRT_LLAMA_CPP_MLLM_PORT_NEXT_TOKEN
+            ? e->next_token : e->is_eog;
+        std::memcpy(out, &value, need);
+        return 0;
+    }
+    if (port == FRT_LLAMA_CPP_MLLM_PORT_LOGITS) {
+        const uint64_t need = e->logits_buf.size() * sizeof(float);
+        *written = need;
+        if (need == 0) {
+            e->set_error("logits not ready");
+            return -7;
+        }
+        if (!out || capacity < need) {
+            e->set_error("logits output buffer too small");
+            return -5;
+        }
+        std::memcpy(out, e->logits_buf.data(), need);
+        return 0;
+    }
+    if (port != FRT_LLAMA_CPP_MLLM_PORT_TEXT) {
+        e->set_error("unknown mllm output port");
         return -1;
     }
     const uint64_t need = e->text_buf.size();
@@ -769,6 +1071,7 @@ frt_llama_cpp_default_engine_factory(void) {
             out->run_infer   = llm_engine_run_infer;
             out->get_output  = llm_engine_get_output;
             out->last_error  = llm_engine_last_error;
+            out->run_stage   = llm_engine_run_stage;
             return 0;
         };
         f.create_mllm = [](void * /*self*/,
@@ -824,6 +1127,7 @@ frt_llama_cpp_default_engine_factory(void) {
             out->run_infer   = mllm_engine_run_infer;
             out->get_output  = mllm_engine_get_output;
             out->last_error  = mllm_engine_last_error;
+            out->run_stage   = mllm_engine_run_stage;
             return 0;
         };
         f.last_error = [](void * /*self*/) -> const char * {
