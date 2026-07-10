@@ -16,6 +16,8 @@ Env:
 import os
 import sys
 
+import numpy as np
+
 
 def _skip(msg):
     print(f"SKIP - {msg}")
@@ -44,7 +46,7 @@ def main():
         top_k=0,
         top_p=0.0,
         seed=1,
-        max_tokens=64,
+        max_tokens=16,
         lib_path=os.environ.get("FLASHRT_LLM_LIB"))
 
     text = fe.generate("What is 2 plus 2? The answer is")
@@ -63,6 +65,26 @@ def main():
     if isinstance(text, str) and text:
         printable = any(0x20 <= ord(c) < 0x7f for c in text)
         check(printable, "generated text contains printable chars")
+
+    prompt = "What is 2 plus 2? The answer is"
+    fe.reset()
+    logits = fe.prefill(prompt)
+    check(logits.ndim == 1 and logits.size > 0,
+          "prefill returns a non-empty logits vector")
+    check(bool((logits == logits).all()), "prefill logits contain no NaN")
+    step = None
+    for _ in range(16):
+        step = fe.decode()
+        check(isinstance(step["token"], int), "decode returns token id")
+        check(isinstance(step["is_eog"], bool), "decode returns EOG flag")
+        if step["is_eog"]:
+            break
+    check(step is not None and step["text"] == text,
+          "host-driven decode text matches one-shot generate")
+
+    token_logits = fe.prefill(tokens=[0])
+    check(token_logits.shape == logits.shape and np.isfinite(token_logits).all(),
+          "optional int32 tokens input produces finite logits")
 
     del fe
 

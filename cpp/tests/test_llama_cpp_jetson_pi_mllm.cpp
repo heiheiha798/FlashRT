@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,8 @@ static int g_fail = 0;
 int main() {
     const char * model_env = std::getenv("FLASHRT_MLLM_MODEL");
     const char * mmproj_env = std::getenv("FLASHRT_MLLM_MMPROJ");
+    const char * backend_env = std::getenv("FLASHRT_MLLM_BACKEND");
+    const char * backend = (backend_env && *backend_env) ? backend_env : "cpu";
     auto file_exists = [](const char * path) {
         if (!path || !*path) return false;
         FILE * f = std::fopen(path, "rb");
@@ -60,9 +63,9 @@ int main() {
         "\"model_family\":\"mllm\","
         "\"model_path\":\"" + model_env + "\","
         "\"mmproj_path\":\"" + mmproj_env + "\","
-        "\"backend\":\"cpu\","
+        "\"backend\":\"" + std::string(backend) + "\","
         "\"n_ctx\":2048,\"n_threads\":0,"
-        "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,\"max_tokens\":64}";
+        "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,\"max_tokens\":16}";
     frt_model_runtime_v2 * model = nullptr;
     int rc = frt_llama_cpp_mllm_runtime_open_with_engine_factory(
         json.c_str(), factory, &model);
@@ -72,6 +75,14 @@ int main() {
         return 1;
     }
     CHECK(rc == 0 && model != nullptr, "open MLLM runtime from JSON");
+    CHECK(model->n_stages == 0 && model->n_stages_v2 == 4,
+          "MLLM runtime exposes infer/reset/prefill/decode callback stages");
+    CHECK(model->n_ports == 6,
+          "MLLM runtime exposes images/prompt/text/token/logits/eog ports");
+    CHECK(model->verbs_v2.get_output(
+              model->self, FRT_LLAMA_CPP_MLLM_PORT_LOGITS,
+              nullptr, 0, nullptr, -1) == -1,
+          "get_output rejects null written without crashing");
 
     // Generate a 224x224 solid-red RGB image inline (no stb_image_write dep).
     const int W = 224, H = 224;
@@ -109,7 +120,7 @@ int main() {
         std::printf("ok  : run_stage infer\n");
     }
 
-    const uint64_t cap = 64u * 8u;
+    const uint64_t cap = 16u * 8u;
     std::string text(cap, '\0');
     uint64_t written = 0;
     rc = model->verbs_v2.get_output(
@@ -125,6 +136,66 @@ int main() {
         }
         CHECK(printable, "generated text contains printable chars");
     }
+
+    rc = model->verbs_v2.run_stage(
+        model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_RESET, -1);
+    CHECK(rc == 0, "run_stage reset");
+    rc = model->verbs_v2.run_stage(
+        model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_PREFILL, -1);
+    CHECK(rc == 0, "run_stage prefill");
+
+    uint64_t logits_bytes = 0;
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_MLLM_PORT_LOGITS, nullptr, 0,
+        &logits_bytes, -1);
+    CHECK(rc == -5 && logits_bytes > 0 && logits_bytes % sizeof(float) == 0,
+          "prefill exposes logits size");
+    std::vector<float> logits(logits_bytes / sizeof(float));
+    uint64_t logits_written = 0;
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_MLLM_PORT_LOGITS, logits.data(),
+        logits_bytes, &logits_written, -1);
+    CHECK(rc == 0 && logits_written == logits_bytes,
+          "prefill get_output logits");
+    bool finite = true;
+    for (float value : logits) finite = finite && std::isfinite(value);
+    CHECK(finite, "prefill logits contain no NaN/Inf");
+
+    for (uint32_t i = 0; i < 16; ++i) {
+        rc = model->verbs_v2.run_stage(
+            model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE, -1);
+        CHECK(rc == 0, "run_stage decode");
+        int32_t token = 0;
+        int32_t is_eog = 0;
+        uint64_t scalar_written = 0;
+        rc = model->verbs_v2.get_output(
+            model->self, FRT_LLAMA_CPP_MLLM_PORT_NEXT_TOKEN, &token,
+            sizeof(token), &scalar_written, -1);
+        CHECK(rc == 0 && scalar_written == sizeof(token),
+              "decode exposes next_token");
+        rc = model->verbs_v2.get_output(
+            model->self, FRT_LLAMA_CPP_MLLM_PORT_IS_EOG, &is_eog,
+            sizeof(is_eog), &scalar_written, -1);
+        CHECK(rc == 0 && scalar_written == sizeof(is_eog),
+              "decode exposes is_eog");
+        if (is_eog) break;
+    }
+    std::string staged(cap, '\0');
+    written = 0;
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT, staged.data(), staged.size(),
+        &written, -1);
+    CHECK(rc == 0 && written > 0, "staged decode exposes accumulated text");
+    if (rc == 0) staged.resize(written);
+    CHECK(staged == text, "staged decode text matches one-shot infer");
+    rc = model->verbs_v2.run_stage(
+        model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER, -1);
+    CHECK(rc == 0, "one-shot infer after staged decode");
+    uint64_t stale_written = 0;
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_MLLM_PORT_NEXT_TOKEN, nullptr, 0,
+        &stale_written, -1);
+    CHECK(rc == -7, "one-shot infer invalidates staged token output");
 
     model->release(model->owner);
 

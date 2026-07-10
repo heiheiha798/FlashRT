@@ -30,7 +30,13 @@ from .pi0 import (
 PORT_IMAGES = 0
 PORT_PROMPT = 1
 PORT_TEXT = 2
+PORT_NEXT_TOKEN = 3
+PORT_LOGITS = 4
+PORT_IS_EOG = 5
 STAGE_INFER = 0
+STAGE_RESET = 1
+STAGE_PREFILL = 2
+STAGE_DECODE = 3
 
 
 class MllmJetsonPiFrontend:
@@ -168,6 +174,91 @@ class MllmJetsonPiFrontend:
                            ctypes.byref(written), -1)
         self._check(rc, "get_output text")
         return out.raw[:written.value].decode("utf-8", errors="replace")
+
+    def reset(self):
+        """Clear the current multimodal KV-cache and sampler state."""
+        if self._model is None:
+            raise RuntimeError("MllmJetsonPiFrontend is closed")
+        rc = self._model.verbs_v2.run_stage(
+            self._model.self, STAGE_RESET, -1)
+        self._check(rc, "run_stage reset")
+
+    def prefill(self, images, prompt):
+        """Encode images and prompt, returning first next-token logits."""
+        if self._model is None:
+            raise RuntimeError("MllmJetsonPiFrontend is closed")
+        v2 = self._model.verbs_v2
+        views = self._make_image_views(images)
+        rc = v2.set_input(self._model.self, PORT_IMAGES, ctypes.byref(views),
+                          ctypes.sizeof(views), -1)
+        self._check(rc, "set_input images")
+        if isinstance(prompt, str):
+            prompt_bytes = prompt.encode("utf-8")
+        else:
+            prompt_bytes = bytes(prompt)
+        rc = v2.set_input(self._model.self, PORT_PROMPT, prompt_bytes,
+                          len(prompt_bytes), -1)
+        self._check(rc, "set_input prompt")
+        rc = v2.run_stage(self._model.self, STAGE_PREFILL, -1)
+        self._check(rc, "run_stage prefill")
+        return self.get_logits()
+
+    def decode(self):
+        """Sample and decode one token from the current multimodal session."""
+        if self._model is None:
+            raise RuntimeError("MllmJetsonPiFrontend is closed")
+        v2 = self._model.verbs_v2
+        rc = v2.run_stage(self._model.self, STAGE_DECODE, -1)
+        self._check(rc, "run_stage decode")
+        next_token = ctypes.c_int32()
+        written = ctypes.c_uint64(0)
+        rc = v2.get_output(
+            self._model.self, PORT_NEXT_TOKEN, ctypes.byref(next_token),
+            ctypes.sizeof(next_token), ctypes.byref(written), -1)
+        self._check(rc, "get_output next_token")
+        is_eog = ctypes.c_int32()
+        written = ctypes.c_uint64(0)
+        rc = v2.get_output(
+            self._model.self, PORT_IS_EOG, ctypes.byref(is_eog),
+            ctypes.sizeof(is_eog), ctypes.byref(written), -1)
+        self._check(rc, "get_output is_eog")
+        cap = self.max_tokens * 8
+        out = (ctypes.c_char * cap)()
+        written = ctypes.c_uint64(0)
+        rc = v2.get_output(self._model.self, PORT_TEXT, out, cap,
+                           ctypes.byref(written), -1)
+        self._check(rc, "get_output text")
+        return {
+            "token": int(next_token.value),
+            "is_eog": bool(is_eog.value),
+            "text": out.raw[:written.value].decode("utf-8", errors="replace"),
+        }
+
+    def get_logits(self):
+        """Copy current next-token logits into a NumPy float32 array."""
+        if self._model is None:
+            raise RuntimeError("MllmJetsonPiFrontend is closed")
+        v2 = self._model.verbs_v2
+        required = ctypes.c_uint64(0)
+        rc = v2.get_output(self._model.self, PORT_LOGITS, None, 0,
+                           ctypes.byref(required), -1)
+        if rc != -5 or required.value == 0:
+            self._check(rc, "query logits size")
+            raise RuntimeError("query logits size returned no bytes")
+        if required.value % np.dtype(np.float32).itemsize != 0:
+            raise RuntimeError(
+                f"logits byte size {required.value} is not float32-aligned")
+        logits = np.empty(
+            required.value // np.dtype(np.float32).itemsize, dtype=np.float32)
+        written = ctypes.c_uint64(0)
+        rc = v2.get_output(self._model.self, PORT_LOGITS, logits.ctypes.data,
+                           logits.nbytes, ctypes.byref(written), -1)
+        self._check(rc, "get_output logits")
+        if written.value != logits.nbytes:
+            raise RuntimeError(
+                f"get_output logits wrote {written.value} bytes, expected "
+                f"{logits.nbytes}")
+        return logits
 
     def infer(self, observation, debug=False):
         """VLAModel-predict-parity entry.

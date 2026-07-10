@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <string>
+#include <vector>
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
@@ -22,6 +24,8 @@ int main() {
         std::printf("SKIP - FLASHRT_LLM_MODEL not set or file missing\n");
         return 0;
     }
+    const char * backend_env = std::getenv("FLASHRT_LLM_BACKEND");
+    const std::string backend = backend_env && *backend_env ? backend_env : "cpu";
 
     const frt_llama_cpp_engine_factory_v1 * factory =
         frt_llama_cpp_default_engine_factory();
@@ -46,9 +50,9 @@ int main() {
         std::string("{") +
         "\"model_family\":\"llm\","
         "\"model_path\":\"" + model_env + "\","
-        "\"backend\":\"cpu\","
+        "\"backend\":\"" + backend + "\","
         "\"n_ctx\":2048,\"n_threads\":0,"
-        "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,\"max_tokens\":64}";
+        "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,\"max_tokens\":16}";
     frt_model_runtime_v2 * model = nullptr;
     int rc = frt_llama_cpp_llm_runtime_open_with_engine_factory(
         json.c_str(), factory, &model);
@@ -58,6 +62,20 @@ int main() {
         return 1;
     }
     CHECK(rc == 0 && model != nullptr, "open LLM runtime from JSON");
+    std::printf("    runtime stages (%llu):",
+                static_cast<unsigned long long>(model->n_stages_v2));
+    for (uint64_t i = 0; i < model->n_stages_v2; ++i) {
+        std::printf(" %s", model->stages_v2[i].name);
+    }
+    std::printf("\n");
+    CHECK(model->n_stages == 0 && model->n_stages_v2 == 4,
+          "LLM runtime exposes infer/reset/prefill/decode callback stages");
+    CHECK(model->n_ports == 6,
+          "LLM runtime exposes prompt/text/token/logits/eog/tokens ports");
+    CHECK(model->verbs_v2.get_output(
+              model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS,
+              nullptr, 0, nullptr, -1) == -1,
+          "get_output rejects null written without crashing");
 
     rc = model->verbs_v2.set_input(model->self,
                                    FRT_LLAMA_CPP_LLM_PORT_PROMPT,
@@ -78,7 +96,7 @@ int main() {
     // reports the worst-case max_tokens*8 on size-query, so a size-query
     // first would force an oversized alloc). Allocate worst-case, read,
     // then trim.
-    const uint64_t cap = 64u * 8u;  // max_tokens(64) * 8 worst-case bytes
+    const uint64_t cap = 16u * 8u;  // max_tokens(16) * 8 worst-case bytes
     std::string text(cap, '\0');
     uint64_t written = 0;
     rc = model->verbs_v2.get_output(
@@ -95,6 +113,64 @@ int main() {
         }
         CHECK(printable, "generated text contains printable chars");
     }
+
+    CHECK(model->verbs_v2.run_stage(
+              model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0,
+          "run_stage reset");
+    CHECK(model->verbs_v2.run_stage(
+              model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0,
+          "run_stage prefill");
+    uint64_t logits_bytes = 0;
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS, nullptr, 0,
+        &logits_bytes, -1);
+    CHECK(rc != 0 && logits_bytes > 1000 * sizeof(float),
+          "prefill exposes logits size");
+    std::vector<float> logits(logits_bytes / sizeof(float));
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS, logits.data(),
+        logits_bytes, &logits_bytes, -1);
+    CHECK(rc == 0, "prefill get_output logits");
+    bool finite_logits = true;
+    for (float value : logits) finite_logits &= std::isfinite(value);
+    CHECK(finite_logits, "prefill logits contain no NaN/Inf");
+
+    std::string staged_text;
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK(model->verbs_v2.run_stage(
+                  model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0,
+              "run_stage decode");
+        int32_t token = 0;
+        int32_t is_eog = 0;
+        uint64_t scalar_bytes = 0;
+        CHECK(model->verbs_v2.get_output(
+                  model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN, &token,
+                  sizeof(token), &scalar_bytes, -1) == 0 &&
+                  scalar_bytes == sizeof(token),
+              "decode exposes next_token");
+        CHECK(model->verbs_v2.get_output(
+                  model->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG, &is_eog,
+                  sizeof(is_eog), &scalar_bytes, -1) == 0 &&
+                  scalar_bytes == sizeof(is_eog),
+              "decode exposes is_eog");
+        if (is_eog) break;
+    }
+    staged_text.assign(cap, '\0');
+    written = 0;
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, staged_text.data(),
+        staged_text.size(), &written, -1);
+    CHECK(rc == 0 && written > 0, "staged decode exposes accumulated text");
+    staged_text.resize(written);
+    CHECK(staged_text == text, "staged decode text matches one-shot infer");
+    rc = model->verbs_v2.run_stage(
+        model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER, -1);
+    CHECK(rc == 0, "one-shot infer after staged decode");
+    uint64_t stale_written = 0;
+    rc = model->verbs_v2.get_output(
+        model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN, nullptr, 0,
+        &stale_written, -1);
+    CHECK(rc == -7, "one-shot infer invalidates staged token output");
 
     model->release(model->owner);
 

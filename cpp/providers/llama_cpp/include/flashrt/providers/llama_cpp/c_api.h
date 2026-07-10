@@ -3,6 +3,7 @@
 
 #include "flashrt/model_runtime.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -27,22 +28,35 @@ enum frt_llama_cpp_pi0_stage_index {
 };
 
 enum frt_llama_cpp_llm_port {
-    FRT_LLAMA_CPP_LLM_PORT_PROMPT = 0,
-    FRT_LLAMA_CPP_LLM_PORT_TEXT   = 1,
+    FRT_LLAMA_CPP_LLM_PORT_PROMPT     = 0,
+    FRT_LLAMA_CPP_LLM_PORT_TEXT       = 1,
+    FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN = 2,
+    FRT_LLAMA_CPP_LLM_PORT_LOGITS     = 3,
+    FRT_LLAMA_CPP_LLM_PORT_IS_EOG     = 4,
+    FRT_LLAMA_CPP_LLM_PORT_TOKENS     = 5,
 };
 
 enum frt_llama_cpp_llm_stage_index {
-    FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER = 0,
+    FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER   = 0,
+    FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET   = 1,
+    FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL = 2,
+    FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE  = 3,
 };
 
 enum frt_llama_cpp_mllm_port {
-    FRT_LLAMA_CPP_MLLM_PORT_IMAGES = 0,
-    FRT_LLAMA_CPP_MLLM_PORT_PROMPT = 1,
-    FRT_LLAMA_CPP_MLLM_PORT_TEXT   = 2,
+    FRT_LLAMA_CPP_MLLM_PORT_IMAGES     = 0,
+    FRT_LLAMA_CPP_MLLM_PORT_PROMPT     = 1,
+    FRT_LLAMA_CPP_MLLM_PORT_TEXT       = 2,
+    FRT_LLAMA_CPP_MLLM_PORT_NEXT_TOKEN = 3,
+    FRT_LLAMA_CPP_MLLM_PORT_LOGITS     = 4,
+    FRT_LLAMA_CPP_MLLM_PORT_IS_EOG     = 5,
 };
 
 enum frt_llama_cpp_mllm_stage_index {
-    FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER = 0,
+    FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER   = 0,
+    FRT_LLAMA_CPP_MLLM_STAGE_INDEX_RESET   = 1,
+    FRT_LLAMA_CPP_MLLM_STAGE_INDEX_PREFILL = 2,
+    FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE  = 3,
 };
 
 typedef struct frt_llama_cpp_pi0_config {
@@ -112,7 +126,15 @@ typedef struct frt_llama_cpp_engine_v1 {
     /* Should return a non-null borrowed string. If it violates that contract,
      * the wrapper reports a stable boundary error string. */
     const char* (*last_error)(void* self);
+
+    /* Optional append-only tail. Engines exposing this callback support the
+     * provider's model-family-specific stage indices (e.g. LLM reset/prefill/
+     * decode). Older engines end at last_error and remain valid. */
+    int (*run_stage)(void* self, uint32_t stage);
 } frt_llama_cpp_engine_v1;
+
+#define FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE \
+    (offsetof(frt_llama_cpp_engine_v1, run_stage))
 
 typedef struct frt_llama_cpp_engine_factory_v1 {
     uint32_t struct_size;

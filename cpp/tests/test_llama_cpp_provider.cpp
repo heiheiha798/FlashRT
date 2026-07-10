@@ -148,6 +148,39 @@ int main() {
     engine_api.get_output = get_output;
     engine_api.last_error = last_error;
 
+    FakeEngine old_engine;
+    frt_llama_cpp_engine_v1 old_engine_api = engine_api;
+    old_engine_api.self = &old_engine;
+    old_engine_api.struct_size = FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE;
+    old_engine_api.run_stage = nullptr;
+
+    frt_llama_cpp_llm_config llm_cfg{};
+    llm_cfg.struct_size = sizeof(llm_cfg);
+    llm_cfg.model_path = "/models/llm.gguf";
+    llm_cfg.backend = "cpu";
+    llm_cfg.n_ctx = 2048;
+    llm_cfg.max_tokens = 16;
+    frt_model_runtime_v2* old_llm = nullptr;
+    CHECK(frt_llama_cpp_llm_runtime_create_with_engine(
+              &llm_cfg, &old_engine_api, &old_llm) == 0 && old_llm &&
+              old_llm->n_ports == 2 && old_llm->n_stages_v2 == 1,
+          "old-prefix LLM engine exposes only infer schema");
+    if (old_llm) old_llm->release(old_llm->owner);
+
+    frt_llama_cpp_mllm_config mllm_cfg{};
+    mllm_cfg.struct_size = sizeof(mllm_cfg);
+    mllm_cfg.model_path = "/models/mllm.gguf";
+    mllm_cfg.mmproj_path = "/models/mllm-mmproj.gguf";
+    mllm_cfg.backend = "cpu";
+    mllm_cfg.n_ctx = 2048;
+    mllm_cfg.max_tokens = 16;
+    frt_model_runtime_v2* old_mllm = nullptr;
+    CHECK(frt_llama_cpp_mllm_runtime_create_with_engine(
+              &mllm_cfg, &old_engine_api, &old_mllm) == 0 && old_mllm &&
+              old_mllm->n_ports == 3 && old_mllm->n_stages_v2 == 1,
+          "old-prefix MLLM engine exposes only infer schema");
+    if (old_mllm) old_mllm->release(old_mllm->owner);
+
     frt_llama_cpp_pi0_config cfg{};
     cfg.struct_size = sizeof(cfg);
     cfg.model_path = "/models/pi0.gguf";
