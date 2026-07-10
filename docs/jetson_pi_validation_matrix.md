@@ -44,6 +44,10 @@ stable benchmarks and not cross-backend speed claims.
 - Consecutive Pi0 requests invalidate stale actions and reproduce the same
   fixed-seed output for identical inputs; no previous context leaks.
 - Pi0 actions are checked for shape, nonzero values, and NaN/Inf absence.
+- Pi0 host SWAP is consumed zero-copy through NumPy's versioned, read-only
+  DLPack path; pointer identity and the live-consumer stage guard are tested.
+  PyTorch 2.6 legacy DLPack export is rejected because it cannot preserve the
+  read-only provider mapping, and no implicit copy fallback is used.
 - LLM/MLLM prefill exposes finite vocabulary logits; decode is host-repeatable.
 - Host interruption is explicit: callers stop generation by not issuing another
   decode stage. Each staged session enforces its configured `max_tokens`; one
