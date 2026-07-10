@@ -4,6 +4,7 @@
 // Strict JSON open path. No GGML types appear here.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
+#include "checkpoint_identity.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -108,7 +109,7 @@ extern "C" int frt_llama_cpp_mllm_runtime_create_with_engine(
         frt_model_runtime_v2** out) {
     if (!out) return -1;
     *out = nullptr;
-    if (!config || config->struct_size < sizeof(frt_llama_cpp_mllm_config) ||
+    if (!config || config->struct_size < FRT_LLAMA_CPP_MLLM_CONFIG_BASE_SIZE ||
         !config->model_path || !config->model_path[0] ||
         !config->mmproj_path || !config->mmproj_path[0] ||
         !config->backend || !config->backend[0]) {
@@ -179,6 +180,14 @@ extern "C" int frt_llama_cpp_mllm_runtime_create_with_engine(
     rc |= frt_runtime_builder_add_identity(b, "model_family", "mllm");
     rc |= frt_runtime_builder_add_identity(b, "model_path", config->model_path);
     rc |= frt_runtime_builder_add_identity(b, "mmproj_path", config->mmproj_path);
+    if (config->struct_size >= sizeof(*config) && config->model_identity &&
+        config->model_identity[0] && config->mmproj_identity &&
+        config->mmproj_identity[0]) {
+        rc |= frt_runtime_builder_add_identity(
+            b, "weights_sha256", config->model_identity);
+        rc |= frt_runtime_builder_add_identity(
+            b, "mmproj_sha256", config->mmproj_identity);
+    }
     rc |= frt_runtime_builder_add_identity(b, "backend", config->backend);
     rc |= frt_runtime_builder_add_identity(
         b, "n_ctx", std::to_string(config->n_ctx).c_str());
@@ -240,6 +249,8 @@ extern "C" int frt_llama_cpp_mllm_runtime_open_with_engine_factory(
     std::string model_path;
     std::string mmproj_path;
     std::string backend;
+    std::string model_identity;
+    std::string mmproj_identity;
     bool seen_model_family = false;
     bool seen_model_path = false;
     bool seen_mmproj_path = false;
@@ -455,6 +466,14 @@ extern "C" int frt_llama_cpp_mllm_runtime_open_with_engine_factory(
     config.model_path  = model_path.c_str();
     config.mmproj_path = mmproj_path.c_str();
     config.backend     = backend.c_str();
+    if (!flashrt::providers::llama_cpp::checkpoint_identity(
+            config.model_path, &model_identity, nullptr) ||
+        !flashrt::providers::llama_cpp::checkpoint_identity(
+            config.mmproj_path, &mmproj_identity, nullptr)) {
+        return -1;
+    }
+    config.model_identity = model_identity.c_str();
+    config.mmproj_identity = mmproj_identity.c_str();
 
     frt_llama_cpp_engine_v1 engine{};
     const int rc = factory->create_mllm(factory->self, &config, &engine);

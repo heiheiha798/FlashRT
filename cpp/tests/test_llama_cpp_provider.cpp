@@ -3,7 +3,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
+#include <unistd.h>
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
@@ -157,7 +159,7 @@ int main() {
     frt_model_runtime_v2* old_pi0 = nullptr;
 
     frt_llama_cpp_llm_config llm_cfg{};
-    llm_cfg.struct_size = sizeof(llm_cfg);
+    llm_cfg.struct_size = FRT_LLAMA_CPP_LLM_CONFIG_BASE_SIZE;
     llm_cfg.model_path = "/models/llm.gguf";
     llm_cfg.backend = "cpu";
     llm_cfg.n_ctx = 2048;
@@ -170,7 +172,7 @@ int main() {
     if (old_llm) old_llm->release(old_llm->owner);
 
     frt_llama_cpp_mllm_config mllm_cfg{};
-    mllm_cfg.struct_size = sizeof(mllm_cfg);
+    mllm_cfg.struct_size = FRT_LLAMA_CPP_MLLM_CONFIG_BASE_SIZE;
     mllm_cfg.model_path = "/models/mllm.gguf";
     mllm_cfg.mmproj_path = "/models/mllm-mmproj.gguf";
     mllm_cfg.backend = "cpu";
@@ -184,7 +186,7 @@ int main() {
     if (old_mllm) old_mllm->release(old_mllm->owner);
 
     frt_llama_cpp_pi0_config cfg{};
-    cfg.struct_size = sizeof(cfg);
+    cfg.struct_size = FRT_LLAMA_CPP_PI0_CONFIG_BASE_SIZE;
     cfg.model_path = "/models/pi0.gguf";
     cfg.mmproj_path = "/models/pi0-mmproj.gguf";
     cfg.backend = "cpu";
@@ -322,27 +324,27 @@ int main() {
     factory_api.create_pi0 = create_pi0_engine;
     factory_api.last_error = factory_last_error;
 
-    const char* open_json =
-        "{"
-        "\"model_family\":\"pi0\","
-        "\"model_path\":\"/models/pi0.gguf\","
-        "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
-        "\"backend\":\"cpu\","
-        "\"n_views\":2,"
-        "\"image_height\":224,"
-        "\"image_width\":224,"
-        "\"image_channels\":3,"
-        ""
-        "\"action_steps\":2,"
-        "\"action_dim\":2"
-        "}";
+    const std::string identity_prefix =
+        "/tmp/flashrt-identity-" + std::to_string(getpid());
+    const std::string identity_model = identity_prefix + "-model.gguf";
+    const std::string identity_mmproj = identity_prefix + "-mmproj.gguf";
+    {
+        std::ofstream(identity_model, std::ios::binary) << "model-a";
+        std::ofstream(identity_mmproj, std::ios::binary) << "mmproj-a";
+    }
+    const std::string open_json =
+        "{\"model_family\":\"pi0\",\"model_path\":\"" +
+        identity_model + "\",\"mmproj_path\":\"" + identity_mmproj +
+        "\",\"backend\":\"cpu\",\"n_views\":2,"
+        "\"image_height\":224,\"image_width\":224,"
+        "\"image_channels\":3,\"action_steps\":2,\"action_dim\":2}";
     frt_model_runtime_v2* opened = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
-              open_json, &factory_api, &opened) == 0 &&
+              open_json.c_str(), &factory_api, &opened) == 0 &&
               opened && factory.creates == 1,
           "open_with_engine_factory creates a Pi0 runtime from JSON");
-    CHECK(factory.seen_model_path == "/models/pi0.gguf" &&
-              factory.seen_mmproj_path == "/models/pi0-mmproj.gguf" &&
+    CHECK(factory.seen_model_path == identity_model &&
+              factory.seen_mmproj_path == identity_mmproj &&
               factory.seen_backend == "cpu" &&
               factory.seen.n_views == 2 &&
               factory.seen.action_steps == 2 &&
@@ -354,9 +356,54 @@ int main() {
               opened->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER, -1) == 0 &&
               factory_engine.infer == 1,
           "opened runtime delegates infer to factory engine");
+    const uint64_t first_fingerprint = opened->exp->fingerprint;
     opened->release(opened->owner);
     CHECK(factory_engine.releases == 2,
           "opened runtime releases retained factory engine");
+    {
+        std::ofstream(identity_model, std::ios::binary | std::ios::trunc)
+            << "model-b";
+    }
+    frt_model_runtime_v2* changed_checkpoint = nullptr;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              open_json.c_str(), &factory_api, &changed_checkpoint) == 0 &&
+              changed_checkpoint &&
+              changed_checkpoint->exp->fingerprint != first_fingerprint &&
+              std::strstr(changed_checkpoint->exp->identity,
+                          "weights_sha256="),
+          "checkpoint prefix changes deployment fingerprint");
+    const uint64_t model_changed_fingerprint =
+        changed_checkpoint ? changed_checkpoint->exp->fingerprint : 0;
+    if (changed_checkpoint) changed_checkpoint->release(changed_checkpoint->owner);
+    {
+        std::ofstream(identity_mmproj, std::ios::binary | std::ios::trunc)
+            << "mmproj-b";
+    }
+    frt_model_runtime_v2* changed_mmproj = nullptr;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              open_json.c_str(), &factory_api, &changed_mmproj) == 0 &&
+              changed_mmproj &&
+              changed_mmproj->exp->fingerprint != model_changed_fingerprint &&
+              std::strstr(changed_mmproj->exp->identity,
+                          "mmproj_sha256="),
+          "mmproj prefix changes deployment fingerprint");
+    if (changed_mmproj) changed_mmproj->release(changed_mmproj->owner);
+
+    const int creates_before_missing_checkpoint = factory.creates;
+    const std::string missing_checkpoint_json =
+        "{\"model_family\":\"pi0\",\"model_path\":\"" +
+        identity_prefix + "-missing.gguf\",\"mmproj_path\":\"" +
+        identity_mmproj +
+        "\",\"backend\":\"cpu\",\"n_views\":2,"
+        "\"image_height\":224,\"image_width\":224,"
+        "\"image_channels\":3,\"action_steps\":2,\"action_dim\":2}";
+    frt_model_runtime_v2* missing_checkpoint = nullptr;
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              missing_checkpoint_json.c_str(), &factory_api,
+              &missing_checkpoint) == -1 &&
+              missing_checkpoint == nullptr &&
+              factory.creates == creates_before_missing_checkpoint,
+          "missing checkpoint hard-fails before factory creation");
 
     frt_model_runtime_v2* missing = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
@@ -392,6 +439,7 @@ int main() {
               &factory_api, &missing) == -1 &&
               missing == nullptr,
           "open rejects non-Pi0 model family");
+
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               "{\"model_family\":\"pi0\",\"model_path\":\"/models/pi0.gguf\","
               "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
@@ -407,7 +455,7 @@ int main() {
     frt_llama_cpp_engine_factory_v1 borrowed_factory_api = factory_api;
     borrowed_factory_api.self = &borrowed_factory;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
-              open_json, &borrowed_factory_api, &missing) == -1 &&
+              open_json.c_str(), &borrowed_factory_api, &missing) == -1 &&
               missing == nullptr,
           "open rejects borrowed engines from factories");
     const int releases_before_invalid_engine = factory_engine.releases;
@@ -417,7 +465,7 @@ int main() {
     frt_llama_cpp_engine_factory_v1 invalid_factory_api = factory_api;
     invalid_factory_api.self = &invalid_factory;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
-              open_json, &invalid_factory_api, &missing) == -1 &&
+              open_json.c_str(), &invalid_factory_api, &missing) == -1 &&
               missing == nullptr &&
               factory_engine.releases == releases_before_invalid_engine,
           "open rejects undersized factory engines without calling release");
@@ -426,7 +474,7 @@ int main() {
     invalid_factory.return_null_self = true;
     invalid_factory_api.self = &invalid_factory;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
-              open_json, &invalid_factory_api, &missing) == -1 &&
+              open_json.c_str(), &invalid_factory_api, &missing) == -1 &&
               missing == nullptr &&
               factory_engine.releases == releases_before_invalid_engine,
           "open rejects null factory engine self without calling release");
@@ -435,7 +483,7 @@ int main() {
     invalid_factory.return_retain_only = true;
     invalid_factory_api.self = &invalid_factory;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
-              open_json, &invalid_factory_api, &missing) == -1 &&
+              open_json.c_str(), &invalid_factory_api, &missing) == -1 &&
               missing == nullptr &&
               factory_engine.releases == releases_before_invalid_engine,
           "open rejects asymmetric factory engines without calling release");
@@ -444,7 +492,7 @@ int main() {
     invalid_factory.return_missing_set_input = true;
     invalid_factory_api.self = &invalid_factory;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
-              open_json, &invalid_factory_api, &missing) == -1 &&
+              open_json.c_str(), &invalid_factory_api, &missing) == -1 &&
               missing == nullptr &&
               factory_engine.releases == releases_before_invalid_engine,
           "open rejects factory engines missing hot-path hooks without release");
@@ -453,10 +501,13 @@ int main() {
     invalid_factory.fail_after_engine = true;
     invalid_factory_api.self = &invalid_factory;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
-              open_json, &invalid_factory_api, &missing) == -7 &&
+              open_json.c_str(), &invalid_factory_api, &missing) == -7 &&
               missing == nullptr &&
               factory_engine.releases == releases_before_invalid_engine,
           "open ignores out_engine when factory create fails");
+
+    std::remove(identity_model.c_str());
+    std::remove(identity_mmproj.c_str());
 
     std::printf(g_fail ? "\n== LLAMA_CPP PROVIDER FAILED ==\n"
                        : "\n== LLAMA_CPP PROVIDER PASSED ==\n");

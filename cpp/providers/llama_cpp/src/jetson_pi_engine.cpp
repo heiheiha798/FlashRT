@@ -1033,7 +1033,7 @@ frt_llama_cpp_default_engine_factory(void) {
                           const frt_llama_cpp_pi0_config * config,
                           frt_llama_cpp_engine_v1 * out) -> int {
             g_create_error.clear();
-            if (!config || config->struct_size < sizeof(*config) || !out) {
+            if (!config || config->struct_size < FRT_LLAMA_CPP_PI0_CONFIG_BASE_SIZE || !out) {
                 set_create_error("invalid create_pi0 arguments");
                 return -1;
             }
@@ -1114,7 +1114,7 @@ frt_llama_cpp_default_engine_factory(void) {
                           const frt_llama_cpp_llm_config * config,
                           frt_llama_cpp_engine_v1 * out) -> int {
             g_create_error.clear();
-            if (!config || config->struct_size < sizeof(*config) || !out) {
+            if (!config || config->struct_size < FRT_LLAMA_CPP_LLM_CONFIG_BASE_SIZE || !out) {
                 set_create_error("invalid create_llm arguments");
                 return -1;
             }
@@ -1168,7 +1168,7 @@ frt_llama_cpp_default_engine_factory(void) {
                            const frt_llama_cpp_mllm_config * config,
                            frt_llama_cpp_engine_v1 * out) -> int {
             g_create_error.clear();
-            if (!config || config->struct_size < sizeof(*config) || !out) {
+            if (!config || config->struct_size < FRT_LLAMA_CPP_MLLM_CONFIG_BASE_SIZE || !out) {
                 set_create_error("invalid create_mllm arguments");
                 return -1;
             }

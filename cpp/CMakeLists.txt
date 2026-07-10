@@ -171,6 +171,7 @@ target_include_directories(flashrt_cpp_pi05_c
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 
 add_library(flashrt_cpp_llama_cpp_provider STATIC
+  providers/llama_cpp/src/checkpoint_identity.cpp
   providers/llama_cpp/src/pi0_runtime.cpp
   providers/llama_cpp/src/llm_runtime.cpp
   providers/llama_cpp/src/mllm_runtime.cpp)
@@ -192,6 +193,7 @@ if(FLASHRT_CPP_WITH_JETSON_PI)
   # frt_llama_cpp_default_engine_factory + frt_llama_cpp_pi0_runtime_open_with_engine_factory
   # for dlopen. Linux default visibility exposes the extern "C" symbols.
   add_library(flashrt_cpp_llama_cpp_provider_c SHARED
+    providers/llama_cpp/src/checkpoint_identity.cpp
     providers/llama_cpp/src/pi0_runtime.cpp
     providers/llama_cpp/src/llm_runtime.cpp
     providers/llama_cpp/src/mllm_runtime.cpp
