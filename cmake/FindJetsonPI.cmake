@@ -20,8 +20,8 @@
 #   JetsonPI::jetson_pi_pi0  JetsonPI::jetson_pi_llm  JetsonPI::jetson_pi_mllm
 #   JetsonPI::mtmd  JetsonPI::llama  JetsonPI::ggml  JetsonPI::ggml-base
 #   JetsonPI::ggml-cpu  JetsonPI::ggml-cuda  JetsonPI::ggml-vulkan
-# (backend libs that exist only when their GGML_<BACKEND> was ON; missing ones
-#  are silently skipped — link only what was built.)
+#   JetsonPI::ggml-opencl  JetsonPI::ggml-sycl
+# (backend libs are linked only when they exist in the selected prefix.)
 #
 # Module-mode search: Jetson-PI does not ship a config-file package for the
 # narrow C API libs (installing an install(EXPORT) graph would require
@@ -79,6 +79,25 @@ _jetsonpi_find_lib(JetsonPI_ggml_base_LIBRARY    ggml-base)
 _jetsonpi_find_lib(JetsonPI_ggml_cpu_LIBRARY     ggml-cpu)
 _jetsonpi_find_lib(JetsonPI_ggml_cuda_LIBRARY    ggml-cuda)
 _jetsonpi_find_lib(JetsonPI_ggml_vulkan_LIBRARY  ggml-vulkan)
+_jetsonpi_find_lib(JetsonPI_ggml_opencl_LIBRARY  ggml-opencl)
+_jetsonpi_find_lib(JetsonPI_ggml_sycl_LIBRARY    ggml-sycl)
+_jetsonpi_find_lib(JetsonPI_onemath_cublas_LIBRARY onemath_blas_cublas)
+
+if (JetsonPI_ggml_opencl_LIBRARY)
+  find_package(OpenCL REQUIRED)
+endif()
+if (JetsonPI_ggml_sycl_LIBRARY)
+  find_library(JetsonPI_sycl_LIBRARY NAMES sycl HINTS ENV ONEAPI_ROOT PATH_SUFFIXES lib lib64)
+  find_library(JetsonPI_imf_LIBRARY NAMES imf HINTS ENV ONEAPI_ROOT PATH_SUFFIXES lib lib64)
+  find_library(JetsonPI_svml_LIBRARY NAMES svml HINTS ENV ONEAPI_ROOT PATH_SUFFIXES lib lib64)
+  find_library(JetsonPI_intlc_LIBRARY NAMES intlc intlc.so.5 HINTS ENV ONEAPI_ROOT PATH_SUFFIXES lib lib64)
+  if (NOT JetsonPI_sycl_LIBRARY OR NOT JetsonPI_imf_LIBRARY OR
+      NOT JetsonPI_svml_LIBRARY OR NOT JetsonPI_intlc_LIBRARY OR
+      NOT JetsonPI_onemath_cublas_LIBRARY)
+    message(FATAL_ERROR "JetsonPI ggml-sycl was found, but its DPC++/oneMath runtime libraries were not. Set ONEAPI_ROOT and install libsycl, libimf, libsvml, libintlc, and libonemath_blas_cublas.")
+  endif()
+  find_package(CUDAToolkit REQUIRED)
+endif()
 
 include(FindPackageHandleStandardArgs)
 # The provider hard-needs the narrow libs + their core transitive deps. Backend
@@ -108,6 +127,12 @@ if (JetsonPI_FOUND)
   if (JetsonPI_ggml_vulkan_LIBRARY)
     list(APPEND _JetsonPI_ggml_backends JetsonPI::ggml-vulkan)
   endif()
+  if (JetsonPI_ggml_opencl_LIBRARY)
+    list(APPEND _JetsonPI_ggml_backends JetsonPI::ggml-opencl)
+  endif()
+  if (JetsonPI_ggml_sycl_LIBRARY)
+    list(APPEND _JetsonPI_ggml_backends JetsonPI::ggml-sycl)
+  endif()
 
   # Helper: declare one imported shared lib target with its transitive deps.
   function(_jetsonpi_import_target tgt lib dep)
@@ -132,6 +157,8 @@ if (JetsonPI_FOUND)
   _jetsonpi_import_target(JetsonPI::ggml-cpu    JetsonPI_ggml_cpu_LIBRARY    "JetsonPI::ggml-base")
   _jetsonpi_import_target(JetsonPI::ggml-cuda   JetsonPI_ggml_cuda_LIBRARY   "JetsonPI::ggml-base;CUDA::cudart;CUDA::cublas;CUDA::cuda_driver")
   _jetsonpi_import_target(JetsonPI::ggml-vulkan JetsonPI_ggml_vulkan_LIBRARY "JetsonPI::ggml-base")
+  _jetsonpi_import_target(JetsonPI::ggml-opencl JetsonPI_ggml_opencl_LIBRARY "JetsonPI::ggml-base;OpenCL::OpenCL")
+  _jetsonpi_import_target(JetsonPI::ggml-sycl   JetsonPI_ggml_sycl_LIBRARY   "JetsonPI::ggml-base;${JetsonPI_onemath_cublas_LIBRARY};${JetsonPI_sycl_LIBRARY};${JetsonPI_imf_LIBRARY};${JetsonPI_svml_LIBRARY};${JetsonPI_intlc_LIBRARY};CUDA::cublas;CUDA::cuda_driver")
   _jetsonpi_import_target(JetsonPI::ggml        JetsonPI_ggml_LIBRARY        "${_ggml_deps}")
   _jetsonpi_import_target(JetsonPI::llama       JetsonPI_llama_LIBRARY       "JetsonPI::ggml")
   _jetsonpi_import_target(JetsonPI::mtmd        JetsonPI_mtmd_LIBRARY        "JetsonPI::llama;JetsonPI::ggml")
@@ -144,7 +171,10 @@ if (JetsonPI_FOUND)
       JetsonPI_pi0_LIBRARY JetsonPI_llm_LIBRARY JetsonPI_mllm_LIBRARY
       JetsonPI_mtmd_LIBRARY JetsonPI_llama_LIBRARY JetsonPI_ggml_LIBRARY
       JetsonPI_ggml_base_LIBRARY JetsonPI_ggml_cpu_LIBRARY
-      JetsonPI_ggml_cuda_LIBRARY JetsonPI_ggml_vulkan_LIBRARY)
+      JetsonPI_ggml_cuda_LIBRARY JetsonPI_ggml_vulkan_LIBRARY
+      JetsonPI_ggml_opencl_LIBRARY JetsonPI_ggml_sycl_LIBRARY
+      JetsonPI_onemath_cublas_LIBRARY JetsonPI_sycl_LIBRARY
+      JetsonPI_imf_LIBRARY JetsonPI_svml_LIBRARY JetsonPI_intlc_LIBRARY)
     if(${_JetsonPI_library})
       get_filename_component(_JetsonPI_library_dir "${${_JetsonPI_library}}" DIRECTORY)
       list(APPEND JetsonPI_LIBRARY_DIRS "${_JetsonPI_library_dir}")
@@ -159,4 +189,7 @@ mark_as_advanced(JetsonPI_INCLUDE_DIR
   JetsonPI_pi0_LIBRARY JetsonPI_llm_LIBRARY JetsonPI_mllm_LIBRARY
   JetsonPI_mtmd_LIBRARY JetsonPI_llama_LIBRARY
   JetsonPI_ggml_LIBRARY JetsonPI_ggml_base_LIBRARY
-  JetsonPI_ggml_cpu_LIBRARY JetsonPI_ggml_cuda_LIBRARY JetsonPI_ggml_vulkan_LIBRARY)
+  JetsonPI_ggml_cpu_LIBRARY JetsonPI_ggml_cuda_LIBRARY JetsonPI_ggml_vulkan_LIBRARY
+  JetsonPI_ggml_opencl_LIBRARY JetsonPI_ggml_sycl_LIBRARY
+  JetsonPI_onemath_cublas_LIBRARY JetsonPI_sycl_LIBRARY
+  JetsonPI_imf_LIBRARY JetsonPI_svml_LIBRARY JetsonPI_intlc_LIBRARY)
