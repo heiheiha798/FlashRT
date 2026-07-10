@@ -24,7 +24,9 @@ enum frt_llama_cpp_pi0_port {
 };
 
 enum frt_llama_cpp_pi0_stage_index {
-    FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER = 0,
+    FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER   = 0,
+    FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT = 1,
+    FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION  = 2,
 };
 
 enum frt_llama_cpp_llm_port {

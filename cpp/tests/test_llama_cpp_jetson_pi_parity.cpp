@@ -134,6 +134,7 @@ int main() {
 
     // ---- PATH A: FlashRT frt_model_runtime_v2 wrapper ----------------------
     std::vector<float> actions_flashrt(n_elems, 0.0f);
+    std::vector<float> actions_split(n_elems, 0.0f);
     {
         const frt_llama_cpp_engine_factory_v1 * factory =
             frt_llama_cpp_default_engine_factory();
@@ -157,6 +158,8 @@ int main() {
             g_fail = 1;
         } else {
             CHECK(true, "open FlashRT Pi0 runtime from JSON");
+            CHECK(model->n_stages_v2 == 3,
+                  "FlashRT Pi0 runtime exposes infer/context/action stages");
 
             frt_image_view views[2];
             views[0].struct_size = sizeof(frt_image_view);
@@ -191,6 +194,46 @@ int main() {
                 actions_flashrt.data(), n_bytes, &written, -1);
             CHECK(rc == 0 && written == n_bytes,
                   "FlashRT get_output actions shape matches config");
+
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) == 0,
+                  "FlashRT run_stage context");
+            CHECK(model->verbs_v2.set_input(
+                      model->self, FRT_LLAMA_CPP_PI0_PORT_PROMPT,
+                      prompt.data(), prompt.size(), -1) == 0,
+                  "new Pi0 input discards pending context");
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) == -7,
+                  "action after replacement input is not ready");
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) == 0,
+                  "FlashRT rebuilds context after replacement input");
+            CHECK(model->verbs_v2.set_input(
+                      model->self, FRT_LLAMA_CPP_PI0_PORT_STATE,
+                      state_bytes.data(), state_bytes.size() - sizeof(float), -1) != 0,
+                  "invalid replacement input is rejected");
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) == -7,
+                  "failed replacement input discards pending context");
+            CHECK(model->verbs_v2.set_input(
+                      model->self, FRT_LLAMA_CPP_PI0_PORT_STATE,
+                      state_bytes.data(), state_bytes.size(), -1) == 0,
+                  "restore valid Pi0 state after invalid replacement");
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) == 0,
+                  "FlashRT rebuilds context after failed replacement");
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) == 0,
+                  "FlashRT run_stage action");
+            written = 0;
+            rc = model->verbs_v2.get_output(
+                model->self, FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
+                actions_split.data(), n_bytes, &written, -1);
+            CHECK(rc == 0 && written == n_bytes,
+                  "FlashRT split stages produced action chunk");
+            CHECK(model->verbs_v2.run_stage(
+                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) == -7,
+                  "Pi0 action stage consumes pending context exactly once");
             model->release(model->owner);
         }
     }
@@ -226,6 +269,38 @@ int main() {
 
             const uint8_t * imgs[2] = { img, wrist };
             size_t written = 0;
+            CHECK(jetson_pi_pi0_action(
+                      pi0, actions_native.data(), n_elems, &written) ==
+                      JETSON_PI_PI0_ACTION_NOT_READY && written == 0,
+                  "direct action-not-ready reports zero elements written");
+            written = 0;
+            CHECK(jetson_pi_pi0_infer(
+                      pi0, imgs, 2, prompt.data(), prompt.size(),
+                      reinterpret_cast<const float*>(state_bytes.data()),
+                      state_bytes.size() / sizeof(float), actions_native.data(),
+                      n_elems - 1, &written) ==
+                      JETSON_PI_PI0_BUFFER_TOO_SMALL && written == n_elems,
+                  "too-small whole infer reports required size before context");
+            written = 123;
+            CHECK(jetson_pi_pi0_action(
+                      pi0, actions_native.data(), n_elems, &written) ==
+                      JETSON_PI_PI0_ACTION_NOT_READY && written == 0,
+                  "invalid whole infer leaves no consumable context");
+            CHECK(jetson_pi_pi0_context(
+                      pi0, imgs, 2, prompt.data(), prompt.size(),
+                      reinterpret_cast<const float*>(state_bytes.data()),
+                      state_bytes.size() / sizeof(float)) == JETSON_PI_PI0_OK,
+                  "direct context prepares pending action");
+            CHECK(jetson_pi_pi0_context(
+                      pi0, imgs, 2, nullptr, 0,
+                      reinterpret_cast<const float*>(state_bytes.data()),
+                      state_bytes.size() / sizeof(float)) == JETSON_PI_PI0_INVALID,
+                  "failed direct context replacement is rejected");
+            written = 123;
+            CHECK(jetson_pi_pi0_action(
+                      pi0, actions_native.data(), n_elems, &written) ==
+                      JETSON_PI_PI0_ACTION_NOT_READY && written == 0,
+                  "failed direct context discards prior pending context");
             s = jetson_pi_pi0_infer(pi0, imgs, 2,
                                     prompt.data(), prompt.size(),
                                     reinterpret_cast<const float*>(state_bytes.data()),
@@ -254,6 +329,15 @@ int main() {
         if (std::isnan(v) || std::isinf(v)) { nan_inf = true; break; }
     }
     CHECK(!nan_inf, "FlashRT actions contain no NaN/Inf");
+
+    float split_max_diff = 0.0f;
+    for (size_t i = 0; i < n_elems; ++i) {
+        split_max_diff = std::max(
+            split_max_diff, std::fabs(actions_flashrt[i] - actions_split[i]));
+    }
+    std::printf("    whole-vs-split max abs diff = %.9g\n", split_max_diff);
+    CHECK(split_max_diff == 0.0f,
+          "FlashRT context/action is bit-identical to whole infer");
 
     float max_diff = 0.0f;
     size_t diverge_idx = 0;

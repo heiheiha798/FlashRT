@@ -96,6 +96,11 @@ def main():
         check(False, "actions contain NaN/Inf")
     check(bool(np.any(actions != 0)), "actions are not all zero")
 
+    model._pipe.context({"images": [image, wrist], "state": state})
+    split_actions = model._pipe.action()
+    check(np.array_equal(split_actions, actions),
+          "context/action stages are bit-identical to predict")
+
     del model
 
     print("\n== JETSON_PI PYTHON " + ("PASSED" if not failed else "FAILED") + " ==")
