@@ -8,8 +8,10 @@ The completed correctness/backend/performance gate record is maintained in
 `docs/jetson_pi_validation_matrix.md`.
 
 Three providers, selected by `config=`:
-- **`config="pi0"`** (default for VLA) — Pi0 whole-graph infer via
-  `jetson_pi_pi0`. Returns a `VLAModel` (`.predict(images, prompt, state)`).
+- **`config="pi0"`** (default for VLA) — Pi0/Pi0.5 whole-graph infer via
+  `jetson_pi_pi0`. The narrow API detects the model family from the GGUF pair
+  and rejects a conflicting model/mmproj pair. Returns a `VLAModel`
+  (`.predict(images, prompt, state)`).
 - **`config="llm"`** — generic GGUF text completion via `jetson_pi_llm`.
   Returns an `LlmJetsonPiFrontend` directly (`.generate(prompt)`); not a VLA.
 - **`config="mllm"`** — multimodal LLM (vision+text) via `jetson_pi_mllm`.
@@ -42,7 +44,9 @@ Build and install Jetson-PI as a standalone tree (NOT via FlashRT's
 the narrow `jetson_pi_*` libs and `mtmd`/`llama`/`ggml` deps build. The default
 direct-link layout installs `lib64/libjetson_pi_{pi0,llm,mllm}.so`,
 `lib64/lib{llama,mtmd,ggml*}.so`, and
-`include/jetson_pi_{pi0,llm,mllm}.h`:
+`include/jetson_pi_{pi0,llm,mllm}.h`. The installed MTMD public-header closure
+also contains `mtmd-helper.h` and its `pi-model.h` dependency, so an
+out-of-tree static or shared consumer does not depend on source-tree headers:
 
 ```bash
 cmake -S Jetson-PI -B Jetson-PI/build-prod \
@@ -165,7 +169,12 @@ The Jetson-PI fork must be used as a locked version with its own GGML — do not
 mix another llama.cpp/GGML version into the same provider (ABI/symbol/layout
 conflicts). The final migration is developed, independently reviewed, and
 GPU-verified against Jetson-PI commit
-`68dd395b3f89dbd031ae564e335780f702fbd1e7` on branch `expose-mtmd-only-build` (local, not pushed).
+`9c8e8b30e629a2475958c7b8a0bfb06f6f05295d` on local branch
+`flashrt-migration-merge`. That commit
+is based on upstream `origin/merge` commit
+`436fdb2aceaf564e152be6e0779180f56a279074`; the pre-merge implementation is
+preserved at `origin/flashrt-migration-master-baseline`
+(`68dd395b3f89dbd031ae564e335780f702fbd1e7`).
 When upgrading the fork, re-run the parity tests
 (`test_llama_cpp_jetson_pi_parity` / `test_llama_cpp_jetson_pi_llm_parity`) to
 confirm FlashRT's provider path still matches the direct `jetson_pi_*` path
@@ -221,6 +230,30 @@ numpy_actions = np.from_dlpack(actions_view)
 actions_view.close()  # DLPack consumer keeps its own map alive
 del numpy_actions     # required before replacing inputs or running a stage
 ```
+
+Pi0.5 uses the same FlashRT face. Point `checkpoint` and `mmproj_path` at the
+converted Pi0.5 pair; no process-global `PI_MODEL` override is required:
+
+```python
+pi05 = flash_rt.load_model(
+    "/path/to/Pi05_Libero-2.8B-F16.gguf",
+    framework="jetson_pi",
+    config="pi0",
+    mmproj_path="/path/to/pi05/vit/mmproj-model-f16.gguf",
+    backend="cuda",
+    num_views=2,
+    action_steps=10,
+    action_dim=32,
+)
+actions = pi05.predict(images, prompt=prompt, state=state)
+```
+
+Jetson-PI detects Pi0 versus Pi0.5 from strong GGUF metadata/tensor features,
+pins that choice to the handle for model load, VIT preprocessing, graph build,
+and decode, and rejects an unknown or inconsistent pair during `open`.
+The Pi0.5 converter also recognizes adaptive output-norm tensors in the raw
+safetensors key namespace and omits an obsolete base output norm when both are
+present.
 
 The Python smoke test verifies NumPy's versioned DLPack path is zero-copy,
 read-only, and keeps the mapping live. PyTorch 2.6 requests the legacy DLPack
@@ -281,17 +314,18 @@ chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
   `reset()`/`prefill()`/repeatable `decode()` expose the token boundary and keep
   provider-private KV state for host-driven generation.
 - **CPU/CUDA/SYCL clean-exit and Vulkan inference paths verified.** `backend="cuda"` is verified
-  end-to-end on an RTX 4090 (sm_89) for all three providers — Pi0 (`offloaded
-  37/37 layers`, pi0_base), LLM (`29/29`, qwen3-0.6b-q4_k_m), and MLLM
+  end-to-end on an RTX 4090 (sm_89) for all provider faces — Pi0 and Pi0.5
+  (`offloaded 37/37 layers` plus VIT), LLM (`29/29`, qwen3-0.6b-q4_k_m), and MLLM
   (`29/29`, Qwen3-VL-2B-Instruct-Q4_K_M; the VIT/mmproj encoder offloads too).
   For Pi0 and LLM the generated output is coherent; for MLLM the GPU execution
   path (load → VIT encode → forward → sample) is exercised, but the smoke test
   feeds a raw prompt so the output is template-token noise rather than a
   caption — output coherence requires a caller-applied chat template (see the
   MLLM note below). `backend="vulkan"` runs the intended model and VIT paths on
-  the RTX 4090 for Pi0, LLM, and MLLM. Pi0 reaches numerical parity with
-  `max_diff = 0`, LLM retains exact direct-path text parity, and all three final
-  provider tests reach their success markers. Each process then exits 139 in
+  the RTX 4090 for Pi0, Pi0.5, LLM, and MLLM. Both policy variants reach
+  numerical parity with `max_diff = 0`, LLM retains exact direct-path text
+  parity, MLLM retains exact text parity, and all four final provider tests
+  reach their success markers. Each process then exits 139 in
   the local NVIDIA 550.54.14 ICD during process-exit teardown, so none is a
   clean-exit Vulkan validation. Per §6 of
   the migration plan, compiling a backend does not guarantee every model op is
@@ -338,7 +372,7 @@ chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
   `offloaded N/N layers` and `CLIP using <backend>` log lines as confirmation
   that the intended backend was exercised.
 
-  **Vulkan backend** (Pi0/LLM/MLLM inference verified; all three have the NVIDIA
+  **Vulkan backend** (Pi0/Pi0.5/LLM/MLLM inference verified; all four have the NVIDIA
   process-exit teardown failure below). Build in a separate
   dir with `-DGGML_VULKAN=ON -DGGML_CUDA=OFF` (Vulkan is SPIR-V; no CUDA arch
   needed) and conda compilers; the `vulkan-shaders-gen` build-time tool needs a
@@ -375,12 +409,13 @@ chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
   `FLASHRT_PI0_BACKEND=vulkan` / `FLASHRT_LLM_BACKEND=vulkan`, point
   `FLASHRT_PI0_LIB`/`FLASHRT_LLM_LIB` at the vulkan build's `_c.so`, and ensure
   `LD_LIBRARY_PATH` includes the vulkan build's `bin/` (for `libggml-vulkan.so`).
-  Verified: Pi0 `pi0_base` offloads 37/37 layers + VIT to Vulkan0, actions
-  (10,32) sane, parity `max_diff = 0` vs the direct `jetson_pi_pi0` call;
+  Verified: Pi0 `pi0_base` and the converted Pi0.5 LIBERO model each offload
+  37/37 layers + VIT to Vulkan0, produce finite `(10,32)` actions, and retain
+  whole/split/direct parity `max_diff = 0`;
   LLM `qwen3-0.6b-q4_k_m` offloads 29/29 layers to Vulkan0, greedy text
   byte-identical to the direct `jetson_pi_llm` call. Qwen3-VL MLLM also
   completes one-shot and staged generation with all 29 text layers and VIT on
-  Vulkan0. On final rebuilt GPU6 runs, all three tests print their success marker
+  Vulkan0. On final rebuilt GPU6 runs, all four tests print their success marker
   and subsequently segfault inside the NVIDIA 550.54.14 Vulkan ICD's process-exit
   destructors with exit code 139. Earlier GDB capture places the failure after
   the test success marker, outside provider inference and explicit object
@@ -398,6 +433,11 @@ chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
   backend capability gate, not a missing download and not a model execution
   result; no CPU fallback is installed.
 
+  On this host the ICD loader must be pointed at the system vendor files with
+  `OCL_ICD_VENDORS=/etc/OpenCL/vendors`; without that environment setting the
+  conda loader does not enumerate the installed NVIDIA ICD. Enumeration still
+  ends at the explicit unsupported-family gate described above.
+
   **SYCL backend.** A separate `jetsonpi-sycl-cuda` conda environment uses
   DPC++ 2025.3.0, GCC 13.4, CUDA 12.4, and oneMath cuBLAS to build
   `-DGGML_SYCL=ON -DGGML_SYCL_TARGET=NVIDIA -DGGML_SYCL_DNN=OFF`. The matching
@@ -411,9 +451,10 @@ chat template, is recorded in `docs/jetson_pi_validation_matrix.md`.
   ```
 
   GPU6/RTX 4090 end-to-end results: LLM offloads 29/29 layers; MLLM offloads
-  29/29 language layers and CLIP/VIT to SYCL0; Pi0 offloads 37/37 model layers
-  and VIT. LLM staged decode, MLLM staged/image parity, and Pi0 whole-versus-
-  context/action parity all pass; Pi0 action `max_abs_diff=0`. A focused SYCL
+  29/29 language layers and CLIP/VIT to SYCL0; Pi0 and Pi0.5 each offload
+  37/37 model layers and VIT. LLM staged decode, MLLM staged/image parity, and
+  both policy variants' whole-versus-context/action parity all pass with
+  `max_abs_diff=0`. A focused SYCL
   backend-op test passes nearest and F32 bilinear upscale (half-pixel and
   align-corners), transpose, and up/downsample cases, 11/11 total. Bicubic is
   still explicitly unsupported and is not claimed. The installed-prefix build
