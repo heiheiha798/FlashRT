@@ -98,8 +98,9 @@ latency targets.
 
 ## Limits
 
-- Inherits all 8B-path limits (single-image graph prefill, per-cache-position
-  decode graphs, FP8-not-NVFP4 on Ada). See `qwen3_vl_fp8_sm89.md`.
+- Inherits all 8B-path limits (single- and multi-image graph prefill,
+  per-cache-position decode graphs, FP8-not-NVFP4 on Ada). See
+  `qwen3_vl_fp8_sm89.md`.
 - The 2B FP8 checkpoint is produced offline by the repo quantizer; there is no
   official 2B FP8 release.
 - The `scripts/*qwen3_vl_fp8_sm89*` entry points are local validation, not CI.

@@ -311,7 +311,9 @@ def test_qwen3_vl_sm89_multimodal_graph_caches_are_lru_bounded(monkeypatch):
 
     for i in range(3):
         fe._prompt = {k: _TensorStub(f"{k}_{i}") for k in fe._PG_KEYS}
-        key = fe._stage_prefill_inputs(P=10 + i, S=20 + i, span=(i, i + 10))
+        fe._prompt['seg_patches'] = [10 + i]
+        fe._prompt['spans'] = [(i, i + 10)]
+        key = fe._stage_prefill_inputs([10 + i], 20 + i, [(i, i + 10)])
         fe._prefill_graphs[key] = object()
         fe._trim_lru_graph_cache(
             fe._prefill_graphs, fe.max_prefill_graphs,
@@ -320,7 +322,8 @@ def test_qwen3_vl_sm89_multimodal_graph_caches_are_lru_bounded(monkeypatch):
     assert len(fe._prefill_graphs) == fe.max_prefill_graphs
     assert len(fe._pg_buffers) == fe.max_prefill_graphs
     assert list(fe._prefill_graphs) == list(fe._pg_buffers)
-    assert list(fe._prefill_graphs) == [(11, 21, 1, 11), (12, 22, 2, 12)]
+    assert list(fe._prefill_graphs) == [
+        (21, (11,), ((1, 11),)), (22, (12,), ((2, 12),))]
 
     for i in range(5):
         fe._ensure_decode_graph(cache_pos=i, rope_pos=100 + i)

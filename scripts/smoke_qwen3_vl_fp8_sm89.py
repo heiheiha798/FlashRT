@@ -189,7 +189,7 @@ def _bench_multimodal(args) -> None:
     prefill_logits_f = logits.detach().float().clone()
     graph_logits_f = prefill_logits_f
     graph_prefill_times = None
-    if len(p["spans"]) == 1:
+    if p.get("pg_key") is not None:
         fe.prefill_graph()
         torch.cuda.synchronize()
         graph_prefill_times = _event_time_ms(

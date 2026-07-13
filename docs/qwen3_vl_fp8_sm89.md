@@ -135,8 +135,12 @@ residual state, and BF16 `lm_head`.
 - This is not an NVFP4 implementation. SM89 uses official FP8 weights because
   NVFP4 is a Blackwell path.
 - `lm_head` stays BF16 by default for generation quality.
-- Single-image prefill has a CUDA Graph replay path. Multi-image and video
-  should use the eager path unless separately validated.
+- Single-image and multi-image prefill both have a CUDA Graph replay path.
+  The graph cache key encodes the full per-image shape signature (per-image
+  patch counts + per-image token spans + sequence length), so two multi-image
+  prompts with different per-image resolutions need different graphs even when
+  the total patch count matches. Video prefill still uses the eager path
+  unless separately validated.
 - Decode graphs are captured per cache position because the FA2 call captures
   host-side sequence length.
 - The development scripts under `scripts/*qwen3_vl_fp8_sm89*` are local

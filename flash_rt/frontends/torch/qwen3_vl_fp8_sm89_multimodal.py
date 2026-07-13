@@ -134,9 +134,26 @@ class Qwen3VlFp8Sm89Frontend:
             if on_evict is not None:
                 on_evict(old_key)
 
-    def _stage_prefill_inputs(self, P: int, S: int, span):
+    def _stage_prefill_inputs(self, seg_patches, S: int, spans):
+        """Stage the per-prompt static tensors for prefill graph capture.
+
+        ``seg_patches`` / ``spans`` are the per-segment patch counts and
+        token-index spans (lists of equal length). The cache key encodes the
+        full per-segment shape signature — ``S`` + the ordered per-segment
+        patch counts + the ordered per-segment spans — because a captured
+        CUDA graph bakes each segment's vision-forward shape (patch count)
+        and each ``h[a:b]`` / deepstack span index. Two prompts with the same
+        total patch count but different per-segment splits (e.g. (100,100) vs
+        (150,50)) need different graphs.
+
+        The staged tensor dict ``st`` holds the 7 cloned tensors in
+        ``_PG_KEYS`` (concatenated across all segments, as built in
+        ``set_prompt``) plus ``seg_patches`` / ``spans`` Python lists
+        (borrowed from ``self._prompt`` — they are immutable after
+        ``set_prompt``) so the graph body can loop per segment.
+        """
         p = self._prompt
-        key = (P, S, span[0], span[1])
+        key = (S, tuple(seg_patches), tuple(spans))
         if not isinstance(self._pg_buffers, collections.OrderedDict):
             self._pg_buffers = collections.OrderedDict(self._pg_buffers)
         if not isinstance(self._prefill_graphs, collections.OrderedDict):
@@ -149,11 +166,18 @@ class Qwen3VlFp8Sm89Frontend:
                 old_key, _ = self._pg_buffers.popitem(last=False)
                 self._prefill_graphs.pop(old_key, None)
             bufs = {k: p[k].clone() for k in self._PG_KEYS}
+            # Per-segment layout (Python lists, immutable after set_prompt):
+            # the graph body loops these to call vision per segment. Not in
+            # _PG_KEYS (they aren't tensors); borrowed, not cloned.
+            bufs['seg_patches'] = list(p['seg_patches'])
+            bufs['spans'] = list(p['spans'])
             self._pg_buffers[key] = bufs
         else:
             self._pg_buffers.move_to_end(key)
             for k in self._PG_KEYS:
                 bufs[k].copy_(p[k])
+            bufs['seg_patches'] = list(p['seg_patches'])
+            bufs['spans'] = list(p['spans'])
         return key
 
     def clear_graphs(self) -> None:
@@ -262,9 +286,9 @@ class Qwen3VlFp8Sm89Frontend:
             'S': S,
             'mrope_max': int(pos_ids.max()),
         }
-        if len(spans) == 1:
+        if spans:
             self._prompt['pg_key'] = self._stage_prefill_inputs(
-                seg_patches[0], S, spans[0])
+                seg_patches, S, spans)
 
     def prefill(self):
         import torch
@@ -300,25 +324,40 @@ class Qwen3VlFp8Sm89Frontend:
         torch.cuda.synchronize()
         return logits
 
-    def _prefill_graph_body(self, st, P, S, a, b):
+    def _prefill_graph_body(self, st, S):
+        """Captured body. Loops per vision segment (matching eager
+        ``prefill()``) so each image's bidirectional attention stays
+        self-contained — concatenating segments into one vision.forward
+        would cross-attend across image boundaries. For a single segment
+        this reduces to the prior single-image path (byte-identical).
+        """
         import torch
 
         llm = self.llm
         hidden = llm._cfg['hidden_size']
         embed = llm._weights.anchors[0]
         h = embed[st['input_ids']].to(torch.bfloat16).view(S, hidden)
-        emb, ds = self.vision.forward(
-            st['pixel_values'], st['pos_embeds'], st['vcos'], st['vsin'])
-        h[a:b].copy_(emb.to(torch.bfloat16))
+        seg_deepstacks = []
+        off = 0
+        for (a, b), n_patch in zip(st['spans'], st['seg_patches']):
+            sl = slice(off, off + n_patch)
+            off += n_patch
+            emb, ds = self.vision.forward(
+                st['pixel_values'][sl], st['pos_embeds'][sl],
+                st['vcos'][sl], st['vsin'][sl])
+            h[a:b].copy_(emb.to(torch.bfloat16))
+            seg_deepstacks.append(ds)
 
         deep = {}
         for layer in range(self._deepstack_layers):
-            deep[layer] = [(a, b, ds[layer].to(torch.bfloat16).contiguous())]
+            deep[layer] = [
+                (a, b, seg_deepstacks[i][layer].to(torch.bfloat16).contiguous())
+                for i, (a, b) in enumerate(st['spans'])]
         llm.forward_hidden_prefill_fp8_blockscaled(
             h, st['mcos'], st['msin'], 0, deepstack_by_layer=deep,
             run_lm_head=False)
 
-    def _capture_prefill_graph(self, st, P, S, a, b):
+    def _capture_prefill_graph(self, st, S):
         import torch
 
         llm = self.llm
@@ -326,11 +365,11 @@ class Qwen3VlFp8Sm89Frontend:
         gs.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(gs), torch.no_grad():
             for _ in range(2):
-                self._prefill_graph_body(st, P, S, a, b)
+                self._prefill_graph_body(st, S)
         gs.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=gs), torch.no_grad():
-            self._prefill_graph_body(st, P, S, a, b)
+            self._prefill_graph_body(st, S)
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
         return graph
@@ -345,15 +384,15 @@ class Qwen3VlFp8Sm89Frontend:
         if key is None:
             return self.prefill()
 
-        P, S, a, b = key
+        S, _seg_patches, _spans = key
         st = self._pg_buffers.get(key)
         if st is None:
             self._prefill_graphs.pop(key, None)
-            self._stage_prefill_inputs(P, S, (a, b))
+            self._stage_prefill_inputs(_seg_patches, S, _spans)
             st = self._pg_buffers[key]
         graph = self._graph_cache_get(self._prefill_graphs, key)
         if graph is None:
-            graph = self._capture_prefill_graph(st, P, S, a, b)
+            graph = self._capture_prefill_graph(st, S)
             self._prefill_graphs[key] = graph
             if isinstance(self._prefill_graphs, collections.OrderedDict):
                 self._prefill_graphs.move_to_end(key)
