@@ -170,6 +170,11 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
+# Shared delayed-codebook helper used by discrete-audio paths. Kept behind an
+# explicit option so deployment builds that do not serve audio can remove the
+# TU and its binding in lockstep.
+option(FLASHRT_ENABLE_AUDIO_CODEBOOK
+       "Build shared delayed-codebook helper kernels into flash_rt_kernels" ON)
 # MiniMax-Remover — builds flash_rt_minimax_remover.so with model-specific
 # FP8/NVFP4 transformer and VAE fused kernels. OFF by default; enable with
 # -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON on Blackwell only.
@@ -1244,6 +1249,15 @@ pybind11_add_module(flash_rt_kernels
 set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+
+if(FLASHRT_ENABLE_AUDIO_CODEBOOK)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/delayed_codebook_kernels.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_AUDIO_CODEBOOK=1)
+  message(STATUS "Delayed audio-codebook kernels: ENABLED")
+else()
+  message(STATUS "Delayed audio-codebook kernels: DISABLED")
+endif()
 
 # ── Motus VAE FP8 quantize kernels (slim-gated) ──
 # These 5 TUs are used only by the Motus VAE FP8 path (the *_ncdhw* /
