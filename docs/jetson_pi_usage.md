@@ -20,6 +20,13 @@ Three providers, selected by `config=`:
 
 ## Build
 
+Jetson-PI is a public repository:
+https://github.com/PKU-SEC-Lab/Jetson-PI-Edge, branch `Jetson-PI-flashrt`.
+
+```bash
+git clone --branch Jetson-PI-flashrt https://github.com/PKU-SEC-Lab/Jetson-PI-Edge.git Jetson-PI
+```
+
 Two integration routes (§5.2): a **dev** `add_subdirectory` path and a
 **production** `find_package` path. Pick one.
 
@@ -167,14 +174,21 @@ that completed output size before allocating the readback buffer.
 
 The Jetson-PI fork must be used as a locked version with its own GGML — do not
 mix another llama.cpp/GGML version into the same provider (ABI/symbol/layout
-conflicts). The final migration is developed, independently reviewed, and
-GPU-verified against Jetson-PI commit
-`9c8e8b30e629a2475958c7b8a0bfb06f6f05295d` on local branch
-`flashrt-migration-merge`. That commit
-is based on upstream `origin/merge` commit
-`436fdb2aceaf564e152be6e0779180f56a279074`; the pre-merge implementation is
-preserved at `origin/flashrt-migration-master-baseline`
-(`68dd395b3f89dbd031ae564e335780f702fbd1e7`).
+conflicts).
+
+Jetson-PI is a public repository: https://github.com/PKU-SEC-Lab/Jetson-PI-Edge,
+branch `Jetson-PI-flashrt`. The provider is GPU-verified against the tip of
+that branch (commit `5de3f9e210086f7bc04c5a434990bd28e7ed2240` as of
+2026-07-15). Tracked by https://github.com/flashrt-project/FlashRT/issues/143.
+
+The original migration was developed against a private fork (branch
+`flashrt-migration-merge`, commit
+`9c8e8b30e629a2475958c7b8a0bfb06f6f05295d`, based on upstream `origin/merge`
+commit `436fdb2aceaf564e152be6e0779180f56a279074`); that history has since
+been opened as the public `Jetson-PI-flashrt` branch above, so the private
+commit SHAs are no longer reachable and are kept here only as a provenance
+record.
+
 When upgrading the fork, re-run the parity tests
 (`test_llama_cpp_jetson_pi_parity` / `test_llama_cpp_jetson_pi_llm_parity`) to
 confirm FlashRT's provider path still matches the direct `jetson_pi_*` path

@@ -192,6 +192,12 @@ if(FLASHRT_CPP_WITH_JETSON_PI)
   # STATIC provider minus the test-only link check; exports
   # frt_llama_cpp_default_engine_factory + frt_llama_cpp_pi0_runtime_open_with_engine_factory
   # for dlopen. Linux default visibility exposes the extern "C" symbols.
+  #
+  # Jetson-PI is linked PUBLIC here (vs PRIVATE on the STATIC provider above)
+  # intentionally: the SHARED _c.so is consumed by ctypes dlopen, so its NEEDED
+  # entries must name libjetson_pi_*.so / libmtmd / libllama / libggml so the
+  # dynamic loader resolves them at dlopen time. The STATIC provider is linked
+  # into test executables that name those libs directly, so PRIVATE suffices.
   add_library(flashrt_cpp_llama_cpp_provider_c SHARED
     providers/llama_cpp/src/checkpoint_identity.cpp
     providers/llama_cpp/src/pi0_runtime.cpp
@@ -229,6 +235,11 @@ if(BUILD_TESTING)
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
   add_test(NAME cpp_modalities COMMAND test_cpp_modalities)
 
+  # test_pi05_runtime / test_device_staging transitively reference
+  # frt_graph_replay (via flashrt_cpp_pi05 -> runtime.cpp), which lives in
+  # flashrt_exec. They cannot link with FLASHRT_CPP_WITH_EXEC=OFF, so gate
+  # them on EXEC — this also keeps the Jetson-PI CPU-only provider build
+  # (FLASHRT_CPP_WITH_EXEC=OFF, no CUDA) clean under BUILD_TESTING=ON.
   if(FLASHRT_CPP_WITH_EXEC)
     add_executable(test_pi05_runtime tests/test_pi05_runtime.cpp)
     target_link_libraries(test_pi05_runtime
@@ -308,8 +319,8 @@ if(BUILD_TESTING)
 
       add_executable(test_llama_cpp_jetson_pi_llm_parity
         tests/test_llama_cpp_jetson_pi_llm_parity.cpp)
-    target_link_libraries(test_llama_cpp_jetson_pi_llm_parity
-      PRIVATE flashrt_cpp_llama_cpp_provider ${_frt_jetson_pi_llm})
+      target_link_libraries(test_llama_cpp_jetson_pi_llm_parity
+        PRIVATE flashrt_cpp_llama_cpp_provider ${_frt_jetson_pi_llm})
       add_test(NAME llama_cpp_jetson_pi_llm_parity
         COMMAND test_llama_cpp_jetson_pi_llm_parity)
 

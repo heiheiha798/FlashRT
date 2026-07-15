@@ -8,15 +8,22 @@ stable benchmarks and not cross-backend speed claims.
 ## Validated Revisions
 
 - FlashRT validation baseline:
-  `91a5cc3132ba0543823a02fce9f46719c14d0be5` on local branch
-  `jetson-pi-link-check`. The provider implementation was complete at
-  `0080e3daa383b077955d3063f2ab755de1996dca`; later commits through this
-  baseline corrected and finalized the validation record.
+  branch `jetson-pi-link-check` (fork `heiheiha798/FlashRT`), tracked by
+  https://github.com/flashrt-project/FlashRT/issues/143. The provider
+  implementation was complete at `0080e3daa383b077955d3063f2ab755de1996dca`;
+  later commits through this baseline corrected and finalized the validation
+  record. (The pre-rebase history recorded baseline `91a5cc3`; commit SHAs
+  shift on rebase, so the branch + issue are the stable reference.)
 - Jetson-PI revision:
-  `9c8e8b30e629a2475958c7b8a0bfb06f6f05295d` on local branch
-  `flashrt-migration-merge`, based on
-  `origin/merge@436fdb2aceaf564e152be6e0779180f56a279074`. The prior migration is
-  preserved at `origin/flashrt-migration-master-baseline@68dd395b3f89dbd031ae564e335780f702fbd1e7`.
+  public repository https://github.com/PKU-SEC-Lab/Jetson-PI-Edge, branch
+  `Jetson-PI-flashrt`, tip `5de3f9e210086f7bc04c5a434990bd28e7ed2240`
+  (2026-07-15). Originally developed against a private fork (branch
+  `flashrt-migration-merge`, commit
+  `9c8e8b30e629a2475958c7b8a0bfb06f6f05295d`, based on
+  `origin/merge@436fdb2aceaf564e152be6e0779180f56a279074`; the prior migration
+  is preserved at `origin/flashrt-migration-master-baseline@68dd395b3f89dbd031ae564e335780f702fbd1e7`).
+  That history has since been opened as the public `Jetson-PI-flashrt` branch,
+  so the private SHAs are kept here only as provenance.
 - CUDA/Vulkan/SYCL device used for final accelerator runs: physical GPU 6,
   NVIDIA GeForce RTX 4090. CUDA used `CUDA_VISIBLE_DEVICES=6`; Vulkan used
   `GGML_VK_VISIBLE_DEVICES=6`; SYCL used `ONEAPI_DEVICE_SELECTOR=cuda:6` with
