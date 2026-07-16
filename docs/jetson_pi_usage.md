@@ -1,5 +1,19 @@
 # Jetson-PI providers (Python)
 
+Jetson-PI is the inference engine introduced in
+["Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned
+Asynchronous Inference"](https://arxiv.org/abs/2607.12659). It targets
+onboard, real-time robot control with PI0 and PI0.5 vision-language-action
+models by running the policy through llama.cpp/GGML and exposing optimized
+foreground inference paths across multiple backends, including desktop NVIDIA
+GPUs, Jetson Orin/Thor-class devices, CPU-only builds, and NPU-oriented edge
+integrations. The Jetson-PI codebase is available at
+[PKU-SEC-Lab/Jetson-PI-Edge, branch `Jetson-PI-flashrt`](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge/tree/Jetson-PI-flashrt).
+
+This FlashRT provider integrates the Jetson-PI runtime so applications can
+load the same Jetson-PI GGUF model artifacts through FlashRT's Python API
+instead of running the Jetson-PI HTTP foreground server.
+
 `flash_rt.load_model(..., framework="jetson_pi")` drives Jetson-PI
 llama.cpp/GGML providers through the FlashRT `frt_model_runtime_v2` C ABI
 via ctypes. No torch/jax, no GPU arch detection.
