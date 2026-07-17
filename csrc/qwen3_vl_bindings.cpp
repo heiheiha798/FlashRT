@@ -306,6 +306,16 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
     BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_64x128x128_w8);
     BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_128x128x128_w8);
 #undef BIND_GEMM_TILE
+
+    // Residual-fold GEMM bench bindings: D = bf16(acc) + resid. Same tile set
+    // as the residual-fold kernels (fp8_block128_gemm_*_resid). Exposed only for
+    // dev builds so the production pybind surface stays runtime-only.
+#define BIND_GEMM_TILE_RESID(NAME)                                                   m.def("bench_" #NAME,                                                          [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,                   uintptr_t act_scale, uintptr_t w_scale, uintptr_t resid, uintptr_t stream) { return flash_rt::gemm::block128_sm89::NAME(                                      to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,                                     reinterpret_cast<const float*>(act_scale),                                       reinterpret_cast<const float*>(w_scale), to_ptr(resid), to_stream(stream));         },                                                                             py::arg("A"), py::arg("B"), py::arg("D"),                                      py::arg("M"), py::arg("N"), py::arg("K"),                                       py::arg("act_block_scale"), py::arg("w_block_scale"),                          py::arg("resid"), py::arg("stream") = 0)
+    BIND_GEMM_TILE_RESID(fp8_block128_gemm_bs_sm89_32x64x128_w4_resid);
+    BIND_GEMM_TILE_RESID(fp8_block128_gemm_bs_sm89_64x64x128_w4_resid);
+    BIND_GEMM_TILE_RESID(fp8_block128_gemm_bs_sm89_64x64x128_w4_s1_resid);
+    BIND_GEMM_TILE_RESID(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1_resid);
+#undef BIND_GEMM_TILE_RESID
 #endif
 
     m.def("qwen3_qk_norm_rope_kvwrite_bf16",

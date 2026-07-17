@@ -66,8 +66,15 @@ __device__ __forceinline__ void ldmatrix_x4_b16(
 //  - B: [N, K] row-major FP8 e4m3, w_scale [N/128, K/128] fp32
 //  - D: [M, N] row-major BF16
 //  - BLOCK_N must keep each warp's 8-wide N-atoms inside one 128 scale block.
+//
+// RESID (opt-in epilogue fold): when true, the BF16 store adds a per-element
+// residual `resid[M, N]` (same BF16 layout as D): D = bf16(acc + resid).
+// This folds what would otherwise be a separate residual_add launch + an
+// extra D round-trip through HBM, mirroring #134's residual-fold epilogue.
+// When RESID=false, `resid` is unused and the `if constexpr (RESID)` branch
+// is dead-stripped at compile time, so the baseline kernel is byte-identical.
 template <int BLOCK_M, int BLOCK_N, int NUM_WARPS, int STAGES,
-          int MIN_BLOCKS_PER_SM>
+          int MIN_BLOCKS_PER_SM, bool RESID = false>
 __global__ __launch_bounds__(NUM_WARPS * 32, MIN_BLOCKS_PER_SM)
 void fp8_bs_gemm_kernel(
     const __nv_fp8_e4m3* __restrict__ A,
@@ -75,7 +82,8 @@ void fp8_bs_gemm_kernel(
     const float* __restrict__ act_scale,   // [M, K/128]
     const float* __restrict__ w_scale,     // [N/128, K/128]
     __nv_bfloat16* __restrict__ D,
-    int M, int N, int K)
+    int M, int N, int K,
+    const __nv_bfloat16* __restrict__ resid = nullptr)  // [M, N] BF16, used iff RESID
 {
     constexpr int BLOCK_K    = 128;
     constexpr int THREADS    = NUM_WARPS * 32;
@@ -310,22 +318,56 @@ void fp8_bs_gemm_kernel(
         for (int ni = 0; ni < N_ATOMS_PW; ++ni) {
             int n_pair_base = n_base + warp_id * N_ATOMS_PW * 8 + ni * 8 + 2 * l;
             // acc[0,1] = row0 cols {2l,2l+1}; acc[2,3] = row1 cols {2l,2l+1}.
-            // Emit one 32-bit bfloat162 store per row instead of two scalar
-            // 16-bit stores (NCU's top store-pattern bottleneck after C1).
-            // Tail (odd last column) falls back to scalar stores.
-            if (row0 < M && col_pair_ok(n_pair_base, N)) {
-                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row0 * N + n_pair_base]) =
-                    __floats2bfloat162_rn(acc[mi][ni][0], acc[mi][ni][1]);
-            } else if (row0 < M) {
-                if (n_pair_base < N)     D[(size_t)row0 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][0]);
-                if (n_pair_base + 1 < N) D[(size_t)row0 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][1]);
-            }
-            if (row1 < M && col_pair_ok(n_pair_base, N)) {
-                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row1 * N + n_pair_base]) =
-                    __floats2bfloat162_rn(acc[mi][ni][2], acc[mi][ni][3]);
-            } else if (row1 < M) {
-                if (n_pair_base < N)     D[(size_t)row1 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][2]);
-                if (n_pair_base + 1 < N) D[(size_t)row1 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][3]);
+            // RESID epilogue fold: add the BF16 residual in-register before the
+            // bf16 store, so the residual read is fused into the GEMM epilogue
+            // and never lands as a separate D HBM round-trip + launch.
+            if constexpr (RESID) {
+                if (row0 < M && col_pair_ok(n_pair_base, N)) {
+                    __nv_bfloat162 r = *reinterpret_cast<const __nv_bfloat162*>(
+                        &resid[(size_t)row0 * N + n_pair_base]);
+                    *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row0 * N + n_pair_base]) =
+                        __floats2bfloat162_rn(acc[mi][ni][0] + __low2float(r),
+                                               acc[mi][ni][1] + __high2float(r));
+                } else if (row0 < M) {
+                    if (n_pair_base < N)
+                        D[(size_t)row0 * N + n_pair_base] = __float2bfloat16(
+                            acc[mi][ni][0] + __bfloat162float(resid[(size_t)row0 * N + n_pair_base]));
+                    if (n_pair_base + 1 < N)
+                        D[(size_t)row0 * N + n_pair_base + 1] = __float2bfloat16(
+                            acc[mi][ni][1] + __bfloat162float(resid[(size_t)row0 * N + n_pair_base + 1]));
+                }
+                if (row1 < M && col_pair_ok(n_pair_base, N)) {
+                    __nv_bfloat162 r = *reinterpret_cast<const __nv_bfloat162*>(
+                        &resid[(size_t)row1 * N + n_pair_base]);
+                    *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row1 * N + n_pair_base]) =
+                        __floats2bfloat162_rn(acc[mi][ni][2] + __low2float(r),
+                                               acc[mi][ni][3] + __high2float(r));
+                } else if (row1 < M) {
+                    if (n_pair_base < N)
+                        D[(size_t)row1 * N + n_pair_base] = __float2bfloat16(
+                            acc[mi][ni][2] + __bfloat162float(resid[(size_t)row1 * N + n_pair_base]));
+                    if (n_pair_base + 1 < N)
+                        D[(size_t)row1 * N + n_pair_base + 1] = __float2bfloat16(
+                            acc[mi][ni][3] + __bfloat162float(resid[(size_t)row1 * N + n_pair_base + 1]));
+                }
+            } else {
+                // Emit one 32-bit bfloat162 store per row instead of two scalar
+                // 16-bit stores (NCU's top store-pattern bottleneck after C1).
+                // Tail (odd last column) falls back to scalar stores.
+                if (row0 < M && col_pair_ok(n_pair_base, N)) {
+                    *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row0 * N + n_pair_base]) =
+                        __floats2bfloat162_rn(acc[mi][ni][0], acc[mi][ni][1]);
+                } else if (row0 < M) {
+                    if (n_pair_base < N)     D[(size_t)row0 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][0]);
+                    if (n_pair_base + 1 < N) D[(size_t)row0 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][1]);
+                }
+                if (row1 < M && col_pair_ok(n_pair_base, N)) {
+                    *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row1 * N + n_pair_base]) =
+                        __floats2bfloat162_rn(acc[mi][ni][2], acc[mi][ni][3]);
+                } else if (row1 < M) {
+                    if (n_pair_base < N)     D[(size_t)row1 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][2]);
+                    if (n_pair_base + 1 < N) D[(size_t)row1 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][3]);
+                }
             }
         }
     }

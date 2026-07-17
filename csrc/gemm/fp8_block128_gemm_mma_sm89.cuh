@@ -45,6 +45,22 @@ DECL(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1);
 
 #undef DECL
 
+// Residual-fold tile variants (epilogue adds `resid`): D = bf16(acc) + resid.
+// resid is [M, N] BF16 row-major, same layout as D. Fuses the residual add
+// into the GEMM epilogue (no separate residual_add launch, no D HBM
+// round-trip). Additive — the non-resid kernels above are unchanged.
+#define DECL_RESID(NAME)                                                       \
+  int NAME(const void* A, const void* B, void* D, int M, int N, int K,         \
+           const float* act_scale, const float* w_scale, const void* resid,    \
+           cudaStream_t stream)
+
+DECL_RESID(fp8_block128_gemm_bs_sm89_32x64x128_w4_resid);
+DECL_RESID(fp8_block128_gemm_bs_sm89_64x64x128_w4_resid);
+DECL_RESID(fp8_block128_gemm_bs_sm89_64x64x128_w4_s1_resid);
+DECL_RESID(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1_resid);
+
+#undef DECL_RESID
+
 // Auto-dispatch over the tuned tile set above based on (M, N, K).
 int fp8_block128_gemm_blockscaled_sm89_bf16out(
     const void* A, const void* B, void* D, int M, int N, int K,
