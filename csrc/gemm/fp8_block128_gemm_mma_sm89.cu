@@ -114,6 +114,79 @@ int launch_resid_(const void* A, const void* B, void* D,
                                            w_scale, resid, s);                \
   }
 
+// GeGLU silu-fold launch: fuses gate+up GEMM + silu(gate)*up + per-token
+// block-128 FP8 quant into one launch (no [M,2N] BF16 transient). B is
+// gate_up_w [2*N, K] (gate rows [0,N), up rows [N,2N)); w_scale is gate_up_s
+// [2*N/128, K/128]. Outputs FP8 [M,N] + scale [M,N/128]. See device header.
+template <int BM, int BN, int W, int STAGES, int MIN_BLK>
+int launch_geglu_silu_fold_(const void* A, const void* B,
+                            int M, int N, int K, const float* act_scale,
+                            const float* w_scale, void* output, float* out_scale,
+                            cudaStream_t s)
+{
+    constexpr int BK = 128;
+    constexpr int SCALE_KTILE = 8;
+    int grid_m = (M + BM - 1) / BM;
+    int grid_n = (N + BN - 1) / BN;        // over output N (== inter), NOT 2*N
+    dim3 grid(grid_m, grid_n, 1);
+    dim3 block(W * 32, 1, 1);
+    // A/B cp.async stages + gate_smem (BM*BN bf16) + scales + amax scratch.
+    int smem_bytes = STAGES * (BM + BN) * BK
+                   + (BM * BN) * (int)sizeof(__nv_bfloat16)
+                   + (BM * SCALE_KTILE + 2 * SCALE_KTILE) * (int)sizeof(float)
+                   + (W * BM + BM) * (int)sizeof(float);
+    if (smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(
+            (const void*)&fp8_bs_geglu_silu_fold_kernel<BM, BN, W, STAGES, MIN_BLK>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    }
+    fp8_bs_geglu_silu_fold_kernel<BM, BN, W, STAGES, MIN_BLK><<<grid, block, smem_bytes, s>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(A),
+        reinterpret_cast<const __nv_fp8_e4m3*>(B),
+        act_scale, w_scale,
+        reinterpret_cast<__nv_fp8_e4m3*>(output),
+        out_scale, M, N, K);
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : 1;
+}
+
+// A-persistent interleaved variant: stage A once, reuse ONE B smem region for
+// gate then up within each k-iter (both gate+up acc live in regs, true
+// interleaved per K-tile). Single B region -> 3 CTA/SM at s1 (vs interleaved's
+// 2, vs two-pass's 3). See fp8_bs_geglu_silu_fold_apersist_kernel.
+template <int BM, int BN, int W, int STAGES, int MIN_BLK>
+int launch_geglu_silu_fold_apersist_(const void* A, const void* B,
+                                     int M, int N, int K, const float* act_scale,
+                                     const float* w_scale, void* output,
+                                     float* out_scale, cudaStream_t s)
+{
+    constexpr int BK = 128;
+    constexpr int SCALE_KTILE = 8;
+    int grid_m = (M + BM - 1) / BM;
+    int grid_n = (N + BN - 1) / BN;
+    dim3 grid(grid_m, grid_n, 1);
+    dim3 block(W * 32, 1, 1);
+    // Same smem layout as the two-pass variant (gate_smem region kept for layout
+    // parity though apersist doesn't use it as a handoff — gate stays in regs).
+    int smem_bytes = STAGES * (BM + BN) * BK
+                   + (BM * BN) * (int)sizeof(__nv_bfloat16)
+                   + (BM * SCALE_KTILE + 2 * SCALE_KTILE) * (int)sizeof(float)
+                   + (W * BM + BM) * (int)sizeof(float);
+    if (smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(
+            (const void*)&fp8_bs_geglu_silu_fold_apersist_kernel<BM, BN, W, STAGES, MIN_BLK>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    }
+    fp8_bs_geglu_silu_fold_apersist_kernel<BM, BN, W, STAGES, MIN_BLK><<<grid, block, smem_bytes, s>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(A),
+        reinterpret_cast<const __nv_fp8_e4m3*>(B),
+        act_scale, w_scale,
+        reinterpret_cast<__nv_fp8_e4m3*>(output),
+        out_scale, M, N, K);
+    cudaError_t err = cudaGetLastError();
+    return (err == cudaSuccess) ? 0 : 1;
+}
+
 DEFINE(fp8_block128_gemm_bs_sm89_32x128x128_w4,   32, 128, 4, 2, 4)
 DEFINE(fp8_block128_gemm_bs_sm89_64x128x128_w4,   64, 128, 4, 2, 4)
 DEFINE(fp8_block128_gemm_bs_sm89_64x128x128_w8,   64, 128, 8, 2, 4)
@@ -140,6 +213,40 @@ DEFINE_RESID(fp8_block128_gemm_bs_sm89_64x64x128_w4_s1_resid, 64,  64, 4, 1, 4)
 DEFINE_RESID(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1_resid, 128, 128, 8, 1, 2)
 
 #undef DEFINE_RESID
+
+// GeGLU silu-fold tile variants (BLOCK_N pinned to 128 = one quant block).
+#define DEFINE_GEGLU(NAME, BM, BN, W, S, MB)                                 \
+  int NAME(const void* A, const void* B, int M, int N, int K,                 \
+           const float* act_scale, const float* w_scale, void* output,        \
+           float* out_scale, cudaStream_t s) {                                \
+    return launch_geglu_silu_fold_<BM, BN, W, S, MB>(                         \
+        A, B, M, N, K, act_scale, w_scale, output, out_scale, s);             \
+  }
+DEFINE_GEGLU(fp8_bs_geglu_silu_fold_sm89_32x128_w4_s2, 32, 128, 4, 2, 4)
+DEFINE_GEGLU(fp8_bs_geglu_silu_fold_sm89_16x128_w4_s2, 16, 128, 4, 2, 4)
+DEFINE_GEGLU(fp8_bs_geglu_silu_fold_sm89_64x128_w4_s2, 64, 128, 4, 2, 4)
+DEFINE_GEGLU(fp8_bs_geglu_silu_fold_sm89_128x128_w8_s1, 128, 128, 8, 1, 2)
+// Low-smem variants (STAGES=1) to recover occupancy lost to gate_smem on sm89:
+// the s2 dual-buffer + gate_smem pushes dynamic smem >48KB → Block Limit Shared
+// Mem = 1 (8% occupancy, ncu-confirmed). s1 trades cp.async overlap for 3-4x
+// the CTA density. Primary candidates for the prefill M>=128 regime.
+DEFINE_GEGLU(fp8_bs_geglu_silu_fold_sm89_32x128_w4_s1, 32, 128, 4, 1, 4)
+DEFINE_GEGLU(fp8_bs_geglu_silu_fold_sm89_16x128_w4_s1, 16, 128, 4, 1, 4)
+#undef DEFINE_GEGLU
+
+// A-persistent interleaved variant (single B smem region, gate+up acc both in
+// regs). launch wrapper shares the smem formula with the two-pass variant.
+#define DEFINE_GEGLU_AP(NAME, BM, BN, W, S, MB)                              \
+  int NAME(const void* A, const void* B, int M, int N, int K,                 \
+           const float* act_scale, const float* w_scale, void* output,        \
+           float* out_scale, cudaStream_t s) {                                \
+    return launch_geglu_silu_fold_apersist_<BM, BN, W, S, MB>(                \
+        A, B, M, N, K, act_scale, w_scale, output, out_scale, s);             \
+  }
+DEFINE_GEGLU_AP(fp8_bs_geglu_silu_fold_apersist_sm89_32x128_w4_s1, 32, 128, 4, 1, 2)
+DEFINE_GEGLU_AP(fp8_bs_geglu_silu_fold_apersist_sm89_16x128_w4_s1, 16, 128, 4, 1, 2)
+DEFINE_GEGLU_AP(fp8_bs_geglu_silu_fold_apersist_sm89_32x128_w4_s2, 32, 128, 4, 2, 2)
+#undef DEFINE_GEGLU_AP
 
 int fp8_block128_gemm_blockscaled_sm89_bf16out(
     const void* A, const void* B, void* D, int M, int N, int K,
