@@ -1,5 +1,5 @@
 // Numerical-parity test: FlashRT's Jetson-PI LLM provider (via
-// frt_model_runtime_v2) vs a DIRECT jetson_pi_llm call, same prompt / sampling
+// frt_model_runtime_v1) vs a DIRECT jetson_pi_llm call, same prompt / sampling
 // / backend. Proves the FlashRT port/stage/verb plumbing does not perturb the
 // generated text relative to the native narrow C API.
 //
@@ -21,6 +21,7 @@
 // when a GPU is available.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
+#include "llama_cpp_generic_plan.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 #include "jetson_pi_llm.h"
 
@@ -64,7 +65,7 @@ int main() {
     const uint32_t seed = 1;
     const uint32_t max_tokens = 64;
 
-    // ---- PATH A: FlashRT frt_model_runtime_v2 wrapper ----------------------
+    // ---- PATH A: FlashRT frt_model_runtime_v1 wrapper ----------------------
     std::string text_flashrt;
     std::vector<float> logits_flashrt;
     int32_t token_flashrt = 0;
@@ -86,7 +87,7 @@ int main() {
             "\"top_p\":" + std::to_string(top_p) + ","
             "\"seed\":" + std::to_string(seed) + ","
             "\"max_tokens\":" + std::to_string(max_tokens) + "}";
-        frt_model_runtime_v2 * model = nullptr;
+        frt_model_runtime_v1 * model = nullptr;
         int rc = frt_llama_cpp_llm_runtime_open_with_engine_factory(
             json.c_str(), factory, &model);
         if (rc != 0 || !model) {
@@ -95,48 +96,43 @@ int main() {
             g_fail = 1;
         } else {
             CHECK(true, "open FlashRT LLM runtime from JSON");
-            CHECK(model->verbs_v2.set_input(model->self,
+            CHECK(model->verbs.set_input(model->self,
                                             FRT_LLAMA_CPP_LLM_PORT_PROMPT,
                                             prompt, std::strlen(prompt), -1) == 0,
                   "FlashRT set_input prompt");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER, -1) == 0,
+            CHECK(model->verbs.step(model->self) == 0,
                   "FlashRT run_stage infer");
             uint64_t written = 0;
-            rc = model->verbs_v2.get_output(
+            rc = model->verbs.get_output(
                 model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT,
                 nullptr, 0, &written, -1);
             CHECK(rc == -5 && written > 0,
                   "FlashRT query generated text size");
             text_flashrt.assign(written, '\0');
             written = 0;
-            rc = model->verbs_v2.get_output(
+            rc = model->verbs.get_output(
                 model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, &text_flashrt[0],
                 text_flashrt.size(), &written, -1);
             CHECK(rc == 0 && written > 0, "FlashRT get_output text non-empty");
             text_flashrt.resize(written);
             std::printf("    FlashRT text: %s\n", text_flashrt.c_str());
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0 &&
-                  model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0,
+            CHECK(llama_cpp_run_generic_stage(model, "reset") == 0 &&
+                  llama_cpp_run_generic_stage(model, "prefill") == 0,
                   "FlashRT staged prefill");
             uint64_t logits_bytes = 0;
-            CHECK(model->verbs_v2.get_output(
+            CHECK(model->verbs.get_output(
                       model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS,
                       nullptr, 0, &logits_bytes, -1) != 0 && logits_bytes > 0,
                   "FlashRT query logits size");
             logits_flashrt.resize(logits_bytes / sizeof(float));
-            CHECK(model->verbs_v2.get_output(
+            CHECK(model->verbs.get_output(
                       model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS,
                       logits_flashrt.data(), logits_bytes, &logits_bytes,
                       -1) == 0 &&
-                  model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE,
-                      -1) == 0,
+                  llama_cpp_run_generic_stage(model, "decode") == 0,
                   "FlashRT read logits and decode first token");
             uint64_t token_bytes = 0;
-            CHECK(model->verbs_v2.get_output(
+            CHECK(model->verbs.get_output(
                       model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN,
                       &token_flashrt, sizeof(token_flashrt), &token_bytes,
                       -1) == 0,

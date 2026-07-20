@@ -18,10 +18,8 @@ Env:
                             and use_gpu for the mmproj). CUDA_VISIBLE_DEVICES
                             selects the physical card.
 
-Run from the repo root:
-    FLASHRT_PI0_MODEL=... FLASHRT_PI0_MMPROJ=... FLASHRT_PI0_FIXTURE_DIR=/tmp/pi0_fixture \
-    LD_LIBRARY_PATH=.../miniconda3/lib:FlashRT/cpp/build-jetson-pi \
-    python flash_rt/tests/test_jetson_pi_pi0_python.py
+Run from the repository root after installing the provider or adding its
+install directory to the platform dynamic-loader search path.
 """
 
 import os
@@ -96,47 +94,7 @@ def main():
         check(False, "actions contain NaN/Inf")
     check(bool(np.any(actions != 0)), "actions are not all zero")
 
-    actions_view = model._pipe.action_view()
-    check(not actions_view.flags.writeable,
-          "actions host SWAP view is read-only")
-    check(np.shares_memory(actions_view, np.asarray(actions_view)),
-          "actions host SWAP view is zero-copy")
-    check(np.array_equal(actions_view, actions),
-          "actions host SWAP view matches copied output")
-    dlpack_actions = np.from_dlpack(actions_view)
-    check(not dlpack_actions.flags.writeable and
-          dlpack_actions.ctypes.data == actions_view.ctypes.data and
-          np.array_equal(dlpack_actions, actions),
-          "NumPy consumes actions DLPack zero-copy and read-only")
-    actions_view.close()
-    try:
-        model._pipe.set_prompt(prompt)
-        model._pipe.context({"images": [image, wrist], "state": state})
-        check(False, "live DLPack consumer retains its host mapping")
-    except RuntimeError as exc:
-        check("mapped" in str(exc),
-              "live DLPack consumer retains its host mapping")
-    del dlpack_actions
-
-    try:
-        import torch
-    except ImportError:
-        print("SKIP - PyTorch DLPack legacy-protocol rejection check")
-        torch_legacy_checked = False
-    else:
-        torch_legacy_checked = True
-        torch_view = model._pipe.action_view()
-        try:
-            torch.from_dlpack(torch_view)
-            check(False, "PyTorch legacy DLPack cannot erase read-only access")
-        except BufferError as exc:
-            check("readonly" in str(exc),
-                  "PyTorch legacy DLPack cannot erase read-only access")
-        torch_view.close()
-
     model._pipe.context({"images": [image, wrist], "state": state})
-    if torch_legacy_checked:
-        check(True, "failed legacy DLPack export releases its host mapping")
     split_actions = model._pipe.action()
     check(np.array_equal(split_actions, actions),
           "context/action stages are bit-identical to predict")

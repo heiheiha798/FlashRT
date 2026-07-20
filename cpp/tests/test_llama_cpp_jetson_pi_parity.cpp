@@ -1,5 +1,5 @@
 // Numerical-parity test: FlashRT's Jetson-PI Pi0 provider (via
-// frt_model_runtime_v2) vs a DIRECT jetson_pi_pi0 call, same inputs / backend
+// frt_model_runtime_v1) vs a DIRECT jetson_pi_pi0 call, same inputs / backend
 // / thread count. Proves the FlashRT port/stage/verb plumbing does not
 // perturb the action chunk relative to the native narrow C API.
 //
@@ -37,6 +37,7 @@
 //                            to FlashRT's action chunk.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
+#include "llama_cpp_generic_plan.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 #include "jetson_pi_pi0.h"
 
@@ -137,7 +138,7 @@ int main() {
     const size_t n_elems = static_cast<size_t>(action_steps) * action_dim;
     const size_t n_bytes = n_elems * sizeof(float);
 
-    // ---- PATH A: FlashRT frt_model_runtime_v2 wrapper ----------------------
+    // ---- PATH A: FlashRT frt_model_runtime_v1 wrapper ----------------------
     std::vector<float> actions_flashrt(n_elems, 0.0f);
     std::vector<float> actions_split(n_elems, 0.0f);
     {
@@ -154,7 +155,7 @@ int main() {
             "\"n_views\":2,\"image_height\":224,\"image_width\":224,"
             "\"image_channels\":3,\"action_steps\":" + std::to_string(action_steps) +
             ",\"action_dim\":" + std::to_string(action_dim) + "}";
-        frt_model_runtime_v2 * model = nullptr;
+        frt_model_runtime_v1 * model = nullptr;
         int rc = frt_llama_cpp_pi0_runtime_open_with_engine_factory(
             json.c_str(), factory, &model);
         if (rc != 0 || !model) {
@@ -163,8 +164,9 @@ int main() {
             g_fail = 1;
         } else {
             CHECK(true, "open FlashRT Pi0 runtime from JSON");
-            CHECK(model->n_stages_v2 == 3,
-                  "FlashRT Pi0 runtime exposes infer/context/action stages");
+            const auto* plan = llama_cpp_generic_plan(model);
+            CHECK(model->n_stages == 0 && plan && plan->n_stages == 2,
+                  "FlashRT Pi0 runtime exposes selected context/action plan");
 
             frt_image_view views[2];
             views[0].struct_size = sizeof(frt_image_view);
@@ -176,105 +178,73 @@ int main() {
             views[1] = views[0];
             views[1].data = wrist;
 
-            CHECK(model->verbs_v2.set_input(model->self,
+            CHECK(model->verbs.set_input(model->self,
                                             FRT_LLAMA_CPP_PI0_PORT_IMAGES,
                                             &views[0], sizeof(views), -1) == 0,
                   "FlashRT set_input images");
-            CHECK(model->verbs_v2.set_input(model->self,
+            CHECK(model->verbs.set_input(model->self,
                                             FRT_LLAMA_CPP_PI0_PORT_PROMPT,
                                             prompt.data(), prompt.size(), -1) == 0,
                   "FlashRT set_input prompt");
-            CHECK(model->verbs_v2.set_input(model->self,
+            CHECK(model->verbs.set_input(model->self,
                                             FRT_LLAMA_CPP_PI0_PORT_STATE,
                                             state_bytes.data(),
                                             state_bytes.size(), -1) == 0,
                   "FlashRT set_input state");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER, -1) == 0,
+            CHECK(model->verbs.step(model->self) == 0,
                   "FlashRT run_stage infer");
 
             uint64_t written = 0;
-            rc = model->verbs_v2.get_output(
+            rc = model->verbs.get_output(
                 model->self, FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
                 actions_flashrt.data(), n_bytes, &written, -1);
             CHECK(rc == 0 && written == n_bytes,
                   "FlashRT get_output actions shape matches config");
-            const frt_memory_token_desc & actions_token =
-                model->port_tokens[FRT_LLAMA_CPP_PI0_PORT_ACTIONS];
-            void * mapped_actions = nullptr;
-            CHECK(actions_token.verbs->struct_size >=
-                      sizeof(frt_memory_token_verbs) &&
-                  actions_token.verbs->map_host(
-                      actions_token.handle, actions_token.offset,
-                      actions_token.bytes, FRT_RT_HOST_MAP_READ,
-                      &mapped_actions) == 0 && mapped_actions != nullptr &&
-                  std::memcmp(mapped_actions, actions_flashrt.data(), n_bytes) == 0,
-                  "Pi0 actions token maps a byte-identical zero-copy host view");
-            CHECK(model->verbs_v2.set_input(
-                      model->self, FRT_LLAMA_CPP_PI0_PORT_PROMPT,
-                      prompt.data(), prompt.size(), -1) == -6,
-                  "Pi0 input mutation is rejected while host view is mapped");
-            CHECK(actions_token.verbs->unmap_host(
-                      actions_token.handle, mapped_actions) == 0,
-                  "Pi0 zero-copy host view unmaps explicitly");
-            CHECK(actions_token.verbs->unmap_host(
-                      actions_token.handle, mapped_actions) != 0,
-                  "Pi0 zero-copy host view rejects duplicate unmap");
-
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) == 0,
+            CHECK(llama_cpp_run_generic_stage(model, "context") == 0,
                   "FlashRT run_stage context");
-            CHECK(model->verbs_v2.set_input(
+            CHECK(model->verbs.set_input(
                       model->self, FRT_LLAMA_CPP_PI0_PORT_PROMPT,
                       prompt.data(), prompt.size(), -1) == 0,
                   "new Pi0 input discards pending context");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) == -7,
+            CHECK(llama_cpp_run_generic_stage(model, "action") == -7,
                   "action after replacement input is not ready");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) == 0,
+            CHECK(llama_cpp_run_generic_stage(model, "context") == 0,
                   "FlashRT rebuilds context after replacement input");
-            CHECK(model->verbs_v2.set_input(
+            CHECK(model->verbs.set_input(
                       model->self, FRT_LLAMA_CPP_PI0_PORT_STATE,
                       state_bytes.data(), state_bytes.size() - sizeof(float), -1) != 0,
                   "invalid replacement input is rejected");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) != 0,
+            CHECK(llama_cpp_run_generic_stage(model, "context") != 0,
                   "failed state replacement invalidates the previous state");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) != 0,
+            CHECK(llama_cpp_run_generic_stage(model, "action") != 0,
                   "failed replacement input blocks action execution");
-            CHECK(model->verbs_v2.set_input(
+            CHECK(model->verbs.set_input(
                       model->self, FRT_LLAMA_CPP_PI0_PORT_STATE,
                       state_bytes.data(), state_bytes.size(), -1) == 0,
                   "restore valid Pi0 state after invalid replacement");
             frt_image_view bad_views[2] = {views[0], views[1]};
             bad_views[0].stride_bytes = 1;
-            CHECK(model->verbs_v2.set_input(
+            CHECK(model->verbs.set_input(
                       model->self, FRT_LLAMA_CPP_PI0_PORT_IMAGES,
                       bad_views, sizeof(bad_views), -1) != 0,
                   "undersized Pi0 image stride is rejected");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) != 0,
+            CHECK(llama_cpp_run_generic_stage(model, "context") != 0,
                   "failed image replacement invalidates previous images");
-            CHECK(model->verbs_v2.set_input(
+            CHECK(model->verbs.set_input(
                       model->self, FRT_LLAMA_CPP_PI0_PORT_IMAGES,
                       views, sizeof(views), -1) == 0,
                   "restore valid Pi0 images after failed replacement");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT, -1) == 0,
+            CHECK(llama_cpp_run_generic_stage(model, "context") == 0,
                   "FlashRT rebuilds context after failed replacement");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) == 0,
+            CHECK(llama_cpp_run_generic_stage(model, "action") == 0,
                   "FlashRT run_stage action");
             written = 0;
-            rc = model->verbs_v2.get_output(
+            rc = model->verbs.get_output(
                 model->self, FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
                 actions_split.data(), n_bytes, &written, -1);
             CHECK(rc == 0 && written == n_bytes,
                   "FlashRT split stages produced action chunk");
-            CHECK(model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION, -1) == -7,
+            CHECK(llama_cpp_run_generic_stage(model, "action") == -7,
                   "Pi0 action stage consumes pending context exactly once");
             model->release(model->owner);
         }

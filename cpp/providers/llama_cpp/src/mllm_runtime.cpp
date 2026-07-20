@@ -1,4 +1,4 @@
-// frt_llama_cpp_mllm_runtime — v2 runtime wrapper for a multimodal LLM
+// frt_llama_cpp_mllm_runtime — v1 runtime wrapper for a multimodal LLM
 // engine. Mirrors llm_runtime.cpp's shape but with 3 STAGED ports (images
 // IMAGE in, prompt TEXT in, text TEXT out) + 1 callback "infer" stage.
 // Strict JSON open path. No GGML types appear here.
@@ -27,6 +27,11 @@ struct RuntimeOwner {
     int64_t eog_shape[1] = {1};
     bool staged_decode = false;
 };
+
+constexpr uint32_t kInferExecutor = 37;
+constexpr uint32_t kResetExecutor = 4;
+constexpr uint32_t kPrefillExecutor = 91;
+constexpr uint32_t kDecodeExecutor = 113;
 
 int unsupported_prepare(void* self, uint32_t, frt_shape_key) {
     auto* owner = static_cast<RuntimeOwner*>(self);
@@ -67,8 +72,7 @@ int get_output(void* self, uint32_t port, void* out, uint64_t capacity,
     return rc;
 }
 
-int run_stage(void* self, uint32_t stage, int stream) {
-    (void)stream;
+int run_engine_stage(void* self, uint32_t stage) {
     auto* owner = static_cast<RuntimeOwner*>(self);
     if (!owner) return -1;
     const int rc = owner->staged_decode
@@ -84,7 +88,28 @@ int run_stage(void* self, uint32_t stage, int stream) {
 }
 
 int step(void* self) {
-    return run_stage(self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER, -1);
+    return run_engine_stage(self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER);
+}
+
+int run_opaque(void* self, uint32_t executor_ref) {
+    switch (executor_ref) {
+        case kInferExecutor:
+            return run_engine_stage(
+                self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER);
+        case kResetExecutor:
+            return run_engine_stage(
+                self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_RESET);
+        case kPrefillExecutor:
+            return run_engine_stage(
+                self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_PREFILL);
+        case kDecodeExecutor:
+            return run_engine_stage(
+                self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE);
+        default:
+            static_cast<RuntimeOwner*>(self)->last_error =
+                "unknown llama_cpp MLLM executor ref";
+            return -2;
+    }
 }
 
 const char* last_error(void* self) {
@@ -106,7 +131,7 @@ void destroy_owner(void* self) {
 extern "C" int frt_llama_cpp_mllm_runtime_create_with_engine(
         const frt_llama_cpp_mllm_config* config,
         const frt_llama_cpp_engine_v1* engine,
-        frt_model_runtime_v2** out) {
+        frt_model_runtime_v1** out) {
     if (!out) return -1;
     *out = nullptr;
     if (!config || config->struct_size < FRT_LLAMA_CPP_MLLM_CONFIG_BASE_SIZE ||
@@ -131,7 +156,7 @@ extern "C" int frt_llama_cpp_mllm_runtime_create_with_engine(
                            owner->engine.run_stage;
     if (owner->engine.retain) owner->engine.retain(owner->engine.self);
 
-    frt_runtime_builder b = frt_runtime_builder_create_provider_owned();
+    frt_runtime_builder b = frt_model_runtime_builder_create_metadata();
     if (!b) {
         destroy_owner(owner);
         return -5;
@@ -150,8 +175,6 @@ extern "C" int frt_llama_cpp_mllm_runtime_create_with_engine(
         b, "text", FRT_RT_MOD_TEXT, FRT_RT_DTYPE_U8, FRT_RT_LAYOUT_FLAT,
         FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0, owner->text_shape, 1, 0,
         nullptr, 0, 0);
-    rc |= frt_runtime_builder_add_callback_stage_v2(
-        b, "infer", 0, nullptr, 0);
     if (owner->staged_decode) {
         rc |= frt_runtime_builder_add_port(
             b, "next_token", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_I32,
@@ -165,17 +188,23 @@ extern "C" int frt_llama_cpp_mllm_runtime_create_with_engine(
             b, "is_eog", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_I32,
             FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0,
             owner->eog_shape, 1, 0, nullptr, 0, 0);
-        rc |= frt_runtime_builder_add_callback_stage_v2(
-            b, "reset", 0, nullptr, 0);
-        const uint32_t prefill_after[1] = {
-            FRT_LLAMA_CPP_MLLM_STAGE_INDEX_RESET};
-        rc |= frt_runtime_builder_add_callback_stage_v2(
-            b, "prefill", 0, prefill_after, 1);
-        const uint32_t decode_after[1] = {
-            FRT_LLAMA_CPP_MLLM_STAGE_INDEX_PREFILL};
-        rc |= frt_runtime_builder_add_callback_stage_v2(
-            b, "decode", 0, decode_after, 1);
+        rc |= frt_runtime_builder_add_generic_stage(
+            b, "reset", FRT_GENERIC_STAGE_OPAQUE, kResetExecutor,
+            nullptr, 0);
+        const uint32_t prefill_after[1] = {0};
+        rc |= frt_runtime_builder_add_generic_stage(
+            b, "prefill", FRT_GENERIC_STAGE_OPAQUE, kPrefillExecutor,
+            prefill_after, 1);
+        const uint32_t decode_after[1] = {1};
+        rc |= frt_runtime_builder_add_generic_stage(
+            b, "decode", FRT_GENERIC_STAGE_OPAQUE, kDecodeExecutor,
+            decode_after, 1);
+    } else {
+        rc |= frt_runtime_builder_add_generic_stage(
+            b, "infer", FRT_GENERIC_STAGE_OPAQUE, kInferExecutor,
+            nullptr, 0);
     }
+    rc |= frt_runtime_builder_set_generic_stage_runner(b, owner, run_opaque);
     rc |= frt_runtime_builder_add_identity(b, "provider", "llama_cpp");
     rc |= frt_runtime_builder_add_identity(b, "model_family", "mllm");
     rc |= frt_runtime_builder_add_identity(b, "model_path", config->model_path);
@@ -203,24 +232,26 @@ extern "C" int frt_llama_cpp_mllm_runtime_create_with_engine(
         b, "seed", std::to_string(config->seed).c_str());
     rc |= frt_runtime_builder_add_identity(
         b, "max_tokens", std::to_string(config->max_tokens).c_str());
+    rc |= frt_runtime_builder_add_identity(
+        b, "stage_plan", owner->staged_decode ? "staged_decode" : "full");
     if (rc != 0) {
-        frt_runtime_builder_discard(b);
+        (void)frt_runtime_builder_finish(b, nullptr, nullptr, nullptr);
         destroy_owner(owner);
         return -1;
     }
 
-    frt_model_runtime_verbs_v2 verbs{};
+    frt_model_runtime_verbs verbs{};
     verbs.struct_size = sizeof(verbs);
     verbs.set_input = set_input;
     verbs.get_output = get_output;
     verbs.prepare = unsupported_prepare;
     verbs.step = step;
     verbs.last_error = last_error;
-    verbs.run_stage = run_stage;
 
-    frt_model_runtime_v2* model = frt_runtime_builder_finish_model_v2(
+    frt_model_runtime_v1* model = frt_runtime_builder_finish_model(
         b, &verbs, owner, owner, nullptr, destroy_owner);
     if (!model) {
+        (void)frt_runtime_builder_finish(b, nullptr, nullptr, nullptr);
         destroy_owner(owner);
         return -1;
     }
@@ -231,7 +262,7 @@ extern "C" int frt_llama_cpp_mllm_runtime_create_with_engine(
 extern "C" int frt_llama_cpp_mllm_runtime_open_with_engine_factory(
         const char* config_json,
         const frt_llama_cpp_engine_factory_v1* factory,
-        frt_model_runtime_v2** out) {
+        frt_model_runtime_v1** out) {
     flashrt::providers::llama_cpp::clear_runtime_open_error();
     flashrt::providers::llama_cpp::set_runtime_open_error(
         "invalid MLLM runtime open arguments or JSON config");
@@ -497,7 +528,7 @@ extern "C" int frt_llama_cpp_mllm_runtime_open_with_engine_factory(
             "factory returned an invalid MLLM engine");
         return -1;
     }
-    frt_model_runtime_v2* model = nullptr;
+    frt_model_runtime_v1* model = nullptr;
     const int create_rc =
         frt_llama_cpp_mllm_runtime_create_with_engine(&config, &engine, &model);
     engine.release(engine.self);

@@ -1,6 +1,7 @@
 // Numerical parity: FlashRT MLLM provider versus direct jetson_pi_mllm.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
+#include "llama_cpp_generic_plan.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 #include "jetson_pi_mllm.h"
 
@@ -47,7 +48,7 @@ int main() {
             "\",\"backend\":\"" + backend +
             "\",\"n_ctx\":2048,\"n_threads\":0,\"temp\":0.0,"
             "\"top_k\":0,\"top_p\":0.0,\"seed\":1,\"max_tokens\":16}";
-        frt_model_runtime_v2* model = nullptr;
+        frt_model_runtime_v1* model = nullptr;
         int rc = frt_llama_cpp_mllm_runtime_open_with_engine_factory(
             json.c_str(), factory, &model);
         CHECK(rc == 0 && model, "open FlashRT MLLM runtime");
@@ -59,24 +60,22 @@ int main() {
             image.bytes = rgb.size();
             image.width = width;
             image.height = height;
-            CHECK(model->verbs_v2.set_input(
+            CHECK(model->verbs.set_input(
                       model->self, FRT_LLAMA_CPP_MLLM_PORT_IMAGES,
                       &image, sizeof(image), -1) == 0 &&
-                  model->verbs_v2.set_input(
+                  model->verbs.set_input(
                       model->self, FRT_LLAMA_CPP_MLLM_PORT_PROMPT,
                       prompt, std::strlen(prompt), -1) == 0 &&
-                  model->verbs_v2.run_stage(
-                      model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER,
-                      -1) == 0,
+                  model->verbs.step(model->self) == 0,
                   "run FlashRT MLLM image+text infer");
             uint64_t written = 0;
-            rc = model->verbs_v2.get_output(
+            rc = model->verbs.get_output(
                 model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT,
                 nullptr, 0, &written, -1);
             CHECK(rc == -5 && written > 0, "query FlashRT MLLM text size");
             flashrt_text.assign(written, '\0');
             written = 0;
-            rc = model->verbs_v2.get_output(
+            rc = model->verbs.get_output(
                 model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT,
                 flashrt_text.data(), flashrt_text.size(), &written, -1);
             CHECK(rc == 0 && written > 0, "read FlashRT MLLM text");

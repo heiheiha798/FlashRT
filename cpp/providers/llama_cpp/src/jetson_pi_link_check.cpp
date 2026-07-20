@@ -17,12 +17,9 @@ extern "C" int frt_llama_cpp_jetson_pi_link_check(void) {
     const char* marker = mtmd_default_marker();
     if (!marker || std::strlen(marker) == 0) return -1;
 
-    /* Force a link-time reference to the Phase 1 Pi0 whole-graph entry point
-     * (CLAUDE.md: mtmd_helper_eval_chunks_pi0 is the priority provider entry).
-     * The default-param symbols above do not by themselves exercise this TU's
-     * dependence on the Pi0 infer path. The `volatile` store defeats DCE so
-     * the address must be materialized as an undefined symbol resolved from
-     * libmtmd at link time. */
+    /* Force a link-time reference to the Pi0 whole-request entry point. The
+     * default-parameter symbols alone do not exercise this translation unit's
+     * dependency on the Pi0 inference path. */
     volatile auto eval_pi0 = &mtmd_helper_eval_chunks_pi0;
     (void)eval_pi0;
 
@@ -40,7 +37,7 @@ extern "C" int frt_llama_cpp_jetson_pi_link_check(void) {
 
     frt_llama_cpp_engine_v1 engine{};
     engine.struct_size = sizeof(engine);
-    frt_model_runtime_v2* model = nullptr;
+    frt_model_runtime_v1* model = nullptr;
     if (frt_llama_cpp_pi0_runtime_create_with_engine(&cfg, &engine, &model) !=
         -1) {
         if (model) model->release(model->owner);

@@ -20,6 +20,10 @@ struct RuntimeOwner {
     bool staged_context_action = false;
 };
 
+constexpr uint32_t kInferExecutor = 37;
+constexpr uint32_t kContextExecutor = 4;
+constexpr uint32_t kActionExecutor = 91;
+
 int unsupported_prepare(void* self, uint32_t, frt_shape_key) {
     auto* owner = static_cast<RuntimeOwner*>(self);
     if (owner) owner->last_error = "llama_cpp Pi0 provider has no graph variants";
@@ -59,8 +63,7 @@ int get_output(void* self, uint32_t port, void* out, uint64_t capacity,
     return rc;
 }
 
-int run_stage(void* self, uint32_t stage, int stream) {
-    (void)stream;
+int run_engine_stage(void* self, uint32_t stage) {
     auto* owner = static_cast<RuntimeOwner*>(self);
     if (!owner) return -1;
     const int rc = owner->staged_context_action
@@ -76,7 +79,25 @@ int run_stage(void* self, uint32_t stage, int stream) {
 }
 
 int step(void* self) {
-    return run_stage(self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER, -1);
+    return run_engine_stage(self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER);
+}
+
+int run_opaque(void* self, uint32_t executor_ref) {
+    switch (executor_ref) {
+        case kInferExecutor:
+            return run_engine_stage(
+                self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER);
+        case kContextExecutor:
+            return run_engine_stage(
+                self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT);
+        case kActionExecutor:
+            return run_engine_stage(
+                self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION);
+        default:
+            static_cast<RuntimeOwner*>(self)->last_error =
+                "unknown llama_cpp Pi0 executor ref";
+            return -2;
+    }
 }
 
 const char* last_error(void* self) {
@@ -97,7 +118,7 @@ void destroy_owner(void* self) {
 extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
         const frt_llama_cpp_pi0_config* config,
         const frt_llama_cpp_engine_v1* engine,
-        frt_model_runtime_v2** out) {
+        frt_model_runtime_v1** out) {
     if (!out) return -1;
     *out = nullptr;
     if (!config || config->struct_size < FRT_LLAMA_CPP_PI0_CONFIG_BASE_SIZE ||
@@ -137,7 +158,7 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
     owner->action_shape[0] = static_cast<int64_t>(config->action_steps);
     owner->action_shape[1] = static_cast<int64_t>(config->action_dim);
 
-    frt_runtime_builder b = frt_runtime_builder_create_provider_owned();
+    frt_runtime_builder b = frt_model_runtime_builder_create_metadata();
     if (!b) {
         destroy_owner(owner);
         return -5;
@@ -157,41 +178,24 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
         b, "state", FRT_RT_MOD_STATE, FRT_RT_DTYPE_F32, FRT_RT_LAYOUT_FLAT,
         FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1, owner->state_shape, 1, 0,
         nullptr, 0, 0);
-    // Phase 6: the actions OUT port carries a memory-domain token (handle =
-    // engine.self, the provider Engine*) so a consumer can read the action
-    // chunk through frt_memory_token_verbs as well as get_output. HOST_VISIBLE:
-    // actions_buf is host memory, read live at copy_to_host call time. The
-    // port desc this produces is byte-identical to add_port (STAGED, no raw
-    // buffer), so the model identity/fingerprint and get_output are unchanged.
-    // Only minted when a real Jetson-PI engine is linked; without
-    // FLASHRT_CPP_WITH_JETSON_PI there is no backing store to advertise (the
-    // fake-engine unit test path uses add_port and reads via get_output).
-#if defined(FLASHRT_CPP_WITH_JETSON_PI)
-    const uint64_t action_window_bytes =
-        static_cast<uint64_t>(config->action_steps) *
-        static_cast<uint64_t>(config->action_dim) * sizeof(float);
-    rc |= frt_runtime_builder_add_port_token(
-        b, "actions", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32, FRT_RT_LAYOUT_FLAT,
-        FRT_RT_PORT_OUT, 0, owner->action_shape, 2, 0,
-        reinterpret_cast<frt_memory_token>(owner->engine.self),
-        frt_jetson_pi_actions_token_verbs(),
-        /*offset=*/0, action_window_bytes, FRT_RT_LOCATION_HOST_VISIBLE);
-#else
     rc |= frt_runtime_builder_add_port(
         b, "actions", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32, FRT_RT_LAYOUT_FLAT,
         FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0, owner->action_shape, 2, 0,
         nullptr, 0, 0);
-#endif
-    rc |= frt_runtime_builder_add_callback_stage_v2(
-        b, "infer", 0, nullptr, 0);
     if (owner->staged_context_action) {
-        rc |= frt_runtime_builder_add_callback_stage_v2(
-            b, "context", 0, nullptr, 0);
-        const uint32_t action_after[1] = {
-            FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT};
-        rc |= frt_runtime_builder_add_callback_stage_v2(
-            b, "action", 0, action_after, 1);
+        rc |= frt_runtime_builder_add_generic_stage(
+            b, "context", FRT_GENERIC_STAGE_OPAQUE, kContextExecutor,
+            nullptr, 0);
+        const uint32_t action_after[1] = {0};
+        rc |= frt_runtime_builder_add_generic_stage(
+            b, "action", FRT_GENERIC_STAGE_OPAQUE, kActionExecutor,
+            action_after, 1);
+    } else {
+        rc |= frt_runtime_builder_add_generic_stage(
+            b, "infer", FRT_GENERIC_STAGE_OPAQUE, kInferExecutor,
+            nullptr, 0);
     }
+    rc |= frt_runtime_builder_set_generic_stage_runner(b, owner, run_opaque);
     rc |= frt_runtime_builder_add_identity(b, "provider", "llama_cpp");
     rc |= frt_runtime_builder_add_identity(b, "model_family", "pi0");
     rc |= frt_runtime_builder_add_identity(b, "model_path", config->model_path);
@@ -205,24 +209,27 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
             b, "mmproj_sha256", config->mmproj_identity);
     }
     rc |= frt_runtime_builder_add_identity(b, "backend", config->backend);
+    rc |= frt_runtime_builder_add_identity(
+        b, "stage_plan",
+        owner->staged_context_action ? "context_action" : "full");
     if (rc != 0) {
-        frt_runtime_builder_discard(b);
+        (void)frt_runtime_builder_finish(b, nullptr, nullptr, nullptr);
         destroy_owner(owner);
         return -1;
     }
 
-    frt_model_runtime_verbs_v2 verbs{};
+    frt_model_runtime_verbs verbs{};
     verbs.struct_size = sizeof(verbs);
     verbs.set_input = set_input;
     verbs.get_output = get_output;
     verbs.prepare = unsupported_prepare;
     verbs.step = step;
     verbs.last_error = last_error;
-    verbs.run_stage = run_stage;
 
-    frt_model_runtime_v2* model = frt_runtime_builder_finish_model_v2(
+    frt_model_runtime_v1* model = frt_runtime_builder_finish_model(
         b, &verbs, owner, owner, nullptr, destroy_owner);
     if (!model) {
+        (void)frt_runtime_builder_finish(b, nullptr, nullptr, nullptr);
         destroy_owner(owner);
         return -1;
     }
@@ -233,7 +240,7 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
 extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
         const char* config_json,
         const frt_llama_cpp_engine_factory_v1* factory,
-        frt_model_runtime_v2** out) {
+        frt_model_runtime_v1** out) {
     flashrt::providers::llama_cpp::clear_runtime_open_error();
     flashrt::providers::llama_cpp::set_runtime_open_error(
         "invalid Pi0 runtime open arguments or JSON config");
@@ -442,7 +449,7 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
             "factory returned an invalid Pi0 engine");
         return -1;
     }
-    frt_model_runtime_v2* model = nullptr;
+    frt_model_runtime_v1* model = nullptr;
     const int create_rc =
         frt_llama_cpp_pi0_runtime_create_with_engine(&config, &engine,
                                                      &model);

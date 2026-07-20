@@ -1,11 +1,11 @@
 """Jetson-PI Pi0 frontend — drives the Jetson-PI llama.cpp/GGML Pi0 provider
-through the FlashRT ``frt_model_runtime_v2`` C ABI via ctypes.
+through the FlashRT ``frt_model_runtime_v1`` C ABI via ctypes.
 
-This frontend is the Phase 2 Python entry for the Jetson-PI provider. It
-dlopens the SHARED provider library (``libflashrt_cpp_llama_cpp_provider_c.so``)
+It dlopens the SHARED provider library
+(``libflashrt_cpp_llama_cpp_provider_c.so``)
 built under ``FLASHRT_CPP_WITH_JETSON_PI``, opens a Pi0 runtime through
-``frt_llama_cpp_default_engine_factory`` + ``open_with_engine_factory``, and
-drives one whole-graph Pi0 infer per ``infer(observation)`` call.
+``frt_model_runtime_open_v1``, and drives one whole-model Pi0 infer per
+``infer(observation)`` call.
 
 The frontend intentionally does no action unnormalization / LIBERO slicing:
 it returns the raw ``action_steps × action_dim`` action chunk the model
@@ -19,6 +19,7 @@ Memory: the Jetson-PI engine copies all inputs on ``set_input`` (see
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import json
 import os
 
@@ -43,14 +44,7 @@ class FrtImageView(ctypes.Structure):
     ]
 
 
-# ---- frt_model_runtime_v2 verbs + struct mirrors (only the fields we touch) ----
-#
-# We only need: abi_version, struct_size (sanity), self, verbs_v2 (for
-# set_input/get_output/run_stage/last_error), owner, release. The full struct
-# has more fields (exp, ports, stages, verbs v1, retain, stages_v2) but ctypes
-# only requires correct field ORDER up to the last one we read; trailing fields
-# can be omitted as long as we never touch them. To stay robust against layout
-# drift we mirror the full v2 layout.
+# ---- frt_model_runtime_v1 + GENERIC_STAGE_PLAN_V1 ctypes mirrors -----------
 
 _SetInputFn = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
@@ -63,47 +57,7 @@ _PrepareFn = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64)
 _StepFn = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
 _LastErrorFn = ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_void_p)
-_RunStageFn = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int)
 _RetainReleaseFn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-_TokenCopyToHostFn = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)
-_TokenCopyFromHostFn = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)
-_TokenSyncFn = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
-_TokenDestroyFn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-_TokenMapHostFn = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
-    ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p))
-_TokenUnmapHostFn = ctypes.CFUNCTYPE(
-    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-
-
-class _FrtMemoryTokenVerbs(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-        ("copy_to_host", _TokenCopyToHostFn),
-        ("copy_from_host", _TokenCopyFromHostFn),
-        ("sync", _TokenSyncFn),
-        ("destroy", _TokenDestroyFn),
-        ("map_host", _TokenMapHostFn),
-        ("unmap_host", _TokenUnmapHostFn),
-    ]
-
-
-class _FrtMemoryTokenDesc(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("handle", ctypes.c_void_p),
-        ("verbs", ctypes.POINTER(_FrtMemoryTokenVerbs)),
-        ("offset", ctypes.c_uint64),
-        ("bytes", ctypes.c_uint64),
-        ("location_kind", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-    ]
 
 
 class _FrtVerbsV1(ctypes.Structure):
@@ -118,21 +72,39 @@ class _FrtVerbsV1(ctypes.Structure):
     ]
 
 
-class _FrtVerbsV2(ctypes.Structure):
+class FrtModelRuntimeV1(ctypes.Structure):
+    pass
+
+
+_QueryExtensionFn = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.POINTER(FrtModelRuntimeV1), ctypes.c_uint64,
+    ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p))
+_RunOpaqueFn = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+
+
+class _GenericStageDescV1(ctypes.Structure):
     _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-        ("set_input", _SetInputFn),
-        ("get_output", _GetOutputFn),
-        ("prepare", _PrepareFn),
-        ("step", _StepFn),
-        ("last_error", _LastErrorFn),
-        ("run_stage", _RunStageFn),
+        ("name", ctypes.c_char_p),
+        ("executor_kind", ctypes.c_uint32),
+        ("executor_ref", ctypes.c_uint32),
+        ("n_after", ctypes.c_uint32),
+        ("after", ctypes.POINTER(ctypes.c_uint32)),
     ]
 
 
-class FrtModelRuntimeV2(ctypes.Structure):
+class _GenericStagePlanV1(ctypes.Structure):
     _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("struct_size", ctypes.c_uint32),
+        ("stages", ctypes.POINTER(_GenericStageDescV1)),
+        ("n_stages", ctypes.c_uint64),
+        ("stage_self", ctypes.c_void_p),
+        ("run_opaque", _RunOpaqueFn),
+    ]
+
+
+FrtModelRuntimeV1._fields_ = [
         ("abi_version", ctypes.c_uint32),
         ("struct_size", ctypes.c_uint32),
         ("exp", ctypes.c_void_p),
@@ -145,66 +117,8 @@ class FrtModelRuntimeV2(ctypes.Structure):
         ("owner", ctypes.c_void_p),
         ("retain", _RetainReleaseFn),
         ("release", _RetainReleaseFn),
-        ("stages_v2", ctypes.c_void_p),
-        ("n_stages_v2", ctypes.c_uint64),
-        ("verbs_v2", _FrtVerbsV2),
-        ("port_tokens", ctypes.POINTER(_FrtMemoryTokenDesc)),
-        ("n_port_tokens", ctypes.c_uint64),
-    ]
-
-
-class _MappedActions(np.ndarray):
-    def __new__(cls, frontend, token, pointer):
-        count = frontend.action_steps * frontend.action_dim
-        buffer = (ctypes.c_float * count).from_address(pointer)
-        view = np.ctypeslib.as_array(buffer).reshape(
-            frontend.action_steps, frontend.action_dim).view(cls)
-        view._frontend = frontend
-        view._token = token
-        view._pointer = pointer
-        view._closed = False
-        view._owns_mapping = True
-        view._owner = frontend._model.owner
-        view._release = frontend._model.release
-        frontend._model.retain(view._owner)
-        view.setflags(write=False)
-        return view
-
-    def __array_finalize__(self, source):
-        if source is None:
-            return
-        self._frontend = getattr(source, "_frontend", None)
-        self._token = getattr(source, "_token", None)
-        self._pointer = getattr(source, "_pointer", None)
-        self._closed = True
-        self._owns_mapping = False
-        self._owner = None
-        self._release = None
-
-    def close(self):
-        if self._closed or not self._owns_mapping:
-            return
-        rc = self._token.verbs.contents.unmap_host(
-            self._token.handle, self._pointer)
-        if rc != 0:
-            raise RuntimeError(f"unmap_host actions failed (rc={rc})")
-        self._closed = True
-        self._release(self._owner)
-
-    def __dlpack__(self, *, stream=None, max_version=None,
-                   dl_device=None, copy=None):
-        if self._closed:
-            raise RuntimeError("cannot export a closed actions host view")
-        dlpack_view = self._frontend._map_actions()
-        return np.ndarray.__dlpack__(
-            dlpack_view, stream=stream, max_version=max_version,
-            dl_device=dl_device, copy=copy)
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
+        ("query_extension", _QueryExtensionFn),
+]
 
 
 # Port indices (c_api.h: FRT_LLAMA_CPP_PI0_PORT_*)
@@ -216,17 +130,39 @@ STAGE_INFER = 0
 STAGE_CONTEXT = 1
 STAGE_ACTION = 2
 
-# frt_model_runtime_v2 abi_version (model_runtime.h: FRT_MODEL_RUNTIME_ABI_VERSION_V2)
-_FRT_MODEL_RUNTIME_ABI_VERSION_V2 = 2
+_FRT_MODEL_RUNTIME_ABI_VERSION = 1
+_FRT_EXT_GENERIC_STAGE_PLAN_V1 = 1
 _F32_BYTES = np.dtype(np.float32).itemsize
+
+
+def _generic_plan(model):
+    extension = ctypes.c_void_p()
+    rc = model.query_extension(
+        ctypes.byref(model), _FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+        ctypes.byref(extension))
+    if rc != 0 or not extension.value:
+        raise RuntimeError(f"generic stage plan query failed (rc={rc})")
+    plan = _GenericStagePlanV1.from_address(extension.value)
+    if plan.abi_version < 1 or not plan.stages or not plan.run_opaque:
+        raise RuntimeError("provider returned an invalid generic stage plan")
+    return plan
+
+
+def _run_generic_stage(model, name):
+    plan = _generic_plan(model)
+    encoded = name.encode("utf-8")
+    for index in range(plan.n_stages):
+        stage = plan.stages[index]
+        if stage.name == encoded:
+            return plan.run_opaque(plan.stage_self, stage.executor_ref)
+    raise RuntimeError(f"generic stage {name!r} is not in the selected plan")
 
 
 def _find_lib(lib_path, env_var="FLASHRT_PI0_LIB"):
     """Resolve the SHARED provider .so path.
 
-    Priority: explicit ``lib_path`` kwarg > ``env_var`` env > build-dir
-    convention. An explicit ``lib_path`` that does not exist is a hard error
-    (no silent fallback to env/build-dirs) so callers get deterministic loads.
+    Priority: explicit ``lib_path`` kwarg, environment override, then the
+    platform dynamic-loader search path. An explicit path is a hard contract.
     """
     if lib_path is not None:
         if not os.path.exists(lib_path):
@@ -236,50 +172,8 @@ def _find_lib(lib_path, env_var="FLASHRT_PI0_LIB"):
     env = os.environ.get(env_var)
     if env and os.path.exists(env):
         return env
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(os.path.dirname(os.path.dirname(here)))
-    candidates = [
-        os.path.join(repo, "cpp", "build-jetson-pi",
-                     "libflashrt_cpp_llama_cpp_provider_c.so"),
-        os.path.join(repo, "cpp", "build-container",
-                     "libflashrt_cpp_llama_cpp_provider_c.so"),
-        os.path.join(repo, "cpp", "build",
-                     "libflashrt_cpp_llama_cpp_provider_c.so"),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    raise RuntimeError(
-        "libflashrt_cpp_llama_cpp_provider_c.so not found. Build it with "
-        "-DFLASHRT_CPP_WITH_JETSON_PI=ON, or pass lib_path=, or set "
-        f"{env_var}.")
-
-
-# frt_llama_cpp_engine_factory_v1 layout:
-#   uint32 struct_size; uint32 reserved; void* self;
-#   int (*create_pi0)(void*, const cfg*, engine*);
-#   int (*create_llm)(void*, const cfg*, engine*);   // Phase 3, between pi0 and last_error
-#   const char* (*last_error)(void*);
-# self is nullptr for the default factory; last_error ignores it (returns the
-# thread-local create-error sink). Defined at module scope so it is not
-# re-created per instance. Field order MUST match c_api.h exactly — ctypes
-# reads by offset, so a missing field shifts every later field.
-class _FactoryV1(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-        ("self", ctypes.c_void_p),
-        ("create_pi0", ctypes.CFUNCTYPE(
-            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p)),
-        ("create_llm", ctypes.CFUNCTYPE(
-            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p)),
-        ("create_mllm", ctypes.CFUNCTYPE(
-            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p)),
-        ("last_error", ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_void_p)),
-    ]
+    return (ctypes.util.find_library("flashrt_cpp_llama_cpp_provider_c") or
+            "libflashrt_cpp_llama_cpp_provider_c.so")
 
 
 class Pi0JetsonPiFrontend:
@@ -304,27 +198,9 @@ class Pi0JetsonPiFrontend:
         self._lib_path = _find_lib(lib_path)
         self._lib = ctypes.CDLL(self._lib_path)
 
-        # C ABI signatures.
-        self._lib.frt_llama_cpp_default_engine_factory.argtypes = []
-        self._lib.frt_llama_cpp_default_engine_factory.restype = ctypes.c_void_p
-        try:
-            self._lib.frt_llama_cpp_runtime_open_error.argtypes = []
-            self._lib.frt_llama_cpp_runtime_open_error.restype = ctypes.c_char_p
-        except AttributeError as exc:
-            raise RuntimeError(
-                "provider .so is older than the Python frontend expects: "
-                "missing frt_llama_cpp_runtime_open_error") from exc
-
-        # frt_llama_cpp_engine_factory_v1 { struct_size, reserved, self,
-        #   create_pi0(self, config*, engine*) -> int, last_error(self) -> char* }
-        # We only call create_pi0 and last_error through the returned pointer.
-        self._lib.frt_llama_cpp_pi0_runtime_open_with_engine_factory.argtypes = [
-            ctypes.c_char_p,           # config_json
-            ctypes.c_void_p,           # factory*
-            ctypes.POINTER(ctypes.c_void_p),  # out model**
-        ]
-        self._lib.frt_llama_cpp_pi0_runtime_open_with_engine_factory.restype = (
-            ctypes.c_int)
+        self._lib.frt_model_runtime_open_v1.argtypes = [
+            ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+        self._lib.frt_model_runtime_open_v1.restype = ctypes.c_int
 
         config = {
             "model_family": "pi0",
@@ -342,43 +218,25 @@ class Pi0JetsonPiFrontend:
         # not handle \uXXXX escapes, only raw UTF-8 bytes.
         config_json = json.dumps(config, ensure_ascii=False).encode("utf-8")
 
-        factory_ptr = self._lib.frt_llama_cpp_default_engine_factory()
-        if not factory_ptr:
-            raise RuntimeError(
-                "frt_llama_cpp_default_engine_factory returned NULL "
-                "(FlashRT built without FLASHRT_CPP_WITH_JETSON_PI?)")
-
-        factory = _FactoryV1.from_address(factory_ptr)
-        if factory.struct_size < ctypes.sizeof(_FactoryV1):
-            raise RuntimeError(
-                f"frt_llama_cpp_engine_factory_v1 struct_size="
-                f"{factory.struct_size} < ctypes sizeof "
-                f"{ctypes.sizeof(_FactoryV1)}; provider .so is older than the "
-                f"Python frontend expects.")
-
         model_ptr = ctypes.c_void_p(0)
-        rc = self._lib.frt_llama_cpp_pi0_runtime_open_with_engine_factory(
-            config_json, factory_ptr, ctypes.byref(model_ptr))
+        rc = self._lib.frt_model_runtime_open_v1(
+            config_json, ctypes.byref(model_ptr))
         if rc != 0 or not model_ptr.value:
-            err = self._lib.frt_llama_cpp_runtime_open_error() or b""
-            if not err:
-                err = factory.last_error(factory.self) or b""
             raise RuntimeError(
-                f"frt_llama_cpp_pi0_runtime_open_with_engine_factory failed "
-                f"(rc={rc}): {(err.decode(errors='replace') if err else 'no error')}")
+                f"frt_model_runtime_open_v1 failed for Pi0 (rc={rc})")
 
-        self._model = FrtModelRuntimeV2.from_address(model_ptr.value)
+        self._model = FrtModelRuntimeV1.from_address(model_ptr.value)
         # ABI gate: refuse to drive a struct laid out for a different ABI
         # version (mirrors the check in runtime/bindings/runtime_pybind.cpp).
-        if self._model.abi_version != _FRT_MODEL_RUNTIME_ABI_VERSION_V2:
+        if self._model.abi_version != _FRT_MODEL_RUNTIME_ABI_VERSION:
             raise RuntimeError(
-                f"frt_model_runtime_v2 abi_version={self._model.abi_version}, "
-                f"expected {_FRT_MODEL_RUNTIME_ABI_VERSION_V2}; the provider "
+                f"frt_model_runtime_v1 abi_version={self._model.abi_version}, "
+                f"expected {_FRT_MODEL_RUNTIME_ABI_VERSION}; the provider "
                 f".so was built against a different FlashRT runtime ABI.")
-        if self._model.struct_size < ctypes.sizeof(FrtModelRuntimeV2):
+        if self._model.struct_size < ctypes.sizeof(FrtModelRuntimeV1):
             raise RuntimeError(
-                f"frt_model_runtime_v2 struct_size={self._model.struct_size} "
-                f"< ctypes sizeof {ctypes.sizeof(FrtModelRuntimeV2)}; the "
+                f"frt_model_runtime_v1 struct_size={self._model.struct_size} "
+                f"< ctypes sizeof {ctypes.sizeof(FrtModelRuntimeV1)}; the "
                 f"provider .so is older than the Python frontend expects.")
         self._model_ptr = model_ptr  # keep the uintptr for sanity
 
@@ -419,26 +277,26 @@ class Pi0JetsonPiFrontend:
         state_padded = np.zeros(self.action_dim, dtype=np.float32)
         state_padded[:state.size] = state
 
-        v2 = self._model.verbs_v2
+        verbs = self._model.verbs
         self_ = self._model.self
 
-        rc = v2.set_input(self_, PORT_IMAGES, ctypes.cast(views, ctypes.c_void_p),
+        rc = verbs.set_input(self_, PORT_IMAGES, ctypes.cast(views, ctypes.c_void_p),
                           ctypes.sizeof(FrtImageView) * len(images), -1)
         self._check(rc, "set_input images")
-        rc = v2.set_input(self_, PORT_PROMPT, self._prompt,
+        rc = verbs.set_input(self_, PORT_PROMPT, self._prompt,
                           len(self._prompt), -1)
         self._check(rc, "set_input prompt")
-        rc = v2.set_input(self_, PORT_STATE, state_padded.ctypes.data,
+        rc = verbs.set_input(self_, PORT_STATE, state_padded.ctypes.data,
                           state_padded.nbytes, -1)
         self._check(rc, "set_input state")
 
-        rc = v2.run_stage(self_, STAGE_INFER, -1)
-        self._check(rc, "run_stage infer")
+        rc = verbs.step(self_)
+        self._check(rc, "step infer")
 
         capacity = self.action_steps * self.action_dim * _F32_BYTES
         out = (ctypes.c_char * capacity)()
         written = ctypes.c_uint64(0)
-        rc = v2.get_output(self_, PORT_ACTIONS, out, capacity,
+        rc = verbs.get_output(self_, PORT_ACTIONS, out, capacity,
                            ctypes.byref(written), -1)
         self._check(rc, "get_output actions")
         need = capacity
@@ -472,32 +330,32 @@ class Pi0JetsonPiFrontend:
         state_padded = np.zeros(self.action_dim, dtype=np.float32)
         state_padded[:state.size] = state
         views = self._make_image_views(images)
-        v2 = self._model.verbs_v2
+        verbs = self._model.verbs
         self_ = self._model.self
-        self._check(v2.set_input(
+        self._check(verbs.set_input(
             self_, PORT_IMAGES, ctypes.cast(views, ctypes.c_void_p),
             ctypes.sizeof(FrtImageView) * len(images), -1),
             "set_input images")
-        self._check(v2.set_input(
+        self._check(verbs.set_input(
             self_, PORT_PROMPT, self._prompt, len(self._prompt), -1),
             "set_input prompt")
-        self._check(v2.set_input(
+        self._check(verbs.set_input(
             self_, PORT_STATE, state_padded.ctypes.data,
             state_padded.nbytes, -1), "set_input state")
-        self._check(v2.run_stage(self_, STAGE_CONTEXT, -1),
-                    "run_stage context")
+        self._check(_run_generic_stage(self._model, "context"),
+                    "generic stage context")
 
     def action(self):
         """Consume the pending Pi0 context and return one action chunk."""
         if self._model is None:
             raise RuntimeError("Pi0JetsonPiFrontend is closed")
-        v2 = self._model.verbs_v2
-        self._check(v2.run_stage(self._model.self, STAGE_ACTION, -1),
-                    "run_stage action")
+        verbs = self._model.verbs
+        self._check(_run_generic_stage(self._model, "action"),
+                    "generic stage action")
         capacity = self.action_steps * self.action_dim * _F32_BYTES
         out = (ctypes.c_char * capacity)()
         written = ctypes.c_uint64(0)
-        self._check(v2.get_output(
+        self._check(verbs.get_output(
             self._model.self, PORT_ACTIONS, out, capacity,
             ctypes.byref(written), -1), "get_output actions")
         if written.value != capacity:
@@ -507,33 +365,6 @@ class Pi0JetsonPiFrontend:
             out, dtype=np.float32,
             count=self.action_steps * self.action_dim).reshape(
                 self.action_steps, self.action_dim).copy()
-
-    def action_view(self):
-        """Map the latest actions as a read-only zero-copy NumPy/DLPack view.
-
-        The returned ndarray implements ``__dlpack__``. Close it before
-        setting new inputs or running another stage; those operations reject
-        while a host view is mapped so the backing pointer cannot go stale.
-        """
-        return self._map_actions()
-
-    def _map_actions(self):
-        if self._model is None:
-            raise RuntimeError("Pi0JetsonPiFrontend is closed")
-        if self._model.n_port_tokens != self._model.n_ports:
-            raise RuntimeError("provider runtime has invalid port token layout")
-        token = self._model.port_tokens[PORT_ACTIONS]
-        if not token.handle or not token.verbs:
-            raise RuntimeError("actions port does not expose a memory token")
-        verbs = token.verbs.contents
-        if verbs.struct_size < ctypes.sizeof(_FrtMemoryTokenVerbs):
-            raise RuntimeError("actions token does not support host mapping")
-        pointer = ctypes.c_void_p()
-        rc = verbs.map_host(
-            token.handle, token.offset, token.bytes, 1, ctypes.byref(pointer))
-        if rc != 0 or not pointer.value:
-            raise RuntimeError(f"map_host actions failed (rc={rc})")
-        return _MappedActions(self, token, pointer.value)
 
     def close(self):
         if getattr(self, "_model", None) is not None:
@@ -578,7 +409,7 @@ class Pi0JetsonPiFrontend:
         if rc != 0:
             err = b""
             try:
-                err = self._model.verbs_v2.last_error(self._model.self) or b""
+                err = self._model.verbs.last_error(self._model.self) or b""
             except Exception:
                 pass
             raise RuntimeError(

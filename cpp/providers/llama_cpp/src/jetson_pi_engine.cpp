@@ -24,7 +24,6 @@
 #include <new>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -51,8 +50,6 @@ struct Engine {
     bool images_set = false;
     bool prompt_set = false;
     bool state_set  = false;
-    uint32_t actions_host_maps = 0;
-    std::unordered_map<void*, uint32_t> actions_host_map_counts;
 
     std::string last_error;
     std::atomic<long> refs{1};
@@ -173,10 +170,6 @@ int engine_set_input(void * self, uint32_t port, const void * data,
     Engine * e = static_cast<Engine*>(self);
     if (!e) return -1;
     e->clear_error();
-    if (e->actions_host_maps != 0) {
-        e->set_error("cannot replace Pi0 input while actions host view is mapped");
-        return -6;
-    }
     int32_t discard_status = jetson_pi_pi0_discard_context(e->pi0);
     if (discard_status != JETSON_PI_PI0_OK) {
         e->set_error(std::string("jetson_pi_pi0_discard_context failed: ") +
@@ -267,10 +260,6 @@ int engine_run_infer(void * self) {
     Engine * e = static_cast<Engine*>(self);
     if (!e) return -1;
     e->clear_error();
-    if (e->actions_host_maps != 0) {
-        e->set_error("cannot run Pi0 infer while actions host view is mapped");
-        return -6;
-    }
     if (!e->images_set || !e->prompt_set || !e->state_set) {
         e->set_error("infer requires images, prompt, and state to be set");
         return -1;
@@ -302,10 +291,6 @@ int engine_run_stage(void * self, uint32_t stage) {
         return engine_run_infer(self);
     }
     e->clear_error();
-    if (e->actions_host_maps != 0) {
-        e->set_error("cannot run Pi0 stage while actions host view is mapped");
-        return -6;
-    }
     if (!e->images_set || !e->prompt_set || !e->state_set) {
         e->set_error("Pi0 stage requires images, prompt, and state to be set");
         return -1;
@@ -377,86 +362,7 @@ int engine_get_output(void * self, uint32_t port, void * out,
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Phase 6 memory-domain token: the Pi0 actions OUT port carries an opaque
-// token (handle == this Engine*) so a consumer can read the action chunk
-// through frt_memory_token_verbs instead of get_output. The verbs read the
-// LIVE actions_buf at call time — NOT a pointer captured at mint time —
-// because std::vector reallocates on clear()/assign() (set_input clears it
-// for staleness; run_infer refills it). The bounds/return codes mirror
-// engine_get_output: -7 not-ready (buf empty), -5 too-small (partial read).
-// Single-threaded, same contract as engine_get_output (no locking on the
-// engine vtable). location_kind is HOST_VISIBLE: actions_buf is host memory,
-// readable via a plain memcpy, no device sync. destroy is null — the engine
-// owns actions_buf and frees it in release(), which fires AFTER the holder's
-// token-destroy loop (runtime_export.cpp).
-// ---------------------------------------------------------------------------
-int pi0_token_copy_to_host(frt_memory_token token, void * dst,
-                           uint64_t dst_off, uint64_t src_off,
-                           uint64_t bytes) {
-    Engine * e = reinterpret_cast<Engine*>(token);
-    if (!e) return -1;
-    if (bytes == 0) return 0;
-    if (!dst) return -1;
-    const size_t have_bytes = e->actions_buf.size() * sizeof(float);
-    if (have_bytes == 0) return -7;                 // not ready (set_input cleared it)
-    if (src_off > have_bytes || bytes > have_bytes - src_off) return -5;  // buffer too small
-    std::memcpy(static_cast<char*>(dst) + dst_off,
-                reinterpret_cast<const char*>(e->actions_buf.data()) + src_off,
-                bytes);
-    return 0;
-}
-
-int pi0_token_copy_from_host(frt_memory_token /*token*/, const void * /*src*/,
-                             uint64_t /*src_off*/, uint64_t /*dst_off*/,
-                             uint64_t /*bytes*/) {
-    return -3;  // unsupported: actions is an OUT port — writing into the model's output is not meaningful
-}
-
-int pi0_token_sync(frt_memory_token /*token*/) {
-    return 0;   // HOST_VISIBLE: host can read without a device sync
-}
-
-int pi0_token_map_host(frt_memory_token token, uint64_t offset,
-                       uint64_t bytes, uint32_t access, void ** out_ptr) {
-    Engine * e = reinterpret_cast<Engine*>(token);
-    if (!e || !out_ptr || access != FRT_RT_HOST_MAP_READ || bytes == 0) return -1;
-    *out_ptr = nullptr;
-    const uint64_t have_bytes = e->actions_buf.size() * sizeof(float);
-    if (have_bytes == 0) return -7;
-    if (offset > have_bytes || bytes > have_bytes - offset) return -5;
-    *out_ptr = reinterpret_cast<char*>(e->actions_buf.data()) + offset;
-    e->actions_host_maps += 1;
-    e->actions_host_map_counts[*out_ptr] += 1;
-    return 0;
-}
-
-int pi0_token_unmap_host(frt_memory_token token, void * ptr) {
-    Engine * e = reinterpret_cast<Engine*>(token);
-    if (!e || !ptr || e->actions_host_maps == 0) return -1;
-    auto it = e->actions_host_map_counts.find(ptr);
-    if (it == e->actions_host_map_counts.end()) return -1;
-    if (--it->second == 0) e->actions_host_map_counts.erase(it);
-    e->actions_host_maps -= 1;
-    return 0;
-}
-
-const frt_memory_token_verbs kPi0ActionsTokenVerbs = {
-    /*struct_size=*/sizeof(frt_memory_token_verbs),
-    /*reserved=*/0,
-    /*copy_to_host=*/pi0_token_copy_to_host,
-    /*copy_from_host=*/pi0_token_copy_from_host,
-    /*sync=*/pi0_token_sync,
-    /*destroy=*/nullptr,  // engine owns actions_buf; freed in release() after the destroy loop
-    /*map_host=*/pi0_token_map_host,
-    /*unmap_host=*/pi0_token_unmap_host,
-};
-
 } // namespace
-
-const frt_memory_token_verbs * frt_jetson_pi_actions_token_verbs(void) {
-    return &kPi0ActionsTokenVerbs;
-}
 
 // ---------------------------------------------------------------------------
 // LLM engine (generic GGUF text completion). Distinct IO shape from Pi0

@@ -189,7 +189,7 @@ const char* frt_llama_cpp_runtime_open_error(void);
 int frt_llama_cpp_pi0_runtime_create_with_engine(
     const frt_llama_cpp_pi0_config* config,
     const frt_llama_cpp_engine_v1* engine,
-    frt_model_runtime_v2** out);
+    frt_model_runtime_v1** out);
 
 /* Provider-specific JSON open path for the current dependency-injection
  * boundary. Required JSON fields:
@@ -200,12 +200,12 @@ int frt_llama_cpp_pi0_runtime_create_with_engine(
 int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
     const char* config_json,
     const frt_llama_cpp_engine_factory_v1* factory,
-    frt_model_runtime_v2** out);
+    frt_model_runtime_v1** out);
 
 int frt_llama_cpp_llm_runtime_create_with_engine(
     const frt_llama_cpp_llm_config* config,
     const frt_llama_cpp_engine_v1* engine,
-    frt_model_runtime_v2** out);
+    frt_model_runtime_v1** out);
 
 /* Provider-specific JSON open path for generic GGUF LLM. Required JSON
  * fields:
@@ -216,12 +216,12 @@ int frt_llama_cpp_llm_runtime_create_with_engine(
 int frt_llama_cpp_llm_runtime_open_with_engine_factory(
     const char* config_json,
     const frt_llama_cpp_engine_factory_v1* factory,
-    frt_model_runtime_v2** out);
+    frt_model_runtime_v1** out);
 
 int frt_llama_cpp_mllm_runtime_create_with_engine(
     const frt_llama_cpp_mllm_config* config,
     const frt_llama_cpp_engine_v1* engine,
-    frt_model_runtime_v2** out);
+    frt_model_runtime_v1** out);
 
 /* Provider-specific JSON open path for multimodal LLM. Required JSON fields:
  *   model_family="mllm", model_path, mmproj_path, backend,
@@ -231,7 +231,7 @@ int frt_llama_cpp_mllm_runtime_create_with_engine(
 int frt_llama_cpp_mllm_runtime_open_with_engine_factory(
     const char* config_json,
     const frt_llama_cpp_engine_factory_v1* factory,
-    frt_model_runtime_v2** out);
+    frt_model_runtime_v1** out);
 
 #ifdef __cplusplus
 }  /* extern "C" */

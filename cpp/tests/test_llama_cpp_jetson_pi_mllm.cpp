@@ -7,6 +7,7 @@
 //   FLASHRT_MLLM_MMPROJ    path to VIT mmproj GGUF
 
 #include "flashrt/providers/llama_cpp/c_api.h"
+#include "llama_cpp_generic_plan.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 
 #include <chrono>
@@ -53,7 +54,7 @@ int main() {
         "\"backend\":\"cpu\","
         "\"n_ctx\":2048,\"n_threads\":0,"
         "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,\"max_tokens\":32}";
-    frt_model_runtime_v2 * bogus = nullptr;
+    frt_model_runtime_v1 * bogus = nullptr;
     CHECK(frt_llama_cpp_mllm_runtime_open_with_engine_factory(
               bogus_json, factory, &bogus) != 0 && bogus == nullptr,
           "open MLLM with bogus model path fails without crashing");
@@ -67,7 +68,7 @@ int main() {
         "\"backend\":\"" + std::string(backend) + "\","
         "\"n_ctx\":2048,\"n_threads\":0,"
         "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,\"max_tokens\":16}";
-    frt_model_runtime_v2 * model = nullptr;
+    frt_model_runtime_v1 * model = nullptr;
     int rc = frt_llama_cpp_mllm_runtime_open_with_engine_factory(
         json.c_str(), factory, &model);
     if (rc != 0 || !model) {
@@ -76,11 +77,12 @@ int main() {
         return 1;
     }
     CHECK(rc == 0 && model != nullptr, "open MLLM runtime from JSON");
-    CHECK(model->n_stages == 0 && model->n_stages_v2 == 4,
-          "MLLM runtime exposes infer/reset/prefill/decode callback stages");
+    const auto* plan = llama_cpp_generic_plan(model);
+    CHECK(model->n_stages == 0 && plan && plan->n_stages == 3,
+          "MLLM runtime exposes selected reset/prefill/decode plan");
     CHECK(model->n_ports == 6,
           "MLLM runtime exposes images/prompt/text/token/logits/eog ports");
-    CHECK(model->verbs_v2.get_output(
+    CHECK(model->verbs.get_output(
               model->self, FRT_LLAMA_CPP_MLLM_PORT_LOGITS,
               nullptr, 0, nullptr, -1) == -1,
           "get_output rejects null written without crashing");
@@ -100,34 +102,33 @@ int main() {
     view.width = W; view.height = H; view.stride_bytes = 0;
     view.reserved = 0; view.timestamp_ns = 0;
 
-    rc = model->verbs_v2.set_input(model->self,
+    rc = model->verbs.set_input(model->self,
                                    FRT_LLAMA_CPP_MLLM_PORT_IMAGES,
                                    &view, sizeof(view), -1);
     CHECK(rc == 0, "set_input images");
 
     const char * prompt = "Describe this image in one sentence.";
-    rc = model->verbs_v2.set_input(model->self,
+    rc = model->verbs.set_input(model->self,
                                    FRT_LLAMA_CPP_MLLM_PORT_PROMPT,
                                    prompt, std::strlen(prompt), -1);
     CHECK(rc == 0, "set_input prompt");
 
-    rc = model->verbs_v2.run_stage(
-        model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER, -1);
+    rc = model->verbs.step(model->self);
     if (rc != 0) {
         std::printf("FAIL: run_stage infer (rc=%d): %s\n", rc,
-                    model->verbs_v2.last_error(model->self));
+                    model->verbs.last_error(model->self));
         g_fail = 1;
     } else {
         std::printf("ok  : run_stage infer\n");
     }
 
     uint64_t written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT, nullptr, 0, &written, -1);
     CHECK(rc == -5 && written > 0, "query one-shot text size");
     std::string text(written, '\0');
     written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT, &text[0], text.size(),
         &written, -1);
     CHECK(rc == 0 && written > 0, "get_output text non-empty");
@@ -142,35 +143,31 @@ int main() {
     }
     frt_image_view bad_view = view;
     bad_view.stride_bytes = 1;
-    CHECK(model->verbs_v2.set_input(
+    CHECK(model->verbs.set_input(
               model->self, FRT_LLAMA_CPP_MLLM_PORT_IMAGES,
               &bad_view, sizeof(bad_view), -1) != 0,
           "undersized image stride is rejected");
-    CHECK(model->verbs_v2.run_stage(
-              model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER, -1) != 0,
+    CHECK(model->verbs.step(model->self) != 0,
           "failed image replacement invalidates previous images");
-    CHECK(model->verbs_v2.set_input(
+    CHECK(model->verbs.set_input(
               model->self, FRT_LLAMA_CPP_MLLM_PORT_IMAGES,
               &view, sizeof(view), -1) == 0,
           "restore valid images after failed replacement");
-    CHECK(model->verbs_v2.set_input(
+    CHECK(model->verbs.set_input(
               model->self, FRT_LLAMA_CPP_MLLM_PORT_PROMPT,
               nullptr, 0, -1) != 0,
           "invalid prompt replacement is rejected");
-    CHECK(model->verbs_v2.run_stage(
-              model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER, -1) != 0,
+    CHECK(model->verbs.step(model->self) != 0,
           "failed prompt replacement invalidates previous prompt");
-    CHECK(model->verbs_v2.set_input(
+    CHECK(model->verbs.set_input(
               model->self, FRT_LLAMA_CPP_MLLM_PORT_PROMPT,
               prompt, std::strlen(prompt), -1) == 0,
           "restore valid prompt after failed replacement");
 
-    rc = model->verbs_v2.run_stage(
-        model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_RESET, -1);
+    rc = llama_cpp_run_generic_stage(model, "reset");
     CHECK(rc == 0, "run_stage reset");
     const auto prefill_start = std::chrono::steady_clock::now();
-    rc = model->verbs_v2.run_stage(
-        model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_PREFILL, -1);
+    rc = llama_cpp_run_generic_stage(model, "prefill");
     const auto prefill_end = std::chrono::steady_clock::now();
     CHECK(rc == 0, "run_stage prefill");
     std::printf("    staged MLLM prefill latency: %.3f ms\n",
@@ -178,14 +175,14 @@ int main() {
                     prefill_end - prefill_start).count());
 
     uint64_t logits_bytes = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_MLLM_PORT_LOGITS, nullptr, 0,
         &logits_bytes, -1);
     CHECK(rc == -5 && logits_bytes > 0 && logits_bytes % sizeof(float) == 0,
           "prefill exposes logits size");
     std::vector<float> logits(logits_bytes / sizeof(float));
     uint64_t logits_written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_MLLM_PORT_LOGITS, logits.data(),
         logits_bytes, &logits_written, -1);
     CHECK(rc == 0 && logits_written == logits_bytes,
@@ -198,8 +195,7 @@ int main() {
     uint32_t decoded_tokens = 0;
     for (uint32_t i = 0; i < 16; ++i) {
         const auto decode_start = std::chrono::steady_clock::now();
-        rc = model->verbs_v2.run_stage(
-            model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE, -1);
+        rc = llama_cpp_run_generic_stage(model, "decode");
         const auto decode_end = std::chrono::steady_clock::now();
         decode_ms += std::chrono::duration<double, std::milli>(
             decode_end - decode_start).count();
@@ -208,12 +204,12 @@ int main() {
         int32_t token = 0;
         int32_t is_eog = 0;
         uint64_t scalar_written = 0;
-        rc = model->verbs_v2.get_output(
+        rc = model->verbs.get_output(
             model->self, FRT_LLAMA_CPP_MLLM_PORT_NEXT_TOKEN, &token,
             sizeof(token), &scalar_written, -1);
         CHECK(rc == 0 && scalar_written == sizeof(token),
               "decode exposes next_token");
-        rc = model->verbs_v2.get_output(
+        rc = model->verbs.get_output(
             model->self, FRT_LLAMA_CPP_MLLM_PORT_IS_EOG, &is_eog,
             sizeof(is_eog), &scalar_written, -1);
         CHECK(rc == 0 && scalar_written == sizeof(is_eog),
@@ -225,22 +221,21 @@ int main() {
                 decoded_tokens * 1000.0 / decode_ms,
                 decoded_tokens, decode_ms);
     written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT, nullptr, 0, &written, -1);
     CHECK(rc == -5 && written > 0, "query staged text size");
     std::string staged(written, '\0');
     written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_MLLM_PORT_TEXT, staged.data(), staged.size(),
         &written, -1);
     CHECK(rc == 0 && written > 0, "staged decode exposes accumulated text");
     if (rc == 0) staged.resize(written);
     CHECK(staged == text, "staged decode text matches one-shot infer");
-    rc = model->verbs_v2.run_stage(
-        model->self, FRT_LLAMA_CPP_MLLM_STAGE_INDEX_INFER, -1);
+    rc = model->verbs.step(model->self);
     CHECK(rc == 0, "one-shot infer after staged decode");
     uint64_t stale_written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_MLLM_PORT_NEXT_TOKEN, nullptr, 0,
         &stale_written, -1);
     CHECK(rc == -7, "one-shot infer invalidates staged token output");
@@ -256,52 +251,42 @@ int main() {
         "\"n_ctx\":2048,\"n_threads\":0,"
         "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,"
         "\"max_tokens\":1}";
-    frt_model_runtime_v2 * budget_model = nullptr;
+    frt_model_runtime_v1 * budget_model = nullptr;
     rc = frt_llama_cpp_mllm_runtime_open_with_engine_factory(
         budget_json.c_str(), factory, &budget_model);
     CHECK(rc == 0 && budget_model, "open max_tokens=1 MLLM runtime");
     if (budget_model) {
-        CHECK(budget_model->verbs_v2.set_input(
+        CHECK(budget_model->verbs.set_input(
                   budget_model->self, FRT_LLAMA_CPP_MLLM_PORT_IMAGES,
                   &view, sizeof(view), -1) == 0 &&
-                  budget_model->verbs_v2.set_input(
+                  budget_model->verbs.set_input(
                   budget_model->self, FRT_LLAMA_CPP_MLLM_PORT_PROMPT,
                   prompt, std::strlen(prompt), -1) == 0 &&
-                  budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_MLLM_STAGE_INDEX_PREFILL, -1) == 0 &&
-                  budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE, -1) == 0,
+                  llama_cpp_run_generic_stage(budget_model, "prefill") == 0 &&
+                  llama_cpp_run_generic_stage(budget_model, "decode") == 0,
               "max_tokens=1 MLLM session permits exactly one decode");
         int32_t first_is_eog = 1;
         uint64_t scalar_written = 0;
-        CHECK(budget_model->verbs_v2.get_output(
+        CHECK(budget_model->verbs.get_output(
                   budget_model->self, FRT_LLAMA_CPP_MLLM_PORT_IS_EOG,
                   &first_is_eog, sizeof(first_is_eog), &scalar_written, -1) == 0 &&
                   first_is_eog == 0,
               "budget test image prompt first token is not EOG");
-        CHECK(budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE, -1) != 0 &&
-                  std::strstr(budget_model->verbs_v2.last_error(
+        CHECK(llama_cpp_run_generic_stage(budget_model, "decode") != 0 &&
+                  std::strstr(budget_model->verbs.last_error(
                                   budget_model->self),
                               "max_tokens"),
               "staged decode rejects calls beyond max_tokens");
         int32_t stale_scalar = 0;
-        CHECK(budget_model->verbs_v2.get_output(
+        CHECK(budget_model->verbs.get_output(
                   budget_model->self, FRT_LLAMA_CPP_MLLM_PORT_NEXT_TOKEN,
                   &stale_scalar, sizeof(stale_scalar), &scalar_written, -1) == -7 &&
-                  budget_model->verbs_v2.get_output(
+                  budget_model->verbs.get_output(
                   budget_model->self, FRT_LLAMA_CPP_MLLM_PORT_IS_EOG,
                   &stale_scalar, sizeof(stale_scalar), &scalar_written, -1) == -7,
               "failed decode invalidates staged scalar outputs");
-        CHECK(budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_MLLM_STAGE_INDEX_PREFILL, -1) == 0 &&
-                  budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_MLLM_STAGE_INDEX_DECODE, -1) == 0,
+        CHECK(llama_cpp_run_generic_stage(budget_model, "prefill") == 0 &&
+                  llama_cpp_run_generic_stage(budget_model, "decode") == 0,
               "prefill restores staged decode budget");
         budget_model->release(budget_model->owner);
     }

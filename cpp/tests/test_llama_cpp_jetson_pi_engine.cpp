@@ -21,6 +21,7 @@
 //   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
+#include "llama_cpp_generic_plan.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 
 #include <cmath>
@@ -98,7 +99,7 @@ int main() {
         "\"backend\":\"cpu\",\"n_views\":2,\"image_height\":224,"
         "\"image_width\":224,\"image_channels\":3,"
         "\"action_steps\":10,\"action_dim\":32}";
-    frt_model_runtime_v2 * bogus = nullptr;
+    frt_model_runtime_v1 * bogus = nullptr;
     int rc = frt_llama_cpp_pi0_runtime_open_with_engine_factory(
         bogus_json, factory, &bogus);
     CHECK(rc != 0 && bogus == nullptr,
@@ -145,7 +146,7 @@ int main() {
             "\"image_channels\":3,\"action_steps\":" +
             std::to_string(action_steps) +
             ",\"action_dim\":" + std::to_string(action_dim + 1) + "}";
-        frt_model_runtime_v2 * m = nullptr;
+        frt_model_runtime_v1 * m = nullptr;
         int mrc = frt_llama_cpp_pi0_runtime_open_with_engine_factory(
             mismatch_json.c_str(), factory, &m);
         CHECK(mrc != 0 && m == nullptr,
@@ -161,7 +162,7 @@ int main() {
         "\"n_views\":2,\"image_height\":224,\"image_width\":224,"
         "\"image_channels\":3,\"action_steps\":" + std::to_string(action_steps) +
         ",\"action_dim\":" + std::to_string(action_dim) + "}";
-    frt_model_runtime_v2 * model = nullptr;
+    frt_model_runtime_v1 * model = nullptr;
     rc = frt_llama_cpp_pi0_runtime_open_with_engine_factory(
         json.c_str(), factory, &model);
     if (rc != 0 || !model) {
@@ -199,25 +200,24 @@ int main() {
         views[1] = views[0];
         views[1].data = wrist;
 
-        CHECK(model->verbs_v2.set_input(model->self,
+        CHECK(model->verbs.set_input(model->self,
                                         FRT_LLAMA_CPP_PI0_PORT_IMAGES,
                                         &views[0], sizeof(views), -1) == 0,
               "set_input images");
-        CHECK(model->verbs_v2.set_input(model->self,
+        CHECK(model->verbs.set_input(model->self,
                                         FRT_LLAMA_CPP_PI0_PORT_PROMPT,
                                         prompt.data(), prompt.size(), -1) == 0,
               "set_input prompt");
-        CHECK(model->verbs_v2.set_input(model->self,
+        CHECK(model->verbs.set_input(model->self,
                                         FRT_LLAMA_CPP_PI0_PORT_STATE,
                                         state_bytes.data(),
                                         state_bytes.size(), -1) == 0,
               "set_input state");
 
-        rc = model->verbs_v2.run_stage(
-            model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER, -1);
+        rc = model->verbs.step(model->self);
         if (rc != 0) {
             std::printf("FAIL: run_stage infer (rc=%d): %s\n", rc,
-                        model->verbs_v2.last_error(model->self));
+                        model->verbs.last_error(model->self));
             g_fail = 1;
         } else {
             std::printf("ok  : run_stage infer\n");
@@ -226,7 +226,7 @@ int main() {
         std::vector<float> actions(
             static_cast<size_t>(action_steps) * action_dim);
         uint64_t written = 0;
-        rc = model->verbs_v2.get_output(
+        rc = model->verbs.get_output(
             model->self, FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
             actions.data(), actions.size() * sizeof(float), &written, -1);
         CHECK(rc == 0 &&
@@ -243,65 +243,20 @@ int main() {
             CHECK(!all_zero, "actions are not all zero");
         }
 
-        // ---- sub-test E: the actions OUT port carries a Phase 6 memory-domain
-        // token. Assert the parallel-array invariant, that only the actions
-        // port mints a real token (HOST_VISIBLE), and that copy_to_host reads
-        // the LIVE provider buffer (byte-identical to get_output; -7 after
-        // set_input clears it). This is the real token consumer that closes
-        // the Phase 6 gap (the contract was previously paper-only). ----
-        CHECK(model->n_port_tokens == model->n_ports,
-              "port_tokens parallel array aligns with ports");
-        CHECK(model->n_port_tokens == 4,
-              "pi0 exposes 4 ports (images/prompt/state/actions)");
-        CHECK(model->port_tokens[FRT_LLAMA_CPP_PI0_PORT_IMAGES].handle  == nullptr &&
-                  model->port_tokens[FRT_LLAMA_CPP_PI0_PORT_PROMPT].handle == nullptr &&
-                  model->port_tokens[FRT_LLAMA_CPP_PI0_PORT_STATE].handle  == nullptr,
-              "non-actions ports carry no token (null handle)");
-        const auto & tk = model->port_tokens[FRT_LLAMA_CPP_PI0_PORT_ACTIONS];
-        CHECK(tk.handle != nullptr, "actions port carries a real token handle");
-        CHECK(tk.location_kind == FRT_RT_LOCATION_HOST_VISIBLE,
-              "actions token advertises HOST_VISIBLE");
-        CHECK(tk.verbs != nullptr && tk.verbs->copy_to_host != nullptr &&
-                  tk.verbs->copy_from_host != nullptr &&
-                  tk.verbs->sync != nullptr,
-              "actions token verbs table is complete");
-        if (tk.handle && tk.verbs && tk.verbs->copy_to_host) {
-            const uint64_t action_bytes =
-                static_cast<uint64_t>(action_steps) * action_dim * sizeof(float);
-            std::vector<float> via_token(actions.size());
-            int trc = tk.verbs->copy_to_host(tk.handle, via_token.data(),
-                                             0, 0, action_bytes);
-            CHECK(trc == 0, "copy_to_host reads the actions chunk via token");
-            CHECK(tk.verbs->copy_to_host(tk.handle, nullptr, 0, 0,
-                                         sizeof(float)) == -1,
-                  "copy_to_host rejects a null destination");
-            if (trc == 0) {
-                CHECK(std::memcmp(via_token.data(), actions.data(),
-                                  static_cast<size_t>(action_bytes)) == 0,
-                      "token copy_to_host is byte-identical to get_output");
-            }
-            float scratch = 0.0f;
-            CHECK(tk.verbs->copy_from_host(tk.handle, &scratch, 0, 0,
-                                           sizeof(float)) == -3,
-                  "copy_from_host returns -3 unsupported (OUT port)");
-            CHECK(tk.verbs->sync(tk.handle) == 0,
-                  "sync is a no-op (HOST_VISIBLE)");
-        }
-
         // ---- multi-tick: a second infer with fresh inputs must not leak the
         // first tick's KV (KV reset) nor return the first tick's actions
         // (staleness guard). We reuse the same inputs; the action should
         // reproduce within tolerance, and a get_output before run_infer (after
         // set_input) must return -7 (actions not ready). ----
-        CHECK(model->verbs_v2.set_input(model->self,
+        CHECK(model->verbs.set_input(model->self,
                                         FRT_LLAMA_CPP_PI0_PORT_IMAGES,
                                         &views[0], sizeof(views), -1) == 0,
               "tick2 set_input images");
-        CHECK(model->verbs_v2.set_input(model->self,
+        CHECK(model->verbs.set_input(model->self,
                                         FRT_LLAMA_CPP_PI0_PORT_PROMPT,
                                         prompt.data(), prompt.size(), -1) == 0,
               "tick2 set_input prompt");
-        CHECK(model->verbs_v2.set_input(model->self,
+        CHECK(model->verbs.set_input(model->self,
                                         FRT_LLAMA_CPP_PI0_PORT_STATE,
                                         state_bytes.data(),
                                         state_bytes.size(), -1) == 0,
@@ -309,32 +264,18 @@ int main() {
         // set_input must have invalidated actions_buf: get_output now -7.
         {
             uint64_t w2 = 0;
-            int rc2 = model->verbs_v2.get_output(
+            int rc2 = model->verbs.get_output(
                 model->self, FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
                 actions.data(), actions.size() * sizeof(float), &w2, -1);
             CHECK(rc2 != 0,
                   "get_output after set_input (before run_infer) fails");
         }
-        // The token must read the LIVE buffer: after set_input cleared
-        // actions_buf, copy_to_host must fail too (-7). This proves the token
-        // is not a mint-time snapshot — it reflects the provider's current
-        // state.
-        {
-            const auto & tk2 = model->port_tokens[FRT_LLAMA_CPP_PI0_PORT_ACTIONS];
-            const uint64_t action_bytes =
-                static_cast<uint64_t>(action_steps) * action_dim * sizeof(float);
-            int trc2 = tk2.verbs->copy_to_host(tk2.handle, actions.data(),
-                                               0, 0, action_bytes);
-            CHECK(trc2 != 0,
-                  "token copy_to_host after set_input (before run_infer) fails");
-        }
-        CHECK(model->verbs_v2.run_stage(
-                  model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER, -1) == 0,
+        CHECK(model->verbs.step(model->self) == 0,
               "tick2 run_stage infer");
         std::vector<float> actions2(
             static_cast<size_t>(action_steps) * action_dim);
         written = 0;
-        rc = model->verbs_v2.get_output(
+        rc = model->verbs.get_output(
             model->self, FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
             actions2.data(), actions2.size() * sizeof(float), &written, -1);
         CHECK(rc == 0 &&

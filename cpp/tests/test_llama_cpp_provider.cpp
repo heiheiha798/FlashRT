@@ -19,6 +19,8 @@ struct FakeEngine {
     int retains = 0;
     int releases = 0;
     int infer = 0;
+    int stage_calls = 0;
+    uint32_t last_stage = UINT32_MAX;
     int set_input_calls = 0;
     uint32_t last_port = 999;
     float actions[4] = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -64,6 +66,13 @@ int run_infer(void* p) {
     auto* engine = static_cast<FakeEngine*>(p);
     engine->infer += 1;
     engine->actions[0] += 10.0f;
+    return 0;
+}
+
+int run_stage(void* p, uint32_t stage) {
+    auto* engine = static_cast<FakeEngine*>(p);
+    engine->stage_calls += 1;
+    engine->last_stage = stage;
     return 0;
 }
 
@@ -131,10 +140,23 @@ const char* factory_last_error(void* p) {
     return static_cast<FakeFactory*>(p)->last_error;
 }
 
+const frt_generic_stage_plan_ext_v1* generic_plan(
+        const frt_model_runtime_v1* model) {
+    if (!model ||
+        model->struct_size < FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE ||
+        !model->query_extension) return nullptr;
+    const void* extension = nullptr;
+    if (model->query_extension(
+            model, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1, &extension) != 0) {
+        return nullptr;
+    }
+    return static_cast<const frt_generic_stage_plan_ext_v1*>(extension);
+}
+
 }  // namespace
 
 int main() {
-    frt_model_runtime_v2* bad = nullptr;
+    frt_model_runtime_v1* bad = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(nullptr, nullptr, &bad)
               == -1 && bad == nullptr,
           "create rejects missing config and engine");
@@ -156,7 +178,7 @@ int main() {
     old_engine_api.struct_size = FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE;
     old_engine_api.run_stage = nullptr;
 
-    frt_model_runtime_v2* old_pi0 = nullptr;
+    frt_model_runtime_v1* old_pi0 = nullptr;
 
     frt_llama_cpp_llm_config llm_cfg{};
     llm_cfg.struct_size = FRT_LLAMA_CPP_LLM_CONFIG_BASE_SIZE;
@@ -164,10 +186,11 @@ int main() {
     llm_cfg.backend = "cpu";
     llm_cfg.n_ctx = 2048;
     llm_cfg.max_tokens = 16;
-    frt_model_runtime_v2* old_llm = nullptr;
+    frt_model_runtime_v1* old_llm = nullptr;
     CHECK(frt_llama_cpp_llm_runtime_create_with_engine(
               &llm_cfg, &old_engine_api, &old_llm) == 0 && old_llm &&
-              old_llm->n_ports == 2 && old_llm->n_stages_v2 == 1,
+              old_llm->n_ports == 2 && generic_plan(old_llm) &&
+              generic_plan(old_llm)->n_stages == 1,
           "old-prefix LLM engine exposes only infer schema");
     if (old_llm) old_llm->release(old_llm->owner);
 
@@ -178,10 +201,11 @@ int main() {
     mllm_cfg.backend = "cpu";
     mllm_cfg.n_ctx = 2048;
     mllm_cfg.max_tokens = 16;
-    frt_model_runtime_v2* old_mllm = nullptr;
+    frt_model_runtime_v1* old_mllm = nullptr;
     CHECK(frt_llama_cpp_mllm_runtime_create_with_engine(
               &mllm_cfg, &old_engine_api, &old_mllm) == 0 && old_mllm &&
-              old_mllm->n_ports == 3 && old_mllm->n_stages_v2 == 1,
+              old_mllm->n_ports == 3 && generic_plan(old_mllm) &&
+              generic_plan(old_mllm)->n_stages == 1,
           "old-prefix MLLM engine exposes only infer schema");
     if (old_mllm) old_mllm->release(old_mllm->owner);
 
@@ -199,7 +223,8 @@ int main() {
 
     CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(
               &cfg, &old_engine_api, &old_pi0) == 0 && old_pi0 &&
-              old_pi0->n_stages_v2 == 1,
+              generic_plan(old_pi0) &&
+              generic_plan(old_pi0)->n_stages == 1,
           "old-prefix Pi0 engine exposes only infer schema");
     if (old_pi0) old_pi0->release(old_pi0->owner);
 
@@ -220,22 +245,23 @@ int main() {
     frt_llama_cpp_engine_v1 borrowed = engine_api;
     borrowed.retain = nullptr;
     borrowed.release = nullptr;
-    frt_model_runtime_v2* borrowed_model = nullptr;
+    frt_model_runtime_v1* borrowed_model = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(&cfg, &borrowed,
                                                        &borrowed_model) == 0 &&
               borrowed_model,
           "create accepts a borrowed explicit engine");
     borrowed_model->release(borrowed_model->owner);
 
-    frt_model_runtime_v2* model = nullptr;
+    frt_model_runtime_v1* model = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(&cfg, &engine_api,
                                                        &model) == 0 && model,
           "create llama_cpp Pi0 runtime with explicit engine");
     CHECK(engine.retains == 1, "engine retained once");
-    CHECK(model->abi_version == FRT_MODEL_RUNTIME_ABI_VERSION_V2 &&
-              model->n_ports == 4 && model->n_stages == 0 &&
-              model->n_stages_v2 == 1,
-          "runtime exposes v2 provider-owned shape");
+    const frt_generic_stage_plan_ext_v1* plan = generic_plan(model);
+    CHECK(model->abi_version == FRT_MODEL_RUNTIME_ABI_VERSION &&
+              model->n_ports == 4 && model->n_stages == 0 && plan &&
+              plan->n_stages == 1,
+          "runtime exposes v1 metadata and one generic authority");
     CHECK(model->exp && model->exp->ctx == nullptr &&
               model->exp->n_graphs == 0,
           "provider runtime has no FlashRT exec graph");
@@ -265,51 +291,83 @@ int main() {
               model->ports[FRT_LLAMA_CPP_PI0_PORT_ACTIONS].shape[0] == 2 &&
               model->ports[FRT_LLAMA_CPP_PI0_PORT_ACTIONS].shape[1] == 2,
           "actions port schema");
-    CHECK(std::strcmp(model->stages_v2[0].name, "infer") == 0 &&
-              model->stages_v2[0].kind == FRT_RT_STAGE_CALLBACK &&
-              model->stages_v2[0].callback == 0,
-          "infer callback stage schema");
+    CHECK(std::strcmp(plan->stages[0].name, "infer") == 0 &&
+              plan->stages[0].executor_kind == FRT_GENERIC_STAGE_OPAQUE &&
+              plan->stages[0].executor_ref == 37,
+          "infer generic stage schema");
     CHECK(std::strstr(model->exp->identity, "provider=llama_cpp\n") &&
               std::strstr(model->exp->identity, "model_family=pi0\n") &&
-              std::strstr(model->exp->identity, "stage_v2:0:infer:"),
-          "identity carries provider, model family, and callback stage");
+              std::strstr(model->exp->identity,
+                          "gstage-v1:0:5:infer:1:37:0:"),
+          "identity carries provider, model family, and generic stage");
 
-    CHECK(model->verbs_v2.set_input(model->self, FRT_LLAMA_CPP_PI0_PORT_PROMPT,
+    CHECK(model->verbs.set_input(model->self, FRT_LLAMA_CPP_PI0_PORT_PROMPT,
                                     "hello", 5, -1) == 0 &&
               engine.set_input_calls == 1 &&
               engine.last_port == FRT_LLAMA_CPP_PI0_PORT_PROMPT,
           "set_input delegates to engine");
-    CHECK(model->verbs_v2.run_stage(
-              model->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER, -1) == 0 &&
+    CHECK(plan->run_opaque(plan->stage_self,
+                           plan->stages[0].executor_ref) == 0 &&
               engine.infer == 1,
-          "run_stage delegates infer to engine");
+          "generic runner delegates executor ref to the engine");
     float out[4] = {};
     uint64_t written = 0;
-    CHECK(model->verbs_v2.get_output(model->self,
+    CHECK(model->verbs.get_output(model->self,
                                      FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
                                      out, sizeof(out), &written, -1) == 0 &&
               written == sizeof(out) && std::fabs(out[0] - 11.0f) < 0.01f,
           "get_output delegates to engine");
-    CHECK(model->verbs_v2.prepare(model->self, 0, 0) == -3 &&
-              std::strstr(model->verbs_v2.last_error(model->self),
+    CHECK(model->verbs.prepare(model->self, 0, 0) == -3 &&
+              std::strstr(model->verbs.last_error(model->self),
                           "no graph variants"),
           "prepare hard-errors instead of fabricating graph variants");
     model->release(model->owner);
     CHECK(engine.releases == 1, "engine released once");
 
+    FakeEngine staged_engine;
+    frt_llama_cpp_engine_v1 staged_engine_api = engine_api;
+    staged_engine_api.self = &staged_engine;
+    staged_engine_api.run_stage = run_stage;
+    frt_model_runtime_v1* staged_model = nullptr;
+    CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(
+              &cfg, &staged_engine_api, &staged_model) == 0 && staged_model,
+          "create staged Pi0 runtime");
+    const auto* staged_plan = generic_plan(staged_model);
+    CHECK(staged_plan && staged_plan->n_stages == 2 &&
+              std::strcmp(staged_plan->stages[0].name, "context") == 0 &&
+              staged_plan->stages[0].executor_ref == 4 &&
+              staged_plan->stages[1].n_after == 1 &&
+              staged_plan->stages[1].after[0] == 0 &&
+              std::strcmp(staged_plan->stages[1].name, "action") == 0 &&
+              staged_plan->stages[1].executor_ref == 91,
+          "staged Pi0 runtime publishes one context/action authority");
+    CHECK(staged_model->verbs.step(staged_model->self) == 0 &&
+              staged_engine.stage_calls == 1 &&
+              staged_engine.last_stage == FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER,
+          "whole-model step remains available as v1 sugar");
+    CHECK(staged_plan &&
+              staged_plan->run_opaque(
+                  staged_plan->stage_self,
+                  staged_plan->stages[0].executor_ref) == 0 &&
+              staged_engine.stage_calls == 2 &&
+              staged_engine.last_stage ==
+                  FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT,
+          "generic context executor delegates to provider stage capability");
+    if (staged_model) staged_model->release(staged_model->owner);
+
     FakeEngine null_error_engine;
     frt_llama_cpp_engine_v1 null_error_api = engine_api;
     null_error_api.self = &null_error_engine;
     null_error_api.last_error = null_last_error;
-    frt_model_runtime_v2* null_error_model = nullptr;
+    frt_model_runtime_v1* null_error_model = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(
               &cfg, &null_error_api, &null_error_model) == 0 &&
               null_error_model,
           "create accepts engine with nullable error implementation");
-    CHECK(null_error_model->verbs_v2.get_output(
+    CHECK(null_error_model->verbs.get_output(
               null_error_model->self, FRT_LLAMA_CPP_PI0_PORT_PROMPT,
               out, sizeof(out), &written, -1) == -1 &&
-              std::strstr(null_error_model->verbs_v2.last_error(
+              std::strstr(null_error_model->verbs.last_error(
                               null_error_model->self),
                           "null error"),
           "null engine errors are reported without crashing");
@@ -341,7 +399,7 @@ int main() {
         "\",\"backend\":\"cpu\",\"n_views\":2,"
         "\"image_height\":224,\"image_width\":224,"
         "\"image_channels\":3,\"action_steps\":2,\"action_dim\":2}";
-    frt_model_runtime_v2* opened = nullptr;
+    frt_model_runtime_v1* opened = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               open_json.c_str(), &factory_api, &opened) == 0 &&
               opened && factory.creates == 1,
@@ -355,10 +413,9 @@ int main() {
           "factory receives parsed Pi0 config");
     CHECK(factory_engine.retains == 1 && factory_engine.releases == 1,
           "factory engine reference is transferred to the runtime");
-    CHECK(opened->verbs_v2.run_stage(
-              opened->self, FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER, -1) == 0 &&
+    CHECK(opened->verbs.step(opened->self) == 0 &&
               factory_engine.infer == 1,
-          "opened runtime delegates infer to factory engine");
+          "opened runtime step delegates whole-model infer");
     const uint64_t first_fingerprint = opened->exp->fingerprint;
     opened->release(opened->owner);
     CHECK(factory_engine.releases == 2,
@@ -369,7 +426,7 @@ int main() {
         std::ofstream(identity_model, std::ios::binary | std::ios::trunc)
             .write(model_bytes.data(), model_bytes.size());
     }
-    frt_model_runtime_v2* changed_checkpoint = nullptr;
+    frt_model_runtime_v1* changed_checkpoint = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               open_json.c_str(), &factory_api, &changed_checkpoint) == 0 &&
               changed_checkpoint &&
@@ -384,7 +441,7 @@ int main() {
         std::ofstream(identity_mmproj, std::ios::binary | std::ios::trunc)
             << "mmproj-b";
     }
-    frt_model_runtime_v2* changed_mmproj = nullptr;
+    frt_model_runtime_v1* changed_mmproj = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               open_json.c_str(), &factory_api, &changed_mmproj) == 0 &&
               changed_mmproj &&
@@ -399,7 +456,7 @@ int main() {
         "\",\"backend\":\"cuda\",\"n_views\":2,"
         "\"image_height\":224,\"image_width\":224,"
         "\"image_channels\":3,\"action_steps\":2,\"action_dim\":2}";
-    frt_model_runtime_v2* cuda_identity = nullptr;
+    frt_model_runtime_v1* cuda_identity = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               cuda_json.c_str(), &factory_api, &cuda_identity) == 0 &&
               cuda_identity &&
@@ -438,7 +495,7 @@ int main() {
         "\",\"backend\":\"cpu\",\"n_views\":2,"
         "\"image_height\":224,\"image_width\":224,"
         "\"image_channels\":3,\"action_steps\":2,\"action_dim\":2}";
-    frt_model_runtime_v2* missing_checkpoint = nullptr;
+    frt_model_runtime_v1* missing_checkpoint = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               missing_checkpoint_json.c_str(), &factory_api,
               &missing_checkpoint) == -1 &&
@@ -448,7 +505,7 @@ int main() {
                           "failed to open checkpoint for identity"),
           "missing checkpoint reports identity error before factory creation");
 
-    frt_model_runtime_v2* missing = nullptr;
+    frt_model_runtime_v1* missing = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               "{\"model_family\":\"pi0\",\"model_path\":\"/models/pi0.gguf\"}",
               &factory_api, &missing) == -1 &&

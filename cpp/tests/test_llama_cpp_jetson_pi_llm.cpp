@@ -3,6 +3,7 @@
 // Skips (returns 0) when FLASHRT_LLM_MODEL is unset.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
+#include "llama_cpp_generic_plan.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
 
 #include <algorithm>
@@ -41,7 +42,7 @@ int main() {
         "\"backend\":\"cpu\","
         "\"n_ctx\":2048,\"n_threads\":0,"
         "\"temp\":0.8,\"top_k\":40,\"top_p\":0.9,\"seed\":1,\"max_tokens\":64}";
-    frt_model_runtime_v2 * bogus = nullptr;
+    frt_model_runtime_v1 * bogus = nullptr;
     CHECK(frt_llama_cpp_llm_runtime_open_with_engine_factory(
               bogus_json, factory, &bogus) != 0 && bogus == nullptr,
           "open LLM with bogus model path fails without crashing");
@@ -58,7 +59,7 @@ int main() {
         "\"backend\":\"" + backend + "\","
         "\"n_ctx\":2048,\"n_threads\":0,"
         "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,\"max_tokens\":16}";
-    frt_model_runtime_v2 * model = nullptr;
+    frt_model_runtime_v1 * model = nullptr;
     int rc = frt_llama_cpp_llm_runtime_open_with_engine_factory(
         json.c_str(), factory, &model);
     if (rc != 0 || !model) {
@@ -67,46 +68,46 @@ int main() {
         return 1;
     }
     CHECK(rc == 0 && model != nullptr, "open LLM runtime from JSON");
+    const auto* plan = llama_cpp_generic_plan(model);
     std::printf("    runtime stages (%llu):",
-                static_cast<unsigned long long>(model->n_stages_v2));
-    for (uint64_t i = 0; i < model->n_stages_v2; ++i) {
-        std::printf(" %s", model->stages_v2[i].name);
+                static_cast<unsigned long long>(plan ? plan->n_stages : 0));
+    for (uint64_t i = 0; plan && i < plan->n_stages; ++i) {
+        std::printf(" %s", plan->stages[i].name);
     }
     std::printf("\n");
-    CHECK(model->n_stages == 0 && model->n_stages_v2 == 4,
-          "LLM runtime exposes infer/reset/prefill/decode callback stages");
+    CHECK(model->n_stages == 0 && plan && plan->n_stages == 3,
+          "LLM runtime exposes selected reset/prefill/decode plan");
     CHECK(model->n_ports == 6,
           "LLM runtime exposes prompt/text/token/logits/eog/tokens ports");
     CHECK(model->exp && std::strstr(model->exp->identity,
                                    "weights_sha256="),
           "deployment identity includes checkpoint content digest");
-    CHECK(model->verbs_v2.get_output(
+    CHECK(model->verbs.get_output(
               model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS,
               nullptr, 0, nullptr, -1) == -1,
           "get_output rejects null written without crashing");
 
-    rc = model->verbs_v2.set_input(model->self,
+    rc = model->verbs.set_input(model->self,
                                    FRT_LLAMA_CPP_LLM_PORT_PROMPT,
                                    prompt, std::strlen(prompt), -1);
     CHECK(rc == 0, "set_input prompt");
 
-    rc = model->verbs_v2.run_stage(
-        model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER, -1);
+    rc = model->verbs.step(model->self);
     if (rc != 0) {
         std::printf("FAIL: run_stage infer (rc=%d): %s\n", rc,
-                    model->verbs_v2.last_error(model->self));
+                    model->verbs.last_error(model->self));
         g_fail = 1;
     } else {
         std::printf("ok  : run_stage infer\n");
     }
 
     uint64_t written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, nullptr, 0, &written, -1);
     CHECK(rc == -5 && written > 0, "query one-shot text size");
     std::string text(written, '\0');
     written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, &text[0], text.size(),
         &written, -1);
     CHECK(rc == 0 && written > 0, "get_output text non-empty");
@@ -120,37 +121,34 @@ int main() {
         }
         CHECK(printable, "generated text contains printable chars");
     }
-    CHECK(model->verbs_v2.set_input(
+    CHECK(model->verbs.set_input(
               model->self, FRT_LLAMA_CPP_LLM_PORT_PROMPT,
               nullptr, 0, -1) != 0,
           "invalid prompt replacement is rejected");
-    CHECK(model->verbs_v2.run_stage(
-              model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER, -1) != 0,
+    CHECK(model->verbs.step(model->self) != 0,
           "failed prompt replacement invalidates the previous prompt");
-    CHECK(model->verbs_v2.set_input(
+    CHECK(model->verbs.set_input(
               model->self, FRT_LLAMA_CPP_LLM_PORT_PROMPT,
               prompt, std::strlen(prompt), -1) == 0,
           "restore valid prompt after failed replacement");
 
-    CHECK(model->verbs_v2.run_stage(
-              model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0,
+    CHECK(llama_cpp_run_generic_stage(model, "reset") == 0,
           "run_stage reset");
     const auto prefill_start = std::chrono::steady_clock::now();
-    rc = model->verbs_v2.run_stage(
-        model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1);
+    rc = llama_cpp_run_generic_stage(model, "prefill");
     const auto prefill_end = std::chrono::steady_clock::now();
     CHECK(rc == 0, "run_stage prefill");
     std::printf("    staged prefill latency: %.3f ms\n",
                 std::chrono::duration<double, std::milli>(
                     prefill_end - prefill_start).count());
     uint64_t logits_bytes = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS, nullptr, 0,
         &logits_bytes, -1);
     CHECK(rc != 0 && logits_bytes > 1000 * sizeof(float),
           "prefill exposes logits size");
     std::vector<float> logits(logits_bytes / sizeof(float));
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_LLM_PORT_LOGITS, logits.data(),
         logits_bytes, &logits_bytes, -1);
     CHECK(rc == 0, "prefill get_output logits");
@@ -164,8 +162,7 @@ int main() {
     double decode_ms = 0.0;
     for (uint32_t i = 0; i < 16; ++i) {
         const auto decode_start = std::chrono::steady_clock::now();
-        rc = model->verbs_v2.run_stage(
-            model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1);
+        rc = llama_cpp_run_generic_stage(model, "decode");
         const auto decode_end = std::chrono::steady_clock::now();
         decode_ms += std::chrono::duration<double, std::milli>(
             decode_end - decode_start).count();
@@ -173,12 +170,12 @@ int main() {
         int32_t token = 0;
         int32_t is_eog = 0;
         uint64_t scalar_bytes = 0;
-        CHECK(model->verbs_v2.get_output(
+        CHECK(model->verbs.get_output(
                   model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN, &token,
                   sizeof(token), &scalar_bytes, -1) == 0 &&
                   scalar_bytes == sizeof(token),
               "decode exposes next_token");
-        CHECK(model->verbs_v2.get_output(
+        CHECK(model->verbs.get_output(
                   model->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG, &is_eog,
                   sizeof(is_eog), &scalar_bytes, -1) == 0 &&
                   scalar_bytes == sizeof(is_eog),
@@ -192,56 +189,52 @@ int main() {
                 baseline_tokens.size() * 1000.0 / decode_ms,
                 baseline_tokens.size(), decode_ms);
     written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, nullptr, 0, &written, -1);
     CHECK(rc == -5 && written > 0, "query staged text size");
     staged_text.assign(written, '\0');
     written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, staged_text.data(),
         staged_text.size(), &written, -1);
     CHECK(rc == 0 && written > 0, "staged decode exposes accumulated text");
     staged_text.resize(written);
     CHECK(staged_text == text, "staged decode text matches one-shot infer");
-    rc = model->verbs_v2.run_stage(
-        model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_INFER, -1);
+    rc = model->verbs.step(model->self);
     CHECK(rc == 0, "one-shot infer after staged decode");
     uint64_t stale_written = 0;
-    rc = model->verbs_v2.get_output(
+    rc = model->verbs.get_output(
         model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN, nullptr, 0,
         &stale_written, -1);
     CHECK(rc == -7, "one-shot infer invalidates staged token output");
 
-    frt_model_runtime_v2* peer = nullptr;
+    frt_model_runtime_v1* peer = nullptr;
     rc = frt_llama_cpp_llm_runtime_open_with_engine_factory(
         json.c_str(), factory, &peer);
     CHECK(rc == 0 && peer, "open independent peer LLM session");
     if (peer) {
         const char* peer_prompt =
             "Complete this sequence with one number: 3, 6, 9,";
-        CHECK(peer->verbs_v2.set_input(
+        CHECK(peer->verbs.set_input(
                   peer->self, FRT_LLAMA_CPP_LLM_PORT_PROMPT,
                   peer_prompt, std::strlen(peer_prompt), -1) == 0,
               "peer set_input distinct prompt");
-        CHECK(peer->verbs_v2.run_stage(
-                  peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0 &&
-                  peer->verbs_v2.run_stage(
-                  peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0,
+        CHECK(llama_cpp_run_generic_stage(peer, "reset") == 0 &&
+                  llama_cpp_run_generic_stage(peer, "prefill") == 0,
               "prepare peer standalone baseline");
         std::vector<int32_t> peer_baseline_tokens;
         std::vector<int32_t> peer_baseline_eog;
         for (uint32_t i = 0; i < 16; ++i) {
-            CHECK(peer->verbs_v2.run_stage(
-                      peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0,
+            CHECK(llama_cpp_run_generic_stage(peer, "decode") == 0,
                   "decode peer standalone baseline");
             int32_t token = 0;
             int32_t is_eog = 0;
             uint64_t scalar_bytes = 0;
-            CHECK(peer->verbs_v2.get_output(
+            CHECK(peer->verbs.get_output(
                       peer->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN, &token,
                       sizeof(token), &scalar_bytes, -1) == 0 &&
                       scalar_bytes == sizeof(token) &&
-                      peer->verbs_v2.get_output(
+                      peer->verbs.get_output(
                       peer->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG, &is_eog,
                       sizeof(is_eog), &scalar_bytes, -1) == 0,
                   "capture peer standalone token sequence");
@@ -250,28 +243,24 @@ int main() {
             if (is_eog) break;
         }
         uint64_t peer_baseline_written = 0;
-        CHECK(peer->verbs_v2.get_output(
+        CHECK(peer->verbs.get_output(
                   peer->self, FRT_LLAMA_CPP_LLM_PORT_TEXT,
                   nullptr, 0, &peer_baseline_written, -1) == -5 &&
                   peer_baseline_written > 0,
               "query peer standalone baseline text size");
         std::string peer_baseline_text(peer_baseline_written, '\0');
         peer_baseline_written = 0;
-        CHECK(peer->verbs_v2.get_output(
+        CHECK(peer->verbs.get_output(
                   peer->self, FRT_LLAMA_CPP_LLM_PORT_TEXT,
                   peer_baseline_text.data(), peer_baseline_text.size(),
                   &peer_baseline_written, -1) == 0,
               "read peer standalone baseline text");
         peer_baseline_text.resize(peer_baseline_written);
-        CHECK(model->verbs_v2.run_stage(
-                  model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0 &&
-                  peer->verbs_v2.run_stage(
-                  peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_RESET, -1) == 0,
+        CHECK(llama_cpp_run_generic_stage(model, "reset") == 0 &&
+                  llama_cpp_run_generic_stage(peer, "reset") == 0,
               "reset two independent sessions");
-        CHECK(model->verbs_v2.run_stage(
-                  model->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0 &&
-                  peer->verbs_v2.run_stage(
-                  peer->self, FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0,
+        CHECK(llama_cpp_run_generic_stage(model, "prefill") == 0 &&
+                  llama_cpp_run_generic_stage(peer, "prefill") == 0,
               "prefill two independent sessions");
         const size_t interleaved_steps =
             std::max(baseline_tokens.size(), peer_baseline_tokens.size());
@@ -280,13 +269,11 @@ int main() {
             if (i < baseline_tokens.size()) {
                 int32_t token = 0;
                 int32_t is_eog = 0;
-                CHECK(model->verbs_v2.run_stage(
-                          model->self,
-                          FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0 &&
-                          model->verbs_v2.get_output(
+                CHECK(llama_cpp_run_generic_stage(model, "decode") == 0 &&
+                          model->verbs.get_output(
                           model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN,
                           &token, sizeof(token), &scalar_bytes, -1) == 0 &&
-                          model->verbs_v2.get_output(
+                          model->verbs.get_output(
                           model->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG,
                           &is_eog, sizeof(is_eog), &scalar_bytes, -1) == 0 &&
                           token == baseline_tokens[i] &&
@@ -296,13 +283,11 @@ int main() {
             if (i < peer_baseline_tokens.size()) {
                 int32_t token = 0;
                 int32_t is_eog = 0;
-                CHECK(peer->verbs_v2.run_stage(
-                          peer->self,
-                          FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0 &&
-                          peer->verbs_v2.get_output(
+                CHECK(llama_cpp_run_generic_stage(peer, "decode") == 0 &&
+                          peer->verbs.get_output(
                           peer->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN,
                           &token, sizeof(token), &scalar_bytes, -1) == 0 &&
-                          peer->verbs_v2.get_output(
+                          peer->verbs.get_output(
                           peer->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG,
                           &is_eog, sizeof(is_eog), &scalar_bytes, -1) == 0 &&
                           token == peer_baseline_tokens[i] &&
@@ -312,11 +297,11 @@ int main() {
         }
         uint64_t model_written = 0;
         uint64_t peer_written = 0;
-        CHECK(model->verbs_v2.get_output(
+        CHECK(model->verbs.get_output(
                   model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT,
                   nullptr, 0, &model_written, -1) == -5 &&
                   model_written > 0 &&
-                  peer->verbs_v2.get_output(
+                  peer->verbs.get_output(
                   peer->self, FRT_LLAMA_CPP_LLM_PORT_TEXT,
                   nullptr, 0, &peer_written, -1) == -5 &&
                   peer_written > 0,
@@ -325,10 +310,10 @@ int main() {
         std::string peer_text(peer_written, '\0');
         model_written = 0;
         peer_written = 0;
-        CHECK(model->verbs_v2.get_output(
+        CHECK(model->verbs.get_output(
                   model->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, model_text.data(),
                   model_text.size(), &model_written, -1) == 0 &&
-                  peer->verbs_v2.get_output(
+                  peer->verbs.get_output(
                   peer->self, FRT_LLAMA_CPP_LLM_PORT_TEXT, peer_text.data(),
                   peer_text.size(), &peer_written, -1) == 0,
               "read interleaved session outputs");
@@ -349,49 +334,39 @@ int main() {
         "\"n_ctx\":2048,\"n_threads\":0,"
         "\"temp\":0.0,\"top_k\":0,\"top_p\":0.0,\"seed\":1,"
         "\"max_tokens\":1}";
-    frt_model_runtime_v2 * budget_model = nullptr;
+    frt_model_runtime_v1 * budget_model = nullptr;
     rc = frt_llama_cpp_llm_runtime_open_with_engine_factory(
         budget_json.c_str(), factory, &budget_model);
     CHECK(rc == 0 && budget_model, "open max_tokens=1 LLM runtime");
     if (budget_model) {
-        CHECK(budget_model->verbs_v2.set_input(
+        CHECK(budget_model->verbs.set_input(
                   budget_model->self, FRT_LLAMA_CPP_LLM_PORT_PROMPT,
                   prompt, std::strlen(prompt), -1) == 0 &&
-                  budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0 &&
-                  budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0,
+                  llama_cpp_run_generic_stage(budget_model, "prefill") == 0 &&
+                  llama_cpp_run_generic_stage(budget_model, "decode") == 0,
               "max_tokens=1 session permits exactly one decode");
         int32_t first_is_eog = 1;
         uint64_t scalar_written = 0;
-        CHECK(budget_model->verbs_v2.get_output(
+        CHECK(budget_model->verbs.get_output(
                   budget_model->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG,
                   &first_is_eog, sizeof(first_is_eog), &scalar_written, -1) == 0 &&
                   first_is_eog == 0,
               "budget test prompt first token is not EOG");
-        CHECK(budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) != 0 &&
-                  std::strstr(budget_model->verbs_v2.last_error(
+        CHECK(llama_cpp_run_generic_stage(budget_model, "decode") != 0 &&
+                  std::strstr(budget_model->verbs.last_error(
                                   budget_model->self),
                               "max_tokens"),
               "staged decode rejects calls beyond max_tokens");
         int32_t stale_scalar = 0;
-        CHECK(budget_model->verbs_v2.get_output(
+        CHECK(budget_model->verbs.get_output(
                   budget_model->self, FRT_LLAMA_CPP_LLM_PORT_NEXT_TOKEN,
                   &stale_scalar, sizeof(stale_scalar), &scalar_written, -1) == -7 &&
-                  budget_model->verbs_v2.get_output(
+                  budget_model->verbs.get_output(
                   budget_model->self, FRT_LLAMA_CPP_LLM_PORT_IS_EOG,
                   &stale_scalar, sizeof(stale_scalar), &scalar_written, -1) == -7,
               "failed decode invalidates staged scalar outputs");
-        CHECK(budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_PREFILL, -1) == 0 &&
-                  budget_model->verbs_v2.run_stage(
-                  budget_model->self,
-                  FRT_LLAMA_CPP_LLM_STAGE_INDEX_DECODE, -1) == 0,
+        CHECK(llama_cpp_run_generic_stage(budget_model, "prefill") == 0 &&
+                  llama_cpp_run_generic_stage(budget_model, "decode") == 0,
               "prefill restores staged decode budget");
         budget_model->release(budget_model->owner);
     }

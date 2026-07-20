@@ -1,7 +1,7 @@
 """Jetson-PI multimodal LLM frontend — drives the Jetson-PI llama.cpp MLLM
-provider through the FlashRT ``frt_model_runtime_v2`` C ABI via ctypes.
+provider through the FlashRT ``frt_model_runtime_v1`` C ABI via ctypes.
 
-This is the Phase 4 Python entry for vision-language models (images + prompt →
+This is the Python entry for vision-language models (images + prompt ->
 text). The caller is responsible for applying the chat template; the engine
 only does raw prompt + media markers → text.
 
@@ -20,11 +20,11 @@ import numpy as np
 
 from .pi0 import (
     FrtImageView,
-    FrtModelRuntimeV2,
+    FrtModelRuntimeV1,
     FRT_RT_PIXEL_RGB8,
-    _FactoryV1,
-    _FRT_MODEL_RUNTIME_ABI_VERSION_V2,
+    _FRT_MODEL_RUNTIME_ABI_VERSION,
     _find_lib,
+    _run_generic_stage,
 )
 
 PORT_IMAGES = 0
@@ -53,22 +53,9 @@ class MllmJetsonPiFrontend:
         self._lib_path = _find_lib(lib_path, env_var="FLASHRT_MLLM_LIB")
         self._lib = ctypes.CDLL(self._lib_path)
 
-        self._lib.frt_llama_cpp_default_engine_factory.argtypes = []
-        self._lib.frt_llama_cpp_default_engine_factory.restype = ctypes.c_void_p
-        try:
-            self._lib.frt_llama_cpp_runtime_open_error.argtypes = []
-            self._lib.frt_llama_cpp_runtime_open_error.restype = ctypes.c_char_p
-        except AttributeError as exc:
-            raise RuntimeError(
-                "provider .so is older than the Python frontend expects: "
-                "missing frt_llama_cpp_runtime_open_error") from exc
-        self._lib.frt_llama_cpp_mllm_runtime_open_with_engine_factory.argtypes = [
-            ctypes.c_char_p,
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        self._lib.frt_llama_cpp_mllm_runtime_open_with_engine_factory.restype = (
-            ctypes.c_int)
+        self._lib.frt_model_runtime_open_v1.argtypes = [
+            ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+        self._lib.frt_model_runtime_open_v1.restype = ctypes.c_int
 
         config = {
             "model_family": "mllm",
@@ -85,39 +72,22 @@ class MllmJetsonPiFrontend:
         }
         config_json = json.dumps(config, ensure_ascii=False).encode("utf-8")
 
-        factory_ptr = self._lib.frt_llama_cpp_default_engine_factory()
-        if not factory_ptr:
-            raise RuntimeError(
-                "frt_llama_cpp_default_engine_factory returned NULL "
-                "(FlashRT built without FLASHRT_CPP_WITH_JETSON_PI?)")
-        factory = _FactoryV1.from_address(factory_ptr)
-        if factory.struct_size < ctypes.sizeof(_FactoryV1):
-            raise RuntimeError(
-                f"frt_llama_cpp_engine_factory_v1 struct_size="
-                f"{factory.struct_size} < ctypes sizeof "
-                f"{ctypes.sizeof(_FactoryV1)}; provider .so is older than the "
-                f"Python frontend expects.")
-
         model_ptr = ctypes.c_void_p(0)
-        rc = self._lib.frt_llama_cpp_mllm_runtime_open_with_engine_factory(
-            config_json, factory_ptr, ctypes.byref(model_ptr))
+        rc = self._lib.frt_model_runtime_open_v1(
+            config_json, ctypes.byref(model_ptr))
         if rc != 0 or not model_ptr.value:
-            err = self._lib.frt_llama_cpp_runtime_open_error() or b""
-            if not err:
-                err = factory.last_error(factory.self) or b""
             raise RuntimeError(
-                f"frt_llama_cpp_mllm_runtime_open_with_engine_factory failed "
-                f"(rc={rc}): {(err.decode(errors='replace') if err else 'no error')}")
+                f"frt_model_runtime_open_v1 failed for MLLM (rc={rc})")
 
-        self._model = FrtModelRuntimeV2.from_address(model_ptr.value)
-        if self._model.abi_version != _FRT_MODEL_RUNTIME_ABI_VERSION_V2:
+        self._model = FrtModelRuntimeV1.from_address(model_ptr.value)
+        if self._model.abi_version != _FRT_MODEL_RUNTIME_ABI_VERSION:
             raise RuntimeError(
-                f"frt_model_runtime_v2 abi_version={self._model.abi_version}, "
-                f"expected {_FRT_MODEL_RUNTIME_ABI_VERSION_V2}.")
-        if self._model.struct_size < ctypes.sizeof(FrtModelRuntimeV2):
+                f"frt_model_runtime_v1 abi_version={self._model.abi_version}, "
+                f"expected {_FRT_MODEL_RUNTIME_ABI_VERSION}.")
+        if self._model.struct_size < ctypes.sizeof(FrtModelRuntimeV1):
             raise RuntimeError(
-                f"frt_model_runtime_v2 struct_size={self._model.struct_size} "
-                f"< ctypes sizeof {ctypes.sizeof(FrtModelRuntimeV2)}.")
+                f"frt_model_runtime_v1 struct_size={self._model.struct_size} "
+                f"< ctypes sizeof {ctypes.sizeof(FrtModelRuntimeV1)}.")
         self._model_ptr = model_ptr
 
     def _make_image_views(self, images):
@@ -157,11 +127,11 @@ class MllmJetsonPiFrontend:
         """
         if self._model is None:
             raise RuntimeError("MllmJetsonPiFrontend is closed")
-        v2 = self._model.verbs_v2
+        verbs = self._model.verbs
         self_ = self._model.self
 
         views = self._make_image_views(images)
-        rc = v2.set_input(self_, PORT_IMAGES, ctypes.byref(views),
+        rc = verbs.set_input(self_, PORT_IMAGES, ctypes.byref(views),
                           ctypes.sizeof(views), -1)
         self._check(rc, "set_input images")
 
@@ -169,15 +139,15 @@ class MllmJetsonPiFrontend:
             prompt_bytes = prompt.encode("utf-8")
         else:
             prompt_bytes = bytes(prompt)
-        rc = v2.set_input(self_, PORT_PROMPT, prompt_bytes,
+        rc = verbs.set_input(self_, PORT_PROMPT, prompt_bytes,
                           len(prompt_bytes), -1)
         self._check(rc, "set_input prompt")
 
-        rc = v2.run_stage(self_, STAGE_INFER, -1)
-        self._check(rc, "run_stage infer")
+        rc = verbs.step(self_)
+        self._check(rc, "step infer")
 
         written = ctypes.c_uint64(0)
-        rc = v2.get_output(self_, PORT_TEXT, None, 0,
+        rc = verbs.get_output(self_, PORT_TEXT, None, 0,
                            ctypes.byref(written), -1)
         if rc != -5 or written.value == 0:
             self._check(rc, "query text output size")
@@ -185,7 +155,7 @@ class MllmJetsonPiFrontend:
         cap = written.value
         out = (ctypes.c_char * cap)()
         written.value = 0
-        rc = v2.get_output(self_, PORT_TEXT, out, cap,
+        rc = verbs.get_output(self_, PORT_TEXT, out, cap,
                            ctypes.byref(written), -1)
         self._check(rc, "get_output text")
         return out.raw[:written.value].decode("utf-8", errors="replace")
@@ -194,51 +164,50 @@ class MllmJetsonPiFrontend:
         """Clear the current multimodal KV-cache and sampler state."""
         if self._model is None:
             raise RuntimeError("MllmJetsonPiFrontend is closed")
-        rc = self._model.verbs_v2.run_stage(
-            self._model.self, STAGE_RESET, -1)
-        self._check(rc, "run_stage reset")
+        rc = _run_generic_stage(self._model, "reset")
+        self._check(rc, "generic stage reset")
 
     def prefill(self, images, prompt):
         """Encode images and prompt, returning first next-token logits."""
         if self._model is None:
             raise RuntimeError("MllmJetsonPiFrontend is closed")
-        v2 = self._model.verbs_v2
+        verbs = self._model.verbs
         views = self._make_image_views(images)
-        rc = v2.set_input(self._model.self, PORT_IMAGES, ctypes.byref(views),
+        rc = verbs.set_input(self._model.self, PORT_IMAGES, ctypes.byref(views),
                           ctypes.sizeof(views), -1)
         self._check(rc, "set_input images")
         if isinstance(prompt, str):
             prompt_bytes = prompt.encode("utf-8")
         else:
             prompt_bytes = bytes(prompt)
-        rc = v2.set_input(self._model.self, PORT_PROMPT, prompt_bytes,
+        rc = verbs.set_input(self._model.self, PORT_PROMPT, prompt_bytes,
                           len(prompt_bytes), -1)
         self._check(rc, "set_input prompt")
-        rc = v2.run_stage(self._model.self, STAGE_PREFILL, -1)
-        self._check(rc, "run_stage prefill")
+        rc = _run_generic_stage(self._model, "prefill")
+        self._check(rc, "generic stage prefill")
         return self.get_logits()
 
     def decode(self):
         """Sample and decode one token from the current multimodal session."""
         if self._model is None:
             raise RuntimeError("MllmJetsonPiFrontend is closed")
-        v2 = self._model.verbs_v2
-        rc = v2.run_stage(self._model.self, STAGE_DECODE, -1)
-        self._check(rc, "run_stage decode")
+        verbs = self._model.verbs
+        rc = _run_generic_stage(self._model, "decode")
+        self._check(rc, "generic stage decode")
         next_token = ctypes.c_int32()
         written = ctypes.c_uint64(0)
-        rc = v2.get_output(
+        rc = verbs.get_output(
             self._model.self, PORT_NEXT_TOKEN, ctypes.byref(next_token),
             ctypes.sizeof(next_token), ctypes.byref(written), -1)
         self._check(rc, "get_output next_token")
         is_eog = ctypes.c_int32()
         written = ctypes.c_uint64(0)
-        rc = v2.get_output(
+        rc = verbs.get_output(
             self._model.self, PORT_IS_EOG, ctypes.byref(is_eog),
             ctypes.sizeof(is_eog), ctypes.byref(written), -1)
         self._check(rc, "get_output is_eog")
         written = ctypes.c_uint64(0)
-        rc = v2.get_output(self._model.self, PORT_TEXT, None, 0,
+        rc = verbs.get_output(self._model.self, PORT_TEXT, None, 0,
                            ctypes.byref(written), -1)
         if rc != -5 or written.value == 0:
             self._check(rc, "query text output size")
@@ -246,7 +215,7 @@ class MllmJetsonPiFrontend:
         cap = written.value
         out = (ctypes.c_char * cap)()
         written.value = 0
-        rc = v2.get_output(self._model.self, PORT_TEXT, out, cap,
+        rc = verbs.get_output(self._model.self, PORT_TEXT, out, cap,
                            ctypes.byref(written), -1)
         self._check(rc, "get_output text")
         return {
@@ -259,9 +228,9 @@ class MllmJetsonPiFrontend:
         """Copy current next-token logits into a NumPy float32 array."""
         if self._model is None:
             raise RuntimeError("MllmJetsonPiFrontend is closed")
-        v2 = self._model.verbs_v2
+        verbs = self._model.verbs
         required = ctypes.c_uint64(0)
-        rc = v2.get_output(self._model.self, PORT_LOGITS, None, 0,
+        rc = verbs.get_output(self._model.self, PORT_LOGITS, None, 0,
                            ctypes.byref(required), -1)
         if rc != -5 or required.value == 0:
             self._check(rc, "query logits size")
@@ -272,7 +241,7 @@ class MllmJetsonPiFrontend:
         logits = np.empty(
             required.value // np.dtype(np.float32).itemsize, dtype=np.float32)
         written = ctypes.c_uint64(0)
-        rc = v2.get_output(self._model.self, PORT_LOGITS, logits.ctypes.data,
+        rc = verbs.get_output(self._model.self, PORT_LOGITS, logits.ctypes.data,
                            logits.nbytes, ctypes.byref(written), -1)
         self._check(rc, "get_output logits")
         if written.value != logits.nbytes:
@@ -312,7 +281,7 @@ class MllmJetsonPiFrontend:
         if rc != 0:
             err = b""
             try:
-                err = self._model.verbs_v2.last_error(self._model.self) or b""
+                err = self._model.verbs.last_error(self._model.self) or b""
             except Exception:
                 pass
             raise RuntimeError(

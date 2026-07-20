@@ -446,12 +446,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "See docs/qwen3_vl_fp8_sm89.md and docs/qwen3_vl_nvfp4.md.")
 
     if framework == "jetson_pi":
-        # The Jetson-PI provider serves Pi0 (VLA) and generic GGUF LLMs. config
-        # picks the path. Neither uses torch/jax or GPU arch detection.
         if config not in ("pi0", "pi05", "llm", "mllm"):
-            logger.warning(
-                "framework='jetson_pi' serves Pi0 / LLM / MLLM; config=%r ignored.",
-                config)
+            raise ValueError(
+                f"Unknown Jetson-PI config: {config}. "
+                "Supported: pi0, pi05, llm, mllm")
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
         raise ValueError(
@@ -462,13 +460,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
 
-    # ── Jetson-PI (llama.cpp/GGML) provider — Phase 2 ──
-    # Drives the Jetson-PI Pi0 provider through the frt_model_runtime_v2 C ABI
-    # via ctypes. No torch/jax, no GPU arch detection. The Pi0 action chunk
+    # Drives the Jetson-PI provider through frt_model_runtime_v1 via ctypes.
+    # No torch/jax or GPU architecture detection is involved. The action chunk
     # shape is passed explicitly by the caller (e.g. 10x32 for pi0_base).
     if framework == "jetson_pi":
-        # The Jetson-PI provider serves Pi0 (VLA) and generic GGUF LLMs. config
-        # picks the path. Neither uses torch/jax or GPU arch detection.
         if config == "llm":
             from flash_rt.frontends.jetson_pi.llm import LlmJetsonPiFrontend
             return LlmJetsonPiFrontend(
