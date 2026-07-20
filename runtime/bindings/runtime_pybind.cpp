@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,10 +37,18 @@ void release_py_owner(void* owner) {
 /* Model-runtime verbs implemented by Python callables. Trampolines acquire
  * the GIL (a native consumer calls these fn pointers from its own threads)
  * and translate exceptions into negative status + last_error. */
+struct PyVerbs;
+
+struct PyOpaqueRunner {
+    py::object callback;
+    PyVerbs* error_sink = nullptr;
+};
+
 struct PyVerbs {
-    py::object set_input, get_output, prepare, step, run_stage;
+    py::object set_input, get_output, prepare, step;
     std::string last_error;
     py::object owner;   /* the producer object the export anchors */
+    std::unique_ptr<PyOpaqueRunner> opaque_runner;
 };
 
 void release_py_verbs(void* p) {
@@ -119,17 +128,13 @@ int verb_step(void* self) {
     }
 }
 
-int verb_run_stage(void* self, uint32_t stage, int stream) {
-    auto* v = static_cast<PyVerbs*>(self);
+int verb_run_opaque(void* self, uint32_t executor_ref) {
+    auto* runner = static_cast<PyOpaqueRunner*>(self);
     py::gil_scoped_acquire gil;
-    if (!v->run_stage || v->run_stage.is_none()) {
-        v->last_error = "run_stage is not provided by this producer";
-        return -3;
-    }
     try {
-        return py::cast<int>(v->run_stage(stage, stream));
+        return py::cast<int>(runner->callback(executor_ref));
     } catch (const std::exception& e) {
-        v->last_error = e.what();
+        if (runner->error_sink) runner->error_sink->last_error = e.what();
         return -1;
     }
 }
@@ -144,17 +149,16 @@ void check(int rc, const char* what) {
 
 struct PyRtBuilder {
     frt_runtime_builder b;
+    std::unique_ptr<PyOpaqueRunner> opaque_runner;
 
     explicit PyRtBuilder(std::uintptr_t ctx_raw) {
         b = frt_runtime_builder_create(reinterpret_cast<frt_ctx>(ctx_raw));
         if (!b) throw std::runtime_error("frt_runtime_builder_create failed (null ctx?)");
     }
-    explicit PyRtBuilder(bool provider_owned) {
-        if (!provider_owned) {
-            throw std::runtime_error("internal error: provider-owned flag is required");
-        }
-        b = frt_runtime_builder_create_provider_owned();
-        if (!b) throw std::runtime_error("frt_runtime_builder_create_provider_owned failed");
+    PyRtBuilder() {
+        b = frt_model_runtime_builder_create_metadata();
+        if (!b) throw std::runtime_error(
+            "frt_model_runtime_builder_create_metadata failed");
     }
     ~PyRtBuilder() {
         /* A never-finished builder leaks its holder by design tradeoff: the
@@ -186,61 +190,47 @@ struct PyRtBuilder {
         pv->prepare = std::move(prepare);
         pv->step = std::move(step);
         pv->owner = std::move(owner);
+        if (opaque_runner) opaque_runner->error_sink = pv;
 
         frt_model_runtime_verbs verbs{};
         verbs.struct_size = sizeof(verbs);
-        verbs.set_input = &verb_set_input;
-        verbs.get_output = &verb_get_output;
-        verbs.prepare = &verb_prepare;
-        verbs.step = &verb_step;
+        verbs.set_input = pv->set_input.is_none() ? nullptr : &verb_set_input;
+        verbs.get_output =
+            pv->get_output.is_none() ? nullptr : &verb_get_output;
+        verbs.prepare = pv->prepare.is_none() ? nullptr : &verb_prepare;
+        verbs.step = pv->step.is_none() ? nullptr : &verb_step;
         verbs.last_error = &verb_last_error;
 
         frt_model_runtime_v1* mr = frt_runtime_builder_finish_model(
             b, &verbs, pv, pv, /*retain_owner=*/nullptr, &release_py_verbs);
         if (!mr) {
+            if (opaque_runner) opaque_runner->error_sink = nullptr;
             release_py_verbs(pv);
             throw std::runtime_error("finish_model failed");
         }
-        b = nullptr;
-        return reinterpret_cast<std::uintptr_t>(mr);
-    }
-
-    std::uintptr_t finish_model_v2(py::object owner, py::object set_input,
-                                   py::object get_output, py::object prepare,
-                                   py::object step, py::object run_stage) {
-        need();
-        auto* pv = new PyVerbs();
-        pv->set_input = std::move(set_input);
-        pv->get_output = std::move(get_output);
-        pv->prepare = std::move(prepare);
-        pv->step = std::move(step);
-        pv->run_stage = std::move(run_stage);
-        pv->owner = std::move(owner);
-
-        frt_model_runtime_verbs_v2 verbs{};
-        verbs.struct_size = sizeof(verbs);
-        verbs.set_input = &verb_set_input;
-        verbs.get_output = &verb_get_output;
-        verbs.prepare = &verb_prepare;
-        verbs.step = &verb_step;
-        verbs.last_error = &verb_last_error;
-        verbs.run_stage = &verb_run_stage;
-
-        frt_model_runtime_v2* mr = frt_runtime_builder_finish_model_v2(
-            b, &verbs, pv, pv, /*retain_owner=*/nullptr, &release_py_verbs);
-        if (!mr) {
-            release_py_verbs(pv);
-            throw std::runtime_error("finish_model_v2 failed");
-        }
+        pv->opaque_runner = std::move(opaque_runner);
         b = nullptr;
         return reinterpret_cast<std::uintptr_t>(mr);
     }
 };
 
+const frt_generic_stage_plan_ext_v1* generic_plan(frt_model_runtime_v1* model) {
+    if (model->struct_size < FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE ||
+        !model->query_extension) return nullptr;
+    const void* extension = nullptr;
+    if (model->query_extension(model, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+                               &extension) != 0) return nullptr;
+    auto* plan = static_cast<const frt_generic_stage_plan_ext_v1*>(extension);
+    if (!plan || plan->abi_version < FRT_GENERIC_STAGE_PLAN_ABI_VERSION ||
+        plan->struct_size < FRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE)
+        throw std::runtime_error("invalid generic stage-plan extension");
+    return plan;
+}
+
 frt_runtime_export_v1* as_export(std::uintptr_t p) {
     auto* e = reinterpret_cast<frt_runtime_export_v1*>(p);
     if (!e || e->abi_version != FRT_RUNTIME_ABI_VERSION ||
-        e->struct_size < sizeof(frt_runtime_export_v1))
+        e->struct_size != sizeof(frt_runtime_export_v1))
         throw std::runtime_error("not a valid frt_runtime_export_v1 pointer");
     return e;
 }
@@ -248,23 +238,8 @@ frt_runtime_export_v1* as_export(std::uintptr_t p) {
 frt_model_runtime_v1* as_model(std::uintptr_t p) {
     auto* m = reinterpret_cast<frt_model_runtime_v1*>(p);
     if (!m || m->abi_version != FRT_MODEL_RUNTIME_ABI_VERSION ||
-        m->struct_size < sizeof(frt_model_runtime_v1))
+        m->struct_size < FRT_MODEL_RUNTIME_V1_BASE_SIZE)
         throw std::runtime_error("not a valid frt_model_runtime_v1 pointer");
-    return m;
-}
-
-frt_model_runtime_v2* as_model_v2(std::uintptr_t p) {
-    auto* m = reinterpret_cast<frt_model_runtime_v2*>(p);
-    /* Append-only: accept any producer whose struct_size is AT LEAST the v2
-     * size we were compiled against. A producer built with a newer header
-     * (larger struct_size, e.g. with Phase 6 port_tokens) must still be
-     * drivable; a producer built with this header matches exactly. The old
-     * strict `!=` gate would reject a newer producer and break the
-     * append-only contract — see frt_model_runtime_wrap (model_runtime.cpp)
-     * which already uses `>=`. */
-    if (!m || m->abi_version != FRT_MODEL_RUNTIME_ABI_VERSION_V2 ||
-        m->struct_size < sizeof(frt_model_runtime_v2))
-        throw std::runtime_error("not a valid frt_model_runtime_v2 pointer");
     return m;
 }
 
@@ -282,7 +257,9 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
     m.attr("REGION_RESTORE") = (unsigned)FRT_RT_REGION_RESTORE;
 
     m.attr("MODEL_ABI_VERSION") = FRT_MODEL_RUNTIME_ABI_VERSION;
-    m.attr("MODEL_ABI_VERSION_V2") = FRT_MODEL_RUNTIME_ABI_VERSION_V2;
+    m.attr("MODEL_V1_BASE_SIZE") = FRT_MODEL_RUNTIME_V1_BASE_SIZE;
+    m.attr("MODEL_V1_QUERY_EXTENSION_SIZE") =
+        FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE;
     m.attr("MOD_TENSOR") = (unsigned)FRT_RT_MOD_TENSOR;
     m.attr("MOD_IMAGE") = (unsigned)FRT_RT_MOD_IMAGE;
     m.attr("MOD_TEXT") = (unsigned)FRT_RT_MOD_TEXT;
@@ -307,14 +284,19 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
     m.attr("PORT_SWAP") = (unsigned)FRT_RT_PORT_SWAP;
     m.attr("PORT_STAGED") = (unsigned)FRT_RT_PORT_STAGED;
     m.attr("PORT_SETUP") = (unsigned)FRT_RT_PORT_SETUP;
-    m.attr("STAGE_GRAPH") = (unsigned)FRT_RT_STAGE_GRAPH;
-    m.attr("STAGE_CALLBACK") = (unsigned)FRT_RT_STAGE_CALLBACK;
+    m.attr("GENERIC_STAGE_GRAPH") = (unsigned)FRT_GENERIC_STAGE_GRAPH;
+    m.attr("GENERIC_STAGE_OPAQUE") = (unsigned)FRT_GENERIC_STAGE_OPAQUE;
+    m.attr("GENERIC_STAGE_NAME_MAX_BYTES") =
+        (unsigned)FRT_GENERIC_STAGE_NAME_MAX_BYTES;
+    m.attr("GENERIC_STAGE_DESC_V1_SIZE") =
+        (unsigned)sizeof(frt_generic_stage_desc_v1);
+    m.attr("GENERIC_STAGE_PLAN_EXT_V1_SIZE") =
+        (unsigned)FRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE;
+    m.attr("EXT_GENERIC_STAGE_PLAN_V1") = FRT_EXT_GENERIC_STAGE_PLAN_V1;
 
     py::class_<PyRtBuilder>(m, "Builder")
         .def(py::init<std::uintptr_t>(), py::arg("ctx_raw"))
-        .def_static("provider_owned", []() {
-            return PyRtBuilder(true);
-        })
+        .def_static("metadata", []() { return std::make_unique<PyRtBuilder>(); })
         .def("add_stream", [](PyRtBuilder& s, const std::string& name, int stream_id,
                               int priority, std::uintptr_t native_handle) {
             s.need();
@@ -386,26 +368,30 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
                                                 (uint32_t)after.size()),
                   "add_stage");
         }, py::arg("graph"), py::arg("after") = std::vector<unsigned>{})
-        .def("add_graph_stage_v2", [](PyRtBuilder& s, const std::string& name,
-                                      unsigned graph,
-                                      const std::vector<unsigned>& after) {
+        .def("add_generic_stage", [](PyRtBuilder& s, const std::string& name,
+                                     unsigned executor_kind,
+                                     unsigned executor_ref,
+                                     const std::vector<unsigned>& after) {
             s.need();
-            check(frt_runtime_builder_add_graph_stage_v2(
-                      s.b, name.c_str(), graph, after.data(),
-                      (uint32_t)after.size()),
-                  "add_graph_stage_v2");
-        }, py::arg("name"), py::arg("graph"),
+            check(frt_runtime_builder_add_generic_stage(
+                      s.b, name.c_str(), executor_kind, executor_ref,
+                      after.data(), (uint32_t)after.size()),
+                  "add_generic_stage");
+        }, py::arg("name"), py::arg("executor_kind"),
+           py::arg("executor_ref"),
            py::arg("after") = std::vector<unsigned>{})
-        .def("add_callback_stage_v2", [](PyRtBuilder& s, const std::string& name,
-                                         unsigned callback,
-                                         const std::vector<unsigned>& after) {
+        .def("set_generic_stage_runner", [](PyRtBuilder& s,
+                                             py::object callback) {
             s.need();
-            check(frt_runtime_builder_add_callback_stage_v2(
-                      s.b, name.c_str(), callback, after.data(),
-                      (uint32_t)after.size()),
-                  "add_callback_stage_v2");
-        }, py::arg("name"), py::arg("callback"),
-           py::arg("after") = std::vector<unsigned>{})
+            if (callback.is_none())
+                throw std::invalid_argument("opaque runner must be callable");
+            auto runner = std::make_unique<PyOpaqueRunner>();
+            runner->callback = std::move(callback);
+            check(frt_runtime_builder_set_generic_stage_runner(
+                      s.b, runner.get(), verb_run_opaque),
+                  "set_generic_stage_runner");
+            s.opaque_runner = std::move(runner);
+        }, py::arg("callback"))
         .def("finish", &PyRtBuilder::finish, py::arg("owner"),
              "Consume the builder; returns the export pointer (uintptr). The export "
              "holds one reference; hand the pointer to a native consumer, which must "
@@ -418,15 +404,7 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
              "GIL, so a native consumer may call them from any thread. "
              "set_input(port, payload: bytes, stream) -> int; "
              "get_output(port, stream) -> bytes; prepare(graph, key) -> int; "
-             "step() -> int.")
-        .def("finish_model_v2", &PyRtBuilder::finish_model_v2,
-             py::arg("owner"),
-             py::arg("set_input") = py::none(), py::arg("get_output") = py::none(),
-             py::arg("prepare") = py::none(), py::arg("step") = py::none(),
-             py::arg("run_stage") = py::none(),
-             "Consume the builder; returns the frt_model_runtime_v2 pointer "
-             "(uintptr). run_stage(stage, stream) executes provider-owned "
-             "callback stages.");
+             "step() -> int.");
 
     /* Introspection over a raw export pointer (tests / mismatch tooling). */
     m.def("export_fingerprint", [](std::uintptr_t p) { return as_export(p)->fingerprint; });
@@ -459,9 +437,6 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
     m.def("model_export_ptr", [](std::uintptr_t p) {
         return reinterpret_cast<std::uintptr_t>(as_model(p)->exp);
     });
-    m.def("model_v2_export_ptr", [](std::uintptr_t p) {
-        return reinterpret_cast<std::uintptr_t>(as_model_v2(p)->exp);
-    });
     m.def("model_ports", [](std::uintptr_t p) {
         auto* mr = as_model(p);
         py::list out;
@@ -492,49 +467,32 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
         }
         return out;
     });
-    m.def("model_stages_v2", [](std::uintptr_t p) {
-        auto* mr = as_model_v2(p);
+    m.def("model_generic_stages", [](std::uintptr_t p) {
+        auto* plan = generic_plan(as_model(p));
         py::list out;
-        for (std::uint64_t i = 0; i < mr->n_stages_v2; ++i) {
-            const frt_runtime_stage_desc_v2& d = mr->stages_v2[i];
+        if (!plan) return out;
+        for (std::uint64_t i = 0; i < plan->n_stages; ++i) {
+            const frt_generic_stage_desc_v1& d = plan->stages[i];
             py::dict e;
             e["name"] = std::string(d.name);
-            e["kind"] = d.kind;
-            e["graph"] = d.graph;
-            e["callback"] = d.callback;
+            e["executor_kind"] = d.executor_kind;
+            e["executor_ref"] = d.executor_ref;
             e["after"] = std::vector<unsigned>(d.after, d.after + d.n_after);
             out.append(e);
         }
         return out;
     });
-    m.def("model_v2_ports", [](std::uintptr_t p) {
-        auto* mr = as_model_v2(p);
-        py::list out;
-        for (std::uint64_t i = 0; i < mr->n_ports; ++i) {
-            const frt_runtime_port_desc& d = mr->ports[i];
-            py::dict e;
-            e["name"] = std::string(d.name);
-            e["modality"] = d.modality; e["dtype"] = d.dtype;
-            e["layout"] = d.layout; e["direction"] = d.direction;
-            e["update"] = d.update; e["required"] = d.required;
-            e["shape"] = std::vector<std::int64_t>(d.shape, d.shape + d.rank);
-            e["cadence_hint_hz"] = d.cadence_hint_hz;
-            e["buffer"] = reinterpret_cast<std::uintptr_t>(d.buffer);
-            e["offset"] = d.offset; e["bytes"] = d.bytes;
-            out.append(e);
-        }
-        return out;
+    m.def("model_run_opaque", [](std::uintptr_t p, unsigned executor_ref) {
+        auto* plan = generic_plan(as_model(p));
+        if (!plan || !plan->run_opaque)
+            throw std::runtime_error("model has no OPAQUE executor");
+        py::gil_scoped_release nogil;
+        return plan->run_opaque(plan->stage_self, executor_ref);
     });
     m.def("model_retain", [](std::uintptr_t p) { auto* mr = as_model(p); mr->retain(mr->owner); });
     m.def("model_release", [](std::uintptr_t p) {
         auto* mr = as_model(p);
         py::gil_scoped_release nogil;   /* release re-acquires internally */
-        mr->release(mr->owner);
-    });
-    m.def("model_v2_retain", [](std::uintptr_t p) { auto* mr = as_model_v2(p); mr->retain(mr->owner); });
-    m.def("model_v2_release", [](std::uintptr_t p) {
-        auto* mr = as_model_v2(p);
-        py::gil_scoped_release nogil;
         mr->release(mr->owner);
     });
     /* Drive the verbs THROUGH the C fn pointers (tests exercise the same
@@ -565,47 +523,8 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
         py::gil_scoped_release nogil;
         return mr->verbs.step(mr->self);
     });
-    m.def("model_v2_step", [](std::uintptr_t p) {
-        auto* mr = as_model_v2(p);
-        py::gil_scoped_release nogil;
-        return mr->verbs_v2.step(mr->self);
-    });
-    m.def("model_v2_set_input", [](std::uintptr_t p, unsigned port,
-                                   py::bytes data, int stream) {
-        auto* mr = as_model_v2(p);
-        std::string s = data;
-        py::gil_scoped_release nogil;
-        return mr->verbs_v2.set_input(mr->self, port, s.data(), s.size(),
-                                      stream);
-    }, py::arg("ptr"), py::arg("port"), py::arg("data"),
-       py::arg("stream") = -1);
-    m.def("model_v2_get_output", [](std::uintptr_t p, unsigned port,
-                                    std::uint64_t capacity, int stream) {
-        auto* mr = as_model_v2(p);
-        std::string buf(capacity, '\0');
-        std::uint64_t written = 0;
-        int rc;
-        {
-            py::gil_scoped_release nogil;
-            rc = mr->verbs_v2.get_output(mr->self, port, buf.data(), capacity,
-                                         &written, stream);
-        }
-        return py::make_tuple(rc, py::bytes(buf.data(),
-                                            rc == 0 ? written : 0), written);
-    }, py::arg("ptr"), py::arg("port"), py::arg("capacity"),
-       py::arg("stream") = -1);
-    m.def("model_v2_run_stage", [](std::uintptr_t p, unsigned stage,
-                                   int stream) {
-        auto* mr = as_model_v2(p);
-        py::gil_scoped_release nogil;
-        return mr->verbs_v2.run_stage(mr->self, stage, stream);
-    }, py::arg("ptr"), py::arg("stage"), py::arg("stream") = -1);
     m.def("model_last_error", [](std::uintptr_t p) {
         auto* mr = as_model(p);
         return std::string(mr->verbs.last_error(mr->self));
-    });
-    m.def("model_v2_last_error", [](std::uintptr_t p) {
-        auto* mr = as_model_v2(p);
-        return std::string(mr->verbs_v2.last_error(mr->self));
     });
 }

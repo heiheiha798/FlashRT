@@ -17,7 +17,6 @@ Run from the repo root (after building exec/ and runtime/):
 
 import ctypes
 import gc
-import json
 import weakref
 
 import _flashrt_exec as ex
@@ -25,9 +24,9 @@ import _flashrt_runtime as rt
 
 import flash_rt.runtime.export as export_mod
 from flash_rt.runtime.export import (
-    BufferSpec, CallbackStageSpec, GraphSpec, PortSpec, RegionSpec,
-    StageSpec, StreamSpec, build_model_runtime, build_provider_model_runtime_v2,
-    DTYPE, LAYOUT, MODALITY, STAGE_KIND, UPDATE,
+    BufferSpec, GenericStageSpec, GraphSpec, PortSpec, RegionSpec, StageSpec,
+    StreamSpec, build_metadata_model_runtime, build_model_runtime,
+    DTYPE, LAYOUT, MODALITY, UPDATE,
 )
 from flash_rt.subgraphs.stage_plan import (
     StagePlan,
@@ -81,6 +80,27 @@ class ModelV1(ctypes.Structure):
                 ("release", ctypes.CFUNCTYPE(None, ctypes.c_void_p))]
 
 
+class ModelV1Tail(ctypes.Structure):
+    _fields_ = ModelV1._fields_ + [("query_extension", ctypes.c_void_p)]
+
+
+class GenericStageDesc(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p),
+                ("executor_kind", ctypes.c_uint32),
+                ("executor_ref", ctypes.c_uint32),
+                ("n_after", ctypes.c_uint32),
+                ("after", ctypes.POINTER(ctypes.c_uint32))]
+
+
+class GenericStagePlan(ctypes.Structure):
+    _fields_ = [("abi_version", ctypes.c_uint32),
+                ("struct_size", ctypes.c_uint32),
+                ("stages", ctypes.POINTER(GenericStageDesc)),
+                ("n_stages", ctypes.c_uint64),
+                ("stage_self", ctypes.c_void_p),
+                ("run_opaque", ctypes.c_void_p)]
+
+
 def make_setup():
     ctx = ex.Ctx()
     sid = ctx.stream(0)
@@ -97,7 +117,11 @@ def make_setup():
 
 def build(setup, img_h=224, verbs=None):
     ctx, sid, src, dst, g = setup
-    verbs = verbs or {}
+    if verbs is None:
+        verbs = {
+            "set_input": lambda port, payload, stream: 0,
+            "get_output": lambda port, stream: b"",
+        }
     return build_model_runtime(
         ctx,
         streams=[StreamSpec("main", sid)],
@@ -144,7 +168,120 @@ def build_split(setup):
         stages=plan.to_stage_specs(export_mod),
         identity={"model": "trivial", "quant": "none"},
         manifest_extra={"stage_plan": plan.manifest()},
+        set_input=lambda port, payload, stream: 0,
+        get_output=lambda port, stream: b"",
     )
+
+
+def check_staged_callback_guards():
+    original_assemble = export_mod._assemble
+    assemble_calls = 0
+
+    def forbidden_assemble(*args, **kwargs):
+        nonlocal assemble_calls
+        assemble_calls += 1
+        raise AssertionError("_assemble must not run after STAGED validation failure")
+
+    export_mod._assemble = forbidden_assemble
+    try:
+        try:
+            build_model_runtime(
+                None, streams=(), graphs=(),
+                ports=[PortSpec("input", "tensor", "f32", "flat",
+                                "in", "staged", shape=(1,))],
+                identity={"model": "invalid-staged-input"},
+            )
+        except ValueError as exc:
+            input_rejected = str(exc) == "STAGED input ports require set_input"
+        else:
+            input_rejected = False
+
+        try:
+            build_model_runtime(
+                None, streams=(), graphs=(),
+                ports=[PortSpec("output", "tensor", "f32", "flat",
+                                "out", "staged", shape=(1,))],
+                identity={"model": "invalid-staged-output"},
+            )
+        except ValueError as exc:
+            output_rejected = str(exc) == "STAGED output ports require get_output"
+        else:
+            output_rejected = False
+    finally:
+        export_mod._assemble = original_assemble
+
+    check("Python producer rejects STAGED input without set_input",
+          input_rejected)
+    check("Python producer rejects STAGED output without get_output",
+          output_rejected)
+    check("Python STAGED rejection happens before _assemble", assemble_calls == 0)
+
+
+def check_low_level_staged_builder_guard(setup):
+    ctx, _, _, _, _ = setup
+    builder = rt.Builder(ctx.raw())
+    builder.add_identity("model", "low-level-staged-guard")
+    builder.add_port("input", rt.MOD_TENSOR, rt.DTYPE_F32,
+                     rt.LAYOUT_FLAT, rt.PORT_IN, rt.PORT_STAGED,
+                     shape=[1])
+    builder.add_port("output", rt.MOD_TENSOR, rt.DTYPE_F32,
+                     rt.LAYOUT_FLAT, rt.PORT_OUT, rt.PORT_STAGED,
+                     shape=[1])
+
+    class Owner:
+        pass
+
+    missing_input_owner = Owner()
+    missing_input_ref = weakref.ref(missing_input_owner)
+    try:
+        builder.finish_model(
+            missing_input_owner,
+            get_output=lambda port, stream: b"",
+        )
+    except RuntimeError as exc:
+        missing_input_rejected = str(exc) == "finish_model failed"
+    else:
+        missing_input_rejected = False
+    del missing_input_owner
+    gc.collect()
+
+    missing_output_owner = Owner()
+    missing_output_ref = weakref.ref(missing_output_owner)
+    try:
+        builder.finish_model(
+            missing_output_owner,
+            set_input=lambda port, payload, stream: 0,
+        )
+    except RuntimeError as exc:
+        missing_output_rejected = str(exc) == "finish_model failed"
+    else:
+        missing_output_rejected = False
+    del missing_output_owner
+    gc.collect()
+
+    final_owner = Owner()
+    final_owner_ref = weakref.ref(final_owner)
+    ptr = builder.finish_model(
+        final_owner,
+        set_input=lambda port, payload, stream: 0,
+        get_output=lambda port, stream: b"",
+        step=lambda: 0,
+    )
+    del final_owner
+    gc.collect()
+
+    check("low-level builder rejects missing STAGED input",
+          missing_input_rejected)
+    check("low-level builder rejects missing STAGED output",
+          missing_output_rejected)
+    check("low-level failures release owners",
+          missing_input_ref() is None and missing_output_ref() is None)
+    check("low-level builder remains retryable after STAGED rejection",
+          ptr != 0 and final_owner_ref() is not None)
+    rt.model_release(ptr)
+    gc.collect()
+    check("low-level successful retry releases its owner",
+          final_owner_ref() is None)
 
 
 def check_stage_plan_registry():
@@ -274,97 +411,72 @@ def check_vjp_guided_port_lowering(setup):
         mr.release()
 
 
-def check_provider_owned_v2():
-    calls = {"set_input": [], "run_stage": [], "step": 0}
+def check_generic_and_metadata(setup):
+    ctx, sid, _, _, g = setup
+    opaque_refs = []
+    def make_generic(executor_ref=91):
+        return build_model_runtime(
+            ctx,
+            streams=[StreamSpec("main", sid)],
+            graphs=[GraphSpec("graph", g)],
+            generic_stages=[
+                GenericStageSpec("graph", "graph", 0),
+                GenericStageSpec("opaque:decode", "opaque", executor_ref,
+                                 after=(0,)),
+            ],
+            identity={"provider": "python-fixture"},
+            step=lambda: 0,
+            run_opaque=lambda ref: opaque_refs.append(ref) or 0,
+        )
 
-    def py_set_input(port, payload, stream):
-        calls["set_input"].append((port, bytes(payload), stream))
-        return 0
+    generic = make_generic()
+    try:
+        check("Python generic plan is the sole stage authority",
+              generic.stages() == [] and generic.generic_stages() == [
+                  {"name": "graph", "executor_kind": rt.GENERIC_STAGE_GRAPH,
+                   "executor_ref": 0, "after": []},
+                  {"name": "opaque:decode",
+                   "executor_kind": rt.GENERIC_STAGE_OPAQUE,
+                   "executor_ref": 91, "after": [0]},
+              ])
+        check("Python generic identity is canonical",
+              "gstage-v1:1:13:opaque:decode:1:91:1:0\n" in generic.identity)
+        check("Python OPAQUE trampoline receives executor_ref",
+              rt.model_run_opaque(generic.ptr, 91) == 0 and opaque_refs == [91])
+        same = make_generic()
+        changed = make_generic(92)
+        try:
+            check("generic fingerprint is deterministic and ref-sensitive",
+                  same.fingerprint == generic.fingerprint and
+                  changed.fingerprint != generic.fingerprint)
+        finally:
+            same.release()
+            changed.release()
+    finally:
+        generic.release()
 
-    def py_run_stage(stage, stream):
-        calls["run_stage"].append((stage, stream))
-        return 0
-
-    def py_step():
-        calls["step"] += 1
-        return py_run_stage(0, -1)
-
-    mr = build_provider_model_runtime_v2(
-        ports=[
-            PortSpec("prompt", "text", "u8", "flat", "in", "staged",
-                     required=True, shape=(-1,)),
-            PortSpec("state", "state", "f32", "flat", "in", "staged",
-                     required=True, shape=(8,)),
-            PortSpec("actions", "action", "f32", "flat", "out", "staged",
-                     shape=(50, 32)),
-        ],
-        stages=[CallbackStageSpec("infer", 0)],
-        identity={"model": "pi0", "provider": "llama_cpp_test"},
-        manifest_extra={"provider": "llama_cpp", "model_family": "pi0"},
-        set_input=py_set_input,
-        step=py_step,
-        run_stage=py_run_stage,
+    metadata_refs = []
+    metadata = build_metadata_model_runtime(
+        ports=[PortSpec("input", "tensor", "f32", "flat", "in", "staged",
+                        shape=(1,), required=True)],
+        generic_stages=[GenericStageSpec("infer", "opaque", 7)],
+        identity={"provider": "metadata-fixture"},
+        set_input=lambda port, payload, stream: 0,
+        run_opaque=lambda ref: metadata_refs.append(ref) or 0,
     )
     try:
-        manifest = json.loads(mr.manifest)
-        ports = mr.ports()
-        stages = mr.stages()
-        check("provider-owned v2 exports staged ports", (
-            len(ports) == 3
-            and ports[0]["name"] == "prompt"
-            and ports[0]["modality"] == MODALITY["text"]
-            and ports[0]["update"] == UPDATE["staged"]
-            and ports[0]["buffer"] == 0))
-        check("provider-owned v2 exposes callback infer stage", (
-            stages == [{"name": "infer", "kind": STAGE_KIND["callback"],
-                        "graph": 0xFFFFFFFF, "callback": 0, "after": []}]))
-        check("provider-owned v2 identity carries callback stage", (
-            "stage_v2:0:infer:" in mr.identity
-            and "port:0:prompt:" in mr.identity))
-        check("provider-owned v2 has no exec graph manifest", (
-            "graphs" not in manifest
-            and manifest["provider"] == "llama_cpp"))
-        check("provider-owned v2 set_input reaches Python callable", (
-            rt.model_v2_set_input(mr.ptr, 0, b"pick cube", -1) == 0
-            and calls["set_input"] == [(0, b"pick cube", -1)]))
-        check("provider-owned v2 run_stage reaches Python callable", (
-            rt.model_v2_run_stage(mr.ptr, 0, -1) == 0
-            and calls["run_stage"][-1] == (0, -1)))
-        check("provider-owned v2 step can delegate to callback stage", (
-            rt.model_v2_step(mr.ptr) == 0 and calls["step"] == 1))
+        check("Python metadata runtime has a zero-resource export anchor",
+              rt.export_counts(metadata.export_ptr) == {
+                  "streams": 0, "graphs": 0, "buffers": 0,
+                  "capsule_regions": 0})
+        check("Python metadata runtime publishes all-OPAQUE plan",
+              metadata.generic_stages() == [
+                  {"name": "infer", "executor_kind": rt.GENERIC_STAGE_OPAQUE,
+                   "executor_ref": 7, "after": []}])
+        check("Python metadata OPAQUE callback runs",
+              rt.model_run_opaque(metadata.ptr, 7) == 0 and metadata_refs == [7])
     finally:
-        mr.release()
-    try:
-        build_provider_model_runtime_v2(
-            ports=[
-                PortSpec("bad_swap", "tensor", "f32", "flat", "in", "swap",
-                         shape=(1,)),
-            ],
-            stages=[CallbackStageSpec("infer", 0)],
-            identity={"model": "bad"},
-            run_stage=py_run_stage,
-        )
-    except ValueError as e:
-        rejected_swap = "staged updates" in str(e)
-    else:
-        rejected_swap = False
-    check("provider-owned v2 rejects non-staged ports", rejected_swap)
-    try:
-        build_provider_model_runtime_v2(
-            ports=[
-                PortSpec("bad_window", "tensor", "f32", "flat", "in",
-                         "staged", shape=(1,), nbytes=4),
-            ],
-            stages=[CallbackStageSpec("infer", 0)],
-            identity={"model": "bad"},
-            run_stage=py_run_stage,
-        )
-    except ValueError as e:
-        rejected_window = "raw windows" in str(e)
-    else:
-        rejected_window = False
-    check("provider-owned v2 rejects raw window declarations",
-          rejected_window)
+        metadata.release()
 
 
 def main():
@@ -373,6 +485,17 @@ def main():
     ctx, sid, src, dst, g = setup
 
     print("== struct layout (ctypes mirror vs specs) ==")
+    check("ctypes v1 prefix matches exported required size",
+          ctypes.sizeof(ModelV1) == int(rt.MODEL_V1_BASE_SIZE))
+    check("ctypes v1 tail matches exported query size",
+          ctypes.sizeof(ModelV1Tail) ==
+          int(rt.MODEL_V1_QUERY_EXTENSION_SIZE))
+    check("ctypes generic descriptor/table match C ABI sizes",
+          ctypes.sizeof(GenericStageDesc) == int(rt.GENERIC_STAGE_DESC_V1_SIZE)
+          and ctypes.sizeof(GenericStagePlan) ==
+          int(rt.GENERIC_STAGE_PLAN_EXT_V1_SIZE))
+    check_staged_callback_guards()
+    check_low_level_staged_builder_guard(setup)
     calls = {"set_input": [], "step": 0}
 
     def py_set_input(port, payload, stream):
@@ -392,7 +515,7 @@ def main():
                                  get_output=py_get_output, step=py_step))
     m = ModelV1.from_address(mr.ptr)
     check("abi stamp", m.abi_version == int(rt.MODEL_ABI_VERSION)
-          and m.struct_size == ctypes.sizeof(ModelV1))
+          and m.struct_size >= int(rt.MODEL_V1_BASE_SIZE))
     check("embedded export pointer", m.exp == mr.export_ptr)
     check("port count", m.n_ports == 3 and m.n_stages == 1)
     p0 = m.ports[0]
@@ -428,8 +551,7 @@ def main():
     print("== stage plan registry ==")
     check_stage_plan_registry()
     check_vjp_guided_port_lowering(setup)
-    print("== provider-owned v2 callback stage ==")
-    check_provider_owned_v2()
+    check_generic_and_metadata(setup)
 
     print("== verbs through the C function pointers ==")
     rc = rt.model_set_input(mr.ptr, 1, b"\xAA\xBB", -1)

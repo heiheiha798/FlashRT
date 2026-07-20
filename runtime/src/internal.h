@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,13 @@ namespace frt_rt {
  * count drops to zero. std::deque: element addresses are stable under
  * push_back, so descriptors can point at .c_str() / .data() safely. */
 struct Holder {
+#if defined(__GNUC__) || defined(__clang__)
+    Holder() __attribute__((visibility("hidden"))) = default;
+    ~Holder() __attribute__((visibility("hidden"))) = default;
+#else
+    Holder() = default;
+    ~Holder() = default;
+#endif
     std::atomic<int> refs{1};
     void* user_owner = nullptr;
     void (*user_release)(void*) = nullptr;
@@ -40,17 +48,17 @@ struct Holder {
     std::deque<std::vector<uint32_t>> after_arrays;
     std::vector<frt_runtime_port_desc>  ports;
     std::vector<frt_runtime_stage_desc> stages;
-    std::vector<frt_runtime_stage_desc_v2> stages_v2;
-
-    /* Phase 6 — memory-domain tokens attached to provider-owned ports.
-     * One entry per port that carries a token (parallel to `ports` by index,
-     * with token.handle == nullptr for ports without one). Copied verbatim
-     * from the builder; `verbs.destroy` is fired at release. */
-    std::vector<frt_memory_token_desc> port_tokens;
+    std::unique_ptr<frt_generic_stage_desc_v1[]> generic_stages;
+    size_t n_generic_stages = 0;
+    size_t generic_stage_capacity = 0;
+    frt_generic_stage_plan_ext_v1 generic_stage_plan{};
+    bool generic_plan_present = false;
+    bool generic_runner_registered = false;
+    void* generic_stage_self = nullptr;
+    int (*run_opaque)(void*, uint32_t) = nullptr;
 
     frt_runtime_export_v1 exp{};
     frt_model_runtime_v1  model{};
-    frt_model_runtime_v2  model_v2{};
 };
 
 extern "C" void frt_rt_holder_retain(void* owner);
@@ -64,7 +72,7 @@ struct frt_runtime_builder_s {
     frt_ctx ctx = nullptr;
     frt_rt::Holder* h = nullptr;  /* built up in place; adopted by finish */
     std::string identity_pairs;
-    bool provider_owned = false;
+    bool metadata_only = false;
 };
 
 namespace frt_rt {

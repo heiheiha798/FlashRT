@@ -30,15 +30,15 @@ BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 # build-mode aware: it reads FLASHRT_SLIM_BUILD from the configured build dir's
 # CMakeCache.txt and asserts the matching surface.
 #
-#   compat default (FLASHRT_SLIM_BUILD=OFF): 55 direct TUs, unchanged.
-#   slim SM89   (FLASHRT_SLIM_BUILD=ON):     33 direct TUs (-22):
+#   compat default (FLASHRT_SLIM_BUILD=OFF): 57 direct TUs, unchanged.
+#   slim SM89   (FLASHRT_SLIM_BUILD=ON):     34 direct TUs (-22):
 #       -5 Motus VAE FP8 (Unit 1), -10 Qwen3.6/linear-attn (Unit 2),
 #       -7 SM120/NVFP4-named (Unit 3).
 # The direct-source breakdowns below are SM89-specific; other arches add/remove
 # arch-owned sources (for example SM120 adds nvfp4_sf_reshape_sm120.cu), so the
 # direct-count/category asserts are limited to SM89.
-COMPAT_KERNELS_TU = 55
-SLIM_SM89_KERNELS_TU = 33
+COMPAT_KERNELS_TU = 57
+SLIM_SM89_KERNELS_TU = 34
 
 # Per-group breakdown of flash_rt_kernels (mirrors AGENTS.md "Current Build
 # Layout"). categorize() drops empty groups, so slim omits sm120_nvfp4_named.
@@ -49,7 +49,8 @@ COMPAT_KERNELS_CATEGORIES = {
     "motus_video_fp8_history": 7,
     "dit_video": 2,
     "qwen3_family": 2,
-    "other": 9,
+    "audio_codebook": 1,
+    "other": 10,
 }
 SLIM_SM89_KERNELS_CATEGORIES = {
     "generic_shared": 15,
@@ -57,6 +58,7 @@ SLIM_SM89_KERNELS_CATEGORIES = {
     "motus_video_fp8_history": 2,
     "dit_video": 2,
     "qwen3_family": 2,
+    "audio_codebook": 1,
     "other": 10,
 }
 
@@ -90,12 +92,21 @@ def _is_sm89() -> bool:
     return (_cache_value("GPU_ARCH") or "").strip() == "89"
 
 
+def _audio_codebook_enabled() -> bool:
+    return _cache_bool("FLASHRT_ENABLE_AUDIO_CODEBOOK")
+
+
 def _expected_tu() -> int:
-    return SLIM_SM89_KERNELS_TU if _is_slim() else COMPAT_KERNELS_TU
+    expected = SLIM_SM89_KERNELS_TU if _is_slim() else COMPAT_KERNELS_TU
+    return expected if _audio_codebook_enabled() else expected - 1
 
 
 def _expected_categories() -> dict:
-    return SLIM_SM89_KERNELS_CATEGORIES if _is_slim() else COMPAT_KERNELS_CATEGORIES
+    expected = dict(SLIM_SM89_KERNELS_CATEGORIES if _is_slim()
+                    else COMPAT_KERNELS_CATEGORIES)
+    if not _audio_codebook_enabled():
+        expected.pop("audio_codebook", None)
+    return expected
 
 
 def _load_inventory():
@@ -172,9 +183,9 @@ def test_object_libraries_counted_in_total():
     module's direct sources; the inventory must account for them separately so
     the reported compile surface is not understated.
 
-    flash_rt_fa2 compiles 1 direct TU but links the fa2_vendor_obj object
-    library; its total must exceed its direct count when attribution is
-    available (Makefile link.txt / Ninja build.ninja present).
+    The default flash_rt_fa2 module links fa2_vendor_obj directly. The opt-in
+    native build links those objects once into flashrt_fa2_raw, leaving the
+    Python module as a thin adapter with no object-library TUs of its own.
     """
     _require_build_dir()
     report = inv.collect(BUILD_DIR)
@@ -183,6 +194,10 @@ def test_object_libraries_counted_in_total():
         pytest.skip("flash_rt_fa2 not configured in this build dir")
     if "object_tu_count" not in fa2:
         pytest.skip("no linker manifest in this build dir; attribution skipped")
-    assert fa2["object_tu_count"] >= 1
-    assert fa2["total_tu_count"] == fa2["count"] + fa2["object_tu_count"]
-    assert fa2["total_tu_count"] > fa2["count"]
+    if _cache_bool("FLASHRT_ENABLE_NATIVE_CPP"):
+        assert fa2["object_tu_count"] == 0
+        assert fa2["total_tu_count"] == fa2["count"]
+    else:
+        assert fa2["object_tu_count"] >= 1
+        assert fa2["total_tu_count"] == fa2["count"] + fa2["object_tu_count"]
+        assert fa2["total_tu_count"] > fa2["count"]

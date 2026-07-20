@@ -56,7 +56,6 @@ extern "C" {
 #endif
 
 #define FRT_MODEL_RUNTIME_ABI_VERSION 1u
-#define FRT_MODEL_RUNTIME_ABI_VERSION_V2 2u
 
 /* ------------------------------------------------------------------ */
 /* Enums — values are ABI-frozen after v1 (append-only).               */
@@ -106,25 +105,14 @@ enum frt_rt_port_update {
     FRT_RT_PORT_SETUP  = 2
 };
 
-enum frt_rt_stage_kind {
-    FRT_RT_STAGE_GRAPH    = 0,
-    FRT_RT_STAGE_CALLBACK = 1
+enum frt_generic_stage_executor_kind_v1 {
+    FRT_GENERIC_STAGE_GRAPH  = 0,
+    FRT_GENERIC_STAGE_OPAQUE = 1
 };
 
-/* Phase 6 — memory-domain contract. Where a provider-owned buffer lives, so
- * FlashRT can reason about access (host-readable now, device-resident later)
- * WITHOUT ever dereferencing the provider's memory or leaking a backend type.
- * Values are ABI-frozen after v1 (append-only): new location kinds get higher
- * integers. */
-enum frt_rt_location_kind {
-    FRT_RT_LOCATION_HOST_VISIBLE = 0,  /* copy_to_host is a plain read; no sync  */
-    FRT_RT_LOCATION_DEVICE_LOCAL = 1   /* provider-owned device memory; sync first */
-};
-
-enum frt_rt_host_map_access {
-    FRT_RT_HOST_MAP_READ  = 1,
-    FRT_RT_HOST_MAP_WRITE = 2
-};
+#define FRT_GENERIC_STAGE_NAME_MAX_BYTES 255u
+#define FRT_GENERIC_STAGE_PLAN_ABI_VERSION 1u
+#define FRT_EXT_GENERIC_STAGE_PLAN_V1 UINT64_C(0x0000000000000001)
 
 /* ------------------------------------------------------------------ */
 /* Payload types (STAGED lane).                                        */
@@ -170,93 +158,6 @@ typedef struct frt_runtime_port_desc {
     uint64_t offset, bytes;
 } frt_runtime_port_desc;
 
-/* ------------------------------------------------------------------ */
-/* Phase 6 — memory-domain token (provider-owned buffer contract).     */
-/*                                                                     */
-/* A provider-owned runtime cannot use the CUDA-export SWAP window     */
-/* (frt_buffer + offset + bytes) — that implies same-backend device    */
-/* sharing with no contract. Instead, a provider-owned port MAY carry  */
-/* an opaque memory token the provider mints, plus a small verb set    */
-/* FlashRT calls to copy/sync/destroy. FlashRT NEVER dereferences the  */
-/* token: zero-copy is an ADVERTISED capability (location_kind =        */
-/* HOST_VISIBLE), not an assumption. This is the honest contract that  */
-/* lets a future provider optionally expose host-visible or device-    */
-/* local buffers through provider-owned ports WITHOUT faking a CUDA    */
-/* graph or leaking GGML/CUDA types (see docs/phase6_backend_vtable_   */
-/* eval.md).                                                           */
-/* ------------------------------------------------------------------ */
-typedef struct frt_memory_token_s* frt_memory_token;
-
-/* Provider-supplied verbs against its own backing store. The original
- * copy/sync prefix is mandatory and always callable. Append-only tail verbs
- * such as map_host/unmap_host must be struct_size-probed before use.
- * `destroy` is the only void entry; FlashRT calls it exactly
- * once when the runtime's holder refcount hits zero (on the provider-owned
- * v2 path the holder IS the token's lifetime owner — there is no separate
- * per-port/per-export counter, and no v2 wrap/override path exists, so the
- * holder refcount is the single relevant count). */
-typedef struct frt_memory_token_verbs {
-    uint32_t struct_size;      /* = sizeof(frt_memory_token_verbs)          */
-    uint32_t reserved;
-
-    /* Copy `bytes` from the token's backing store (at `src_off`) into a
-     * host buffer `dst` (at `dst_off`). Returns 0 on success. */
-    int (*copy_to_host)(frt_memory_token token, void* dst,
-                        uint64_t dst_off, uint64_t src_off, uint64_t bytes);
-
-    /* Copy `bytes` from a host buffer `src` (at `src_off`) into the token's
-     * backing store (at `dst_off`). Returns 0 on success. */
-    int (*copy_from_host)(frt_memory_token token, const void* src,
-                          uint64_t src_off, uint64_t dst_off, uint64_t bytes);
-
-    /* Block until the token's backing store is safe to read/write from the
-     * host (no-op for HOST_VISIBLE; required for DEVICE_LOCAL). Returns 0. */
-    int (*sync)(frt_memory_token token);
-
-    /* Release the provider's backing store. Called exactly once when the
-     * holder's refcount hits zero. May be null if the provider owns the
-     * store externally (then FlashRT never destroys it). */
-    void (*destroy)(frt_memory_token token);
-
-    /* Append-only host SWAP window. map_host returns a provider-owned host
-     * pointer for [offset, offset + bytes); the caller must keep the runtime
-     * alive and call unmap_host exactly once before any operation that can
-     * mutate/reallocate the backing store. Access is frt_rt_host_map_access.
-     * Providers compiled against the original prefix omit these fields. */
-    int (*map_host)(frt_memory_token token, uint64_t offset, uint64_t bytes,
-                    uint32_t access, void** out_ptr);
-    int (*unmap_host)(frt_memory_token token, void* ptr);
-} frt_memory_token_verbs;
-
-#define FRT_MEMORY_TOKEN_VERBS_COPY_SYNC_SIZE \
-    ((uint32_t)offsetof(frt_memory_token_verbs, map_host))
-
-/* A token bound to one provider-owned port. The provider retains the
- * backing store until `verbs.destroy` fires; FlashRT's only job is to fire
- * it once at runtime release. `bytes` is the logical size of the window
- * (not necessarily the whole backing store); `offset` is provider-relative. */
-typedef struct frt_memory_token_desc {
-    uint32_t struct_size;            /* = sizeof(frt_memory_token_desc)    */
-    frt_memory_token handle;         /* opaque provider handle             */
-    const frt_memory_token_verbs* verbs;  /* borrowed for the port's life  */
-    uint64_t offset;                 /* provider-relative window offset    */
-    uint64_t bytes;                  /* logical window size                 */
-    uint32_t location_kind;          /* enum frt_rt_location_kind           */
-    uint32_t reserved;
-} frt_memory_token_desc;
-
-/* Carrier: how a token reaches a provider-owned port. Rather than a second
- * port-descriptor struct probed by struct_size, Phase 6 carries tokens as a
- * PARALLEL array `port_tokens`/`n_port_tokens` on frt_model_runtime_v2,
- * index-aligned with `ports` (port_tokens[i] corresponds to ports[i]; a port
- * added via frt_runtime_builder_add_port gets a null-handle entry, a port
- * added via frt_runtime_builder_add_port_token gets the minted token). This
- * matches how v2 already carries parallel ports/stages/stages_v2 arrays and
- * keeps the v1 frt_runtime_port_desc byte-identical. The eval's named
- * frt_runtime_port_desc_v2 tail-probe form is NOT used — the parallel array
- * is the chosen, simpler carrier (see docs/phase6_backend_vtable_eval.md §8
- * for the vtable-vs-contract decision; the carrier choice is recorded there). */
-
 /* One schedulable stage = one export graph + dependency edges. Declared
  * array order is the sequential firing order `step` uses; `after` lists
  * stage indices that must complete first (for hosts that overlap stages
@@ -267,18 +168,28 @@ typedef struct frt_runtime_stage_desc {
     const uint32_t* after;     /* stage indices                            */
 } frt_runtime_stage_desc;
 
-/* v2 stage descriptors keep graph-backed stages explicit while allowing a
- * provider-owned callback executable. Callback indices are private to the
- * provider and are executed through frt_model_runtime_verbs_v2::run_stage;
- * no GGML/llama.cpp/backend type is exposed in the public ABI. */
-typedef struct frt_runtime_stage_desc_v2 {
-    const char* name;          /* stable stage name: "infer", "decode"...  */
-    uint32_t kind;             /* frt_rt_stage_kind                        */
-    uint32_t graph;            /* exp->graphs index, or UINT32_MAX         */
-    uint32_t callback;         /* provider stage id, or UINT32_MAX         */
+/* Generic selected-plan descriptors. Unlike extension tables, array elements
+ * have frozen size/stride and must not receive additive tail fields. */
+typedef struct frt_generic_stage_desc_v1 {
+    const char* name;
+    uint32_t executor_kind;
+    uint32_t executor_ref;
     uint32_t n_after;
-    const uint32_t* after;     /* stage indices                            */
-} frt_runtime_stage_desc_v2;
+    const uint32_t* after;
+} frt_generic_stage_desc_v1;
+
+typedef struct frt_generic_stage_plan_ext_v1 {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const frt_generic_stage_desc_v1* stages;
+    uint64_t n_stages;
+    void* stage_self;
+    int (*run_opaque)(void* stage_self, uint32_t executor_ref);
+} frt_generic_stage_plan_ext_v1;
+
+#define FRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE \
+    ((uint32_t)(offsetof(frt_generic_stage_plan_ext_v1, run_opaque) + \
+                sizeof(((frt_generic_stage_plan_ext_v1*)0)->run_opaque)))
 
 /* ------------------------------------------------------------------ */
 /* Verbs — implemented by the producer, called by the host.            */
@@ -315,28 +226,25 @@ typedef struct frt_model_runtime_verbs {
     const char* (*last_error)(void* self);
 } frt_model_runtime_verbs;
 
-typedef struct frt_model_runtime_verbs_v2 {
-    uint32_t struct_size;      /* = sizeof(frt_model_runtime_verbs_v2)     */
-    uint32_t reserved;
-
-    int (*set_input)(void* self, uint32_t port,
-                     const void* data, uint64_t bytes, int stream);
-    int (*get_output)(void* self, uint32_t port,
-                      void* out, uint64_t capacity, uint64_t* written,
-                      int stream);
-    int (*prepare)(void* self, uint32_t graph, frt_shape_key key);
-    int (*step)(void* self);
-    const char* (*last_error)(void* self);
-
-    /* Execute one v2 stage by index. Required for CALLBACK stages; graph
-     * stages remain directly schedulable through exp->graphs by white-box
-     * hosts. `stream` = an exp stream id, or -1 for the provider default. */
-    int (*run_stage)(void* self, uint32_t stage, int stream);
-} frt_model_runtime_verbs_v2;
+/* ABI-frozen in v1. Do not append fields here: this table is embedded in the
+ * middle of frt_model_runtime_v1, so growing it would move owner/retain/release
+ * and break the v1 prefix. New optional entry points belong in an additive
+ * tail on frt_model_runtime_v1 itself. */
 
 /* ------------------------------------------------------------------ */
 /* The model runtime object.                                           */
 /* ------------------------------------------------------------------ */
+struct frt_model_runtime_v1;
+
+/* Optional capabilities are discovered through an additive tail instead of
+ * growing the ABI-frozen verbs table. Consumers must probe the runtime's
+ * struct_size before reading this function pointer. */
+typedef int (*frt_model_runtime_query_extension_fn)(
+    const struct frt_model_runtime_v1* runtime,
+    uint64_t extension_id,
+    uint32_t min_version,
+    const void** out_extension);
+
 typedef struct frt_model_runtime_v1 {
     uint32_t abi_version;      /* = FRT_MODEL_RUNTIME_ABI_VERSION          */
     uint32_t struct_size;      /* = sizeof(frt_model_runtime_v1)           */
@@ -357,54 +265,28 @@ typedef struct frt_model_runtime_v1 {
     void* owner;
     void (*retain)(void* owner);
     void (*release)(void* owner);
+
+    /* Additive v1 tail. Baseline-prefix producers end before this field. */
+    frt_model_runtime_query_extension_fn query_extension;
 } frt_model_runtime_v1;
 
-typedef struct frt_model_runtime_v2 {
-    uint32_t abi_version;      /* = FRT_MODEL_RUNTIME_ABI_VERSION_V2       */
-    uint32_t struct_size;      /* = sizeof(frt_model_runtime_v2)           */
+/* Minimum byte prefix every v1 consumer may require. Keep this anchored to
+ * the last v1 field instead of sizeof(frt_model_runtime_v1): future additive
+ * tail fields must remain optional for baseline-prefix producers and invisible
+ * to prefix-only consumers. Read a tail only after probing its required size. */
+#define FRT_MODEL_RUNTIME_V1_BASE_SIZE \
+    ((uint32_t)(offsetof(frt_model_runtime_v1, release) + \
+                sizeof(((frt_model_runtime_v1*)0)->release)))
 
-    const frt_runtime_export_v1* exp;
-
-    const frt_runtime_port_desc*  ports;  uint64_t n_ports;
-
-    /* Legacy graph-only view. Empty when v2 stages include provider-owned
-     * callbacks, so old graph schedulers do not misinterpret the DAG. */
-    const frt_runtime_stage_desc* stages; uint64_t n_stages;
-
-    void* self;
-    frt_model_runtime_verbs verbs;       /* v1-compatible verb subset     */
-
-    void* owner;
-    void (*retain)(void* owner);
-    void (*release)(void* owner);
-
-    const frt_runtime_stage_desc_v2* stages_v2;
-    uint64_t n_stages_v2;
-    frt_model_runtime_verbs_v2 verbs_v2;
-
-    /* Phase 6 (append-only): memory-domain tokens, a PARALLEL array to
-     * `ports` by index. n_port_tokens == n_ports ALWAYS: a port added via
-     * frt_runtime_builder_add_port gets a null-handle entry here, a port
-     * added via frt_runtime_builder_add_port_token gets the minted token.
-     * An entry with handle == nullptr means that port carries no token.
-     * These fields are trailing additions to the v2 struct, so an older
-     * producer (smaller struct_size) is still accepted by the >= / < probes
-     * used by frt_model_runtime_wrap and as_model_v2; such a consumer simply
-     * never reads the tail. FlashRT fires `token.verbs->destroy` exactly
-     * once when the holder refcount hits zero. */
-    const frt_memory_token_desc* port_tokens;
-    uint64_t n_port_tokens;
-} frt_model_runtime_v2;
+#define FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE \
+    ((uint32_t)(offsetof(frt_model_runtime_v1, query_extension) + \
+                sizeof(((frt_model_runtime_v1*)0)->query_extension)))
 
 /* Factory symbol convention for NATIVE model runtimes: a model-runtime .so
  * exports exactly this symbol. Returns a retained object (caller releases). */
 #define FRT_MODEL_RUNTIME_OPEN_V1_SYMBOL "frt_model_runtime_open_v1"
 typedef int (*frt_model_runtime_open_v1_fn)(const char* config_json,
                                             frt_model_runtime_v1** out);
-
-#define FRT_MODEL_RUNTIME_OPEN_V2_SYMBOL "frt_model_runtime_open_v2"
-typedef int (*frt_model_runtime_open_v2_fn)(const char* config_json,
-                                            frt_model_runtime_v2** out);
 
 /* ------------------------------------------------------------------ */
 /* Construction path 1 — INTEGRATED (preferred): the export builder    */
@@ -425,48 +307,29 @@ int frt_runtime_builder_add_port(frt_runtime_builder, const char* name,
                                  uint64_t bytes);
 int frt_runtime_builder_add_stage(frt_runtime_builder, uint32_t graph,
                                   const uint32_t* after, uint32_t n_after);
+int frt_runtime_builder_add_generic_stage(
+    frt_runtime_builder, const char* name, uint32_t executor_kind,
+    uint32_t executor_ref, const uint32_t* after, uint32_t n_after);
+int frt_runtime_builder_set_generic_stage_runner(
+    frt_runtime_builder, void* stage_self,
+    int (*run_opaque)(void* stage_self, uint32_t executor_ref));
 
-/* Add a provider-owned port carrying a Phase 6 memory-domain token in place
- * of a CUDA-export SWAP window. `token` is borrowed only for this call (the
- * builder copies the descriptor). On a provider-owned runtime this is the
- * only permitted buffer form; the builder still rejects a raw frt_buffer.
- * The token's `destroy` is fired exactly once when the runtime's refcount
- * hits zero. */
-int frt_runtime_builder_add_port_token(
-    frt_runtime_builder, const char* name,
-    uint32_t modality, uint32_t dtype, uint32_t layout, uint32_t direction,
-    uint32_t required, const int64_t* shape, uint32_t rank,
-    uint32_t cadence_hint_hz,
-    frt_memory_token handle, const frt_memory_token_verbs* verbs,
-    uint64_t offset, uint64_t bytes, uint32_t location_kind);
-
-/* Create a builder for provider-owned model runtimes with no FlashRT exec
- * context. It may only be finished through frt_runtime_builder_finish_model_v2.
- */
-frt_runtime_builder frt_runtime_builder_create_provider_owned(void);
-
-int frt_runtime_builder_add_graph_stage_v2(frt_runtime_builder,
-                                           const char* name, uint32_t graph,
-                                           const uint32_t* after,
-                                           uint32_t n_after);
-int frt_runtime_builder_add_callback_stage_v2(frt_runtime_builder,
-                                              const char* name,
-                                              uint32_t callback,
-                                              const uint32_t* after,
-                                              uint32_t n_after);
+/* Create a model-only builder for a provider that owns no FlashRT execution
+ * resources. Its export remains the identity/lifetime anchor, with null ctx
+ * and zero resource arrays. The builder is deliberately restricted to
+ * identity/manifest, unbound STAGED or SETUP ports, and all-OPAQUE generic or
+ * step-only authority. */
+frt_runtime_builder frt_model_runtime_builder_create_metadata(void);
 
 /* Like frt_runtime_builder_finish, but returns the model runtime whose
  * `exp` is the internally-built export (one object, one refcount). `verbs`
- * is copied; entries may be null (the runtime then reports them
- * unsupported). Consumes the builder. */
+ * is copied; entries may be null except that every STAGED input requires a
+ * real set_input and every STAGED output requires a real get_output. A
+ * contract-validation failure returns null without consuming the builder or
+ * retaining owner; success consumes the builder. */
 frt_model_runtime_v1* frt_runtime_builder_finish_model(
     frt_runtime_builder,
     const frt_model_runtime_verbs* verbs, void* verbs_self,
-    void* owner, void (*retain_owner)(void*), void (*release_owner)(void*));
-
-frt_model_runtime_v2* frt_runtime_builder_finish_model_v2(
-    frt_runtime_builder,
-    const frt_model_runtime_verbs_v2* verbs, void* verbs_self,
     void* owner, void (*retain_owner)(void*), void (*release_owner)(void*));
 
 /* ------------------------------------------------------------------ */
@@ -477,7 +340,8 @@ frt_model_runtime_v2* frt_runtime_builder_finish_model_v2(
 /* producer builds both. Descriptor arrays are copied. The wrapper     */
 /* takes one export reference and calls `wrapper_release(wrapper_owner)`*/
 /* exactly once when its refcount hits zero (use it to destroy the     */
-/* producer instance behind `verbs_self`).                             */
+/* producer instance behind `verbs_self`). STAGED declarations require */
+/* matching input/output verbs, as on construction path 1.             */
 /* ------------------------------------------------------------------ */
 frt_model_runtime_v1* frt_model_runtime_wrap(
     const frt_runtime_export_v1* exp,
@@ -493,7 +357,8 @@ frt_model_runtime_v1* frt_model_runtime_wrap(
 /* a native runtime owns hot-path transforms. The override retains `in` */
 /* so all inherited descriptor pointers stay valid; consumers release   */
 /* only the returned object. `retain_owner`/`release_owner` manage the  */
-/* native verb object, called once at construction/destruction.         */
+/* native verb object, called once at construction/destruction. The new */
+/* verbs must satisfy every inherited STAGED input/output declaration.   */
 /* ------------------------------------------------------------------ */
 frt_model_runtime_v1* frt_model_runtime_override_verbs(
     const frt_model_runtime_v1* in,
