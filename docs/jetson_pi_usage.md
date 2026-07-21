@@ -54,10 +54,19 @@ The returned object always uses model-runtime v1:
 - outputs use ordinary STAGED `get_output`; no provider-specific buffer ABI is
   required.
 
-Engines with staged capability publish `context -> action` for VLA models or
-`reset -> prefill -> decode` for autoregressive models. Engines without that
-capability publish a single `infer` stage. The plan uses OPAQUE executors, so a
-generic host never sees llama.cpp or GGML types.
+VLA (Pi0) engines publish a single `infer` stage. Autoregressive LLM/MLLM
+engines with staged capability publish `reset -> prefill -> decode`; engines
+without that capability publish a single `infer` stage. The plan uses OPAQUE
+executors, so a generic host never sees llama.cpp or GGML types.
+
+> Pi0 does **not** currently advertise a `context -> action` split. The
+> backend `jetson_pi_pi0_context()`/`action()` pair is a cached result
+> handoff, not a real encode/decode boundary, and PI0.5 proprioceptive state
+> is not yet serialized into the `Task: ..., State: ...;\nAction:` prompt
+> through the narrow C API. Both are being corrected in the Jetson-PI-Edge
+> backend; the `context -> action` plan, staged tests, and the
+> `context()`/`action()` frontend helpers are re-enabled once that lands and
+> PI0.5 reference-policy state parity is proven. See FlashRT #148.
 
 ## Python
 
@@ -84,12 +93,10 @@ actions = model.predict(images, prompt=prompt, state=state)
 contiguous `float32` vector with `action_dim` values. The result is a copied
 `float32[action_steps, action_dim]` array.
 
-The staged face is available through the frontend:
-
-```python
-model._pipe.context({"images": images, "state": state, "prompt": prompt})
-actions = model._pipe.action()
-```
+> The `model._pipe.context()` / `model._pipe.action()` staged helpers exist on
+> the frontend but are not yet backed by a real `context -> action` stage plan
+> (see the note above). Use `model.predict(...)` (the single `infer` stage)
+> until the backend split lands.
 
 ### Text LLM
 

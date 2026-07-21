@@ -711,6 +711,18 @@ if(BUILD_TESTING)
           PRIVATE flashrt_cpp_llama_cpp_provider ${_flashrt_jetson_pi_pi0})
         add_test(NAME llama_cpp_jetson_pi_parity
           COMMAND test_llama_cpp_jetson_pi_parity)
+
+        # PI0.5 reference-policy state-parity scaffold. Skips until the
+        # Jetson-PI-Edge backend serializes PI0.5 proprioceptive state into
+        # the Task/State/Action prompt (see #148 and the test header).
+        add_executable(test_llama_cpp_jetson_pi_state_parity
+          tests/test_llama_cpp_jetson_pi_state_parity.cpp)
+        target_include_directories(test_llama_cpp_jetson_pi_state_parity PRIVATE
+          ${JETSON_PI_ROOT}/vendor)
+        target_link_libraries(test_llama_cpp_jetson_pi_state_parity
+          PRIVATE flashrt_cpp_llama_cpp_provider ${_flashrt_jetson_pi_pi0})
+        add_test(NAME llama_cpp_jetson_pi_state_parity
+          COMMAND test_llama_cpp_jetson_pi_state_parity)
       endif()
     endif()
   endif()

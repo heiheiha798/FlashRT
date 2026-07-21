@@ -140,7 +140,6 @@ int main() {
 
     // ---- PATH A: FlashRT frt_model_runtime_v1 wrapper ----------------------
     std::vector<float> actions_flashrt(n_elems, 0.0f);
-    std::vector<float> actions_split(n_elems, 0.0f);
     {
         const frt_llama_cpp_engine_factory_v1 * factory =
             frt_llama_cpp_default_engine_factory();
@@ -165,8 +164,14 @@ int main() {
         } else {
             CHECK(true, "open FlashRT Pi0 runtime from JSON");
             const auto* plan = llama_cpp_generic_plan(model);
-            CHECK(model->n_stages == 0 && plan && plan->n_stages == 2,
-                  "FlashRT Pi0 runtime exposes selected context/action plan");
+            // Pi0 publishes a single `infer` stage. The backend
+            // jetson_pi_pi0_context()/action() pair is a cached result handoff,
+            // not a real encode/decode boundary, so `context -> action` is not
+            // advertised (see pi0_runtime.cpp and the linked Jetson-PI-Edge PR).
+            // Re-enable the 2-stage plan once the backend exposes a genuine
+            // pending-context/decode split and PI0.5 state parity is proven.
+            CHECK(model->n_stages == 0 && plan && plan->n_stages == 1,
+                  "FlashRT Pi0 runtime exposes a single infer stage");
 
             frt_image_view views[2];
             views[0].struct_size = sizeof(frt_image_view);
@@ -200,52 +205,12 @@ int main() {
                 actions_flashrt.data(), n_bytes, &written, -1);
             CHECK(rc == 0 && written == n_bytes,
                   "FlashRT get_output actions shape matches config");
-            CHECK(llama_cpp_run_generic_stage(model, "context") == 0,
-                  "FlashRT run_stage context");
-            CHECK(model->verbs.set_input(
-                      model->self, FRT_LLAMA_CPP_PI0_PORT_PROMPT,
-                      prompt.data(), prompt.size(), -1) == 0,
-                  "new Pi0 input discards pending context");
-            CHECK(llama_cpp_run_generic_stage(model, "action") == -7,
-                  "action after replacement input is not ready");
-            CHECK(llama_cpp_run_generic_stage(model, "context") == 0,
-                  "FlashRT rebuilds context after replacement input");
-            CHECK(model->verbs.set_input(
-                      model->self, FRT_LLAMA_CPP_PI0_PORT_STATE,
-                      state_bytes.data(), state_bytes.size() - sizeof(float), -1) != 0,
-                  "invalid replacement input is rejected");
-            CHECK(llama_cpp_run_generic_stage(model, "context") != 0,
-                  "failed state replacement invalidates the previous state");
-            CHECK(llama_cpp_run_generic_stage(model, "action") != 0,
-                  "failed replacement input blocks action execution");
-            CHECK(model->verbs.set_input(
-                      model->self, FRT_LLAMA_CPP_PI0_PORT_STATE,
-                      state_bytes.data(), state_bytes.size(), -1) == 0,
-                  "restore valid Pi0 state after invalid replacement");
-            frt_image_view bad_views[2] = {views[0], views[1]};
-            bad_views[0].stride_bytes = 1;
-            CHECK(model->verbs.set_input(
-                      model->self, FRT_LLAMA_CPP_PI0_PORT_IMAGES,
-                      bad_views, sizeof(bad_views), -1) != 0,
-                  "undersized Pi0 image stride is rejected");
-            CHECK(llama_cpp_run_generic_stage(model, "context") != 0,
-                  "failed image replacement invalidates previous images");
-            CHECK(model->verbs.set_input(
-                      model->self, FRT_LLAMA_CPP_PI0_PORT_IMAGES,
-                      views, sizeof(views), -1) == 0,
-                  "restore valid Pi0 images after failed replacement");
-            CHECK(llama_cpp_run_generic_stage(model, "context") == 0,
-                  "FlashRT rebuilds context after failed replacement");
-            CHECK(llama_cpp_run_generic_stage(model, "action") == 0,
-                  "FlashRT run_stage action");
-            written = 0;
-            rc = model->verbs.get_output(
-                model->self, FRT_LLAMA_CPP_PI0_PORT_ACTIONS,
-                actions_split.data(), n_bytes, &written, -1);
-            CHECK(rc == 0 && written == n_bytes,
-                  "FlashRT split stages produced action chunk");
-            CHECK(llama_cpp_run_generic_stage(model, "action") == -7,
-                  "Pi0 action stage consumes pending context exactly once");
+            // No context/action split is exposed. Confirm the selected plan
+            // does not advertise a "context" or "action" stage.
+            CHECK(llama_cpp_run_generic_stage(model, "context") == -3,
+                  "Pi0 provider does not advertise a context stage");
+            CHECK(llama_cpp_run_generic_stage(model, "action") == -3,
+                  "Pi0 provider does not advertise an action stage");
             model->release(model->owner);
         }
     }
@@ -342,14 +307,9 @@ int main() {
     }
     CHECK(!nan_inf, "FlashRT actions contain no NaN/Inf");
 
-    float split_max_diff = 0.0f;
-    for (size_t i = 0; i < n_elems; ++i) {
-        split_max_diff = std::max(
-            split_max_diff, std::fabs(actions_flashrt[i] - actions_split[i]));
-    }
-    std::printf("    whole-vs-split max abs diff = %.9g\n", split_max_diff);
-    CHECK(split_max_diff == 0.0f,
-          "FlashRT context/action is bit-identical to whole infer");
+    // No context/action split is published, so there is no split path to
+    // compare against the whole-infer path. The single `infer` stage output
+    // is compared against the direct jetson_pi_pi0 call below.
 
     float max_diff = 0.0f;
     size_t diverge_idx = 0;

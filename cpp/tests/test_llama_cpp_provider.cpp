@@ -324,6 +324,12 @@ int main() {
     model->release(model->owner);
     CHECK(engine.releases == 1, "engine released once");
 
+    // Even when the engine provides run_stage, the Pi0 runtime publishes a
+    // single `infer` stage. The backend jetson_pi_pi0_context()/action() pair
+    // is a cached result handoff, not a real encode/decode boundary, so
+    // advertising `context -> action` would misrepresent it. Re-enable the
+    // 2-stage plan once the backend exposes a genuine pending-context/decode
+    // split (see pi0_runtime.cpp and the linked Jetson-PI-Edge PR).
     FakeEngine staged_engine;
     frt_llama_cpp_engine_v1 staged_engine_api = engine_api;
     staged_engine_api.self = &staged_engine;
@@ -333,26 +339,13 @@ int main() {
               &cfg, &staged_engine_api, &staged_model) == 0 && staged_model,
           "create staged Pi0 runtime");
     const auto* staged_plan = generic_plan(staged_model);
-    CHECK(staged_plan && staged_plan->n_stages == 2 &&
-              std::strcmp(staged_plan->stages[0].name, "context") == 0 &&
-              staged_plan->stages[0].executor_ref == 4 &&
-              staged_plan->stages[1].n_after == 1 &&
-              staged_plan->stages[1].after[0] == 0 &&
-              std::strcmp(staged_plan->stages[1].name, "action") == 0 &&
-              staged_plan->stages[1].executor_ref == 91,
-          "staged Pi0 runtime publishes one context/action authority");
+    CHECK(staged_plan && staged_plan->n_stages == 1 &&
+              std::strcmp(staged_plan->stages[0].name, "infer") == 0 &&
+              staged_plan->stages[0].executor_ref == 37,
+          "staged Pi0 runtime publishes a single infer authority");
     CHECK(staged_model->verbs.step(staged_model->self) == 0 &&
-              staged_engine.stage_calls == 1 &&
-              staged_engine.last_stage == FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER,
-          "whole-model step remains available as v1 sugar");
-    CHECK(staged_plan &&
-              staged_plan->run_opaque(
-                  staged_plan->stage_self,
-                  staged_plan->stages[0].executor_ref) == 0 &&
-              staged_engine.stage_calls == 2 &&
-              staged_engine.last_stage ==
-                  FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT,
-          "generic context executor delegates to provider stage capability");
+              staged_engine.infer == 1,
+          "whole-model step delegates to infer (run_stage not used)");
     if (staged_model) staged_model->release(staged_model->owner);
 
     FakeEngine null_error_engine;

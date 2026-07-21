@@ -94,10 +94,11 @@ def main():
         check(False, "actions contain NaN/Inf")
     check(bool(np.any(actions != 0)), "actions are not all zero")
 
-    model._pipe.context({"images": [image, wrist], "state": state})
-    split_actions = model._pipe.action()
-    check(np.array_equal(split_actions, actions),
-          "context/action stages are bit-identical to predict")
+    # Pi0 publishes a single `infer` stage (the backend context()/action() pair
+    # is a cached result handoff, not a real encode/decode boundary — see the
+    # linked Jetson-PI-Edge PR). The `context`/`action` frontend helpers are
+    # therefore not exercised here; they re-gain meaning once the backend
+    # exposes a genuine pending-context/decode split.
 
     del model
 

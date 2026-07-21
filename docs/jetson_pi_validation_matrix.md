@@ -16,7 +16,7 @@ details.
 | DSO surface | Dynamic exports equal `frt_model_runtime_open_v1` plus the version node. |
 | Lifecycle | Open, retain/release, repeated instances, and all failure paths are leak-free. |
 | Identity | Checkpoint bytes, backend, port schema, and selected plan affect the fingerprint. |
-| VLA | Whole-step and `context -> action` outputs match the direct provider path. |
+| VLA | Whole-step `infer` output matches the direct provider path. A `context -> action` split is not yet advertised (backend boundary pending; see #148). |
 | LLM | Whole generation and host-driven `reset -> prefill -> decode` match exactly under deterministic sampling. |
 | MLLM | Whole generation and staged decode match exactly under deterministic sampling. |
 | Install tree | An out-of-tree consumer loads the installed DSO without source-tree headers or build-tree RPATH. |
@@ -46,9 +46,13 @@ At least one supported device for each advertised backend must run:
 
 | Model face | Whole request | Selected plan | Direct parity | Repeated session |
 |---|---:|---:|---:|---:|
-| VLA | required | required | required | required |
+| VLA | required | single `infer` | required | required |
 | Text LLM | required | required | required | required |
 | Multimodal LLM | required | required | required | required |
+
+VLA "Selected plan" is the single `infer` stage until the Jetson-PI-Edge
+backend exposes a real `context -> action` encode/decode boundary and PI0.5
+reference-policy state parity is proven (see #148).
 
 For deterministic paths, text/token outputs are exact and VLA action buffers
 are byte-identical unless the provider documents a backend-specific numerical

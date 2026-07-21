@@ -142,18 +142,31 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
     if (!owner) return -5;
     std::memcpy(&owner->engine, engine,
                 std::min<size_t>(engine->struct_size, sizeof(owner->engine)));
-    owner->staged_context_action = engine->struct_size >= sizeof(*engine) &&
-                                   owner->engine.run_stage;
+    // The backend jetson_pi_pi0_context()/action() pair is currently a cached
+    // result handoff, not a real encode/decode boundary: context() runs the
+    // full mtmd_helper_eval_chunks_pi0 and caches the final action, while
+    // action() only copies the cache. Advertising `context -> action` would
+    // misrepresent that as a compute split. Publish a single `infer` stage
+    // until the backend exposes a genuine pending-context/decode boundary
+    // (mtmd_helper_prepare_chunks_pi0_for_model + mtmd_helper_decode_pi0) and
+    // PI0.5 reference-policy state parity is proven. See the linked
+    // Jetson-PI-Edge PR and FlashRT #148 follow-up notes.
+    owner->staged_context_action = false;
     if (owner->engine.retain) owner->engine.retain(owner->engine.self);
 
     owner->image_shape[0] = static_cast<int64_t>(config->n_views);
     owner->image_shape[1] = static_cast<int64_t>(config->image_height);
     owner->image_shape[2] = static_cast<int64_t>(config->image_width);
     owner->image_shape[3] = static_cast<int64_t>(config->image_channels);
-    // Pi0 state shares the model action_dim: llama_set_pi0_state requires
-    // n_values == hparams.action_dim, and the caller zero-pads real
-    // proprioception into that width. Exposing it on the state port keeps
-    // the host-visible shape honest.
+    // Pi0 state shape: the backend jetson_pi_pi0_context currently exposes
+    // proprioception only via the legacy llama_set_pi0_state tensor, which is
+    // zero-padded to hparams.action_dim (a no-op for PI0.5, whose graph never
+    // reads cross.state). The PI0.5 path that discretizes state into the
+    // `Task: ..., State: ...;\nAction:` prompt lives in the Jetson-PI server
+    // and is not yet wired into the narrow C API. Keep the port shape on
+    // action_dim for now so the host-visible contract matches what the
+    // backend actually consumes; the PI0.5 state_dim (>action_dim for openpi)
+    // is exposed once the backend serialization lands.
     owner->state_shape[0] = static_cast<int64_t>(config->action_dim);
     owner->action_shape[0] = static_cast<int64_t>(config->action_steps);
     owner->action_shape[1] = static_cast<int64_t>(config->action_dim);
