@@ -59,14 +59,12 @@ engines with staged capability publish `reset -> prefill -> decode`; engines
 without that capability publish a single `infer` stage. The plan uses OPAQUE
 executors, so a generic host never sees llama.cpp or GGML types.
 
-> Pi0 does **not** currently advertise a `context -> action` split. The
-> backend `jetson_pi_pi0_context()`/`action()` pair is a cached result
-> handoff, not a real encode/decode boundary, and PI0.5 proprioceptive state
-> is not yet serialized into the `Task: ..., State: ...;\nAction:` prompt
-> through the narrow C API. Both are being corrected in the Jetson-PI-Edge
-> backend; the `context -> action` plan, staged tests, and the
-> `context()`/`action()` frontend helpers are re-enabled once that lands and
-> PI0.5 reference-policy state parity is proven. See FlashRT #148.
+> Pi0 does **not** currently advertise a `context -> action` split. Companion
+> backend PR [PKU-SEC-Lab/Jetson-PI-Edge#1](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge/pull/1)
+> implements both the real prepare/decode boundary and PI0.5
+> `Task: ..., State: ...;\nAction:` serialization. FlashRT keeps the selected
+> plan on single `infer` until that change lands in the backend dependency;
+> the staged plan and frontend helpers are re-enabled afterward.
 
 ## Python
 
@@ -89,14 +87,16 @@ model = flash_rt.load_model(
 actions = model.predict(images, prompt=prompt, state=state)
 ```
 
-`images` is an ordered list of contiguous RGB `uint8` HWC arrays. `state` is a
-contiguous `float32` vector with `action_dim` values. The result is a copied
-`float32[action_steps, action_dim]` array.
+`images` is an ordered list of contiguous RGB `uint8` HWC arrays. `state` is
+the non-empty policy proprioception vector, passed without padding; PI0.5
+accepts at most 8 `float32` values, while legacy Pi0 accepts at most
+`action_dim` and lets the backend zero-pad shorter input. The result is a
+copied `float32[action_steps, action_dim]` array.
 
 > The `model._pipe.context()` / `model._pipe.action()` staged helpers exist on
-> the frontend but are not yet backed by a real `context -> action` stage plan
-> (see the note above). Use `model.predict(...)` (the single `infer` stage)
-> until the backend split lands.
+> the frontend but will raise against the selected single-infer plan. Use
+> `model.predict(...)` until the companion backend split is merged and the
+> staged plan is re-enabled.
 
 ### Text LLM
 

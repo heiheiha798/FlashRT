@@ -7,7 +7,9 @@ without weights still passes.
 Env:
   FLASHRT_PI0_MODEL        path to Pi0 policy GGUF
   FLASHRT_PI0_MMPROJ       path to VIT mmproj GGUF
-  FLASHRT_PI0_FIXTURE_DIR  dir with image.png, wrist_image.png, state.bin, prompt.txt
+  FLASHRT_PI0_FIXTURE_DIR  dir with image.png, wrist_image.png, state.bin, prompt.txt;
+                          state.bin contains policy proprioception values
+                          (8 floats for PI0.5), not action_dim padding
   FLASHRT_PI0_LIB          (optional) path to libflashrt_cpp_llama_cpp_provider_c.so
   FLASHRT_PI0_ACTION_STEPS (optional) override; default 10 (pi0_base).
   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
@@ -69,8 +71,8 @@ def main():
     wrist = np.asarray(Image.open(os.path.join(fixture_env, "wrist_image.png")).convert("RGB"), dtype=np.uint8)
     with open(os.path.join(fixture_env, "state.bin"), "rb") as f:
         state = np.frombuffer(f.read(), dtype=np.float32)
-    if state.size != action_dim:
-        print(f"FAIL: state.bin has {state.size} floats, expected {action_dim}")
+    if state.size == 0:
+        print("FAIL: state.bin must contain at least one float")
         return 1
     with open(os.path.join(fixture_env, "prompt.txt")) as f:
         prompt = f.read().rstrip("\n")
@@ -94,11 +96,9 @@ def main():
         check(False, "actions contain NaN/Inf")
     check(bool(np.any(actions != 0)), "actions are not all zero")
 
-    # Pi0 publishes a single `infer` stage (the backend context()/action() pair
-    # is a cached result handoff, not a real encode/decode boundary — see the
-    # linked Jetson-PI-Edge PR). The `context`/`action` frontend helpers are
-    # therefore not exercised here; they re-gain meaning once the backend
-    # exposes a genuine pending-context/decode split.
+    # Pi0 remains on a single `infer` stage until the real split from
+    # PKU-SEC-Lab/Jetson-PI-Edge#1 lands in the backend dependency. The
+    # `context`/`action` frontend helpers are therefore not exercised here.
 
     del model
 

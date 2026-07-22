@@ -325,11 +325,8 @@ int main() {
     CHECK(engine.releases == 1, "engine released once");
 
     // Even when the engine provides run_stage, the Pi0 runtime publishes a
-    // single `infer` stage. The backend jetson_pi_pi0_context()/action() pair
-    // is a cached result handoff, not a real encode/decode boundary, so
-    // advertising `context -> action` would misrepresent it. Re-enable the
-    // 2-stage plan once the backend exposes a genuine pending-context/decode
-    // split (see pi0_runtime.cpp and the linked Jetson-PI-Edge PR).
+    // single `infer` stage until the real split from
+    // PKU-SEC-Lab/Jetson-PI-Edge#1 lands in the backend dependency.
     FakeEngine staged_engine;
     frt_llama_cpp_engine_v1 staged_engine_api = engine_api;
     staged_engine_api.self = &staged_engine;

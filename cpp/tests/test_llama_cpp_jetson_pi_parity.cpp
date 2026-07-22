@@ -15,9 +15,11 @@
 //
 // FlashRT adds NO numerical perturbation vs the direct call (verified): image
 // swizzle is an identity copy for RGB8 fixtures (load via stbi_load(...,3)),
-// prompt/state are copied verbatim, marker injection + zero-pad-to-action_dim
-// happen INSIDE jetson_pi_pi0_infer for both, backend->n_gpu_layers/use_gpu
-// mapping is identical, n_threads=0 on both -> same hardware_concurrency().
+// prompt/state are copied verbatim, and marker injection plus per-model state
+// handling happen INSIDE jetson_pi_pi0_infer for both (PI0.5 serializes state
+// into the prompt; legacy Pi0 zero-pads it to action_dim). Backend
+// n_gpu_layers/use_gpu mapping is identical, and n_threads=0 on both resolves
+// to the same hardware_concurrency().
 // A parity failure means a real FlashRT-port bug.
 //
 // Env:
@@ -171,12 +173,8 @@ int main() {
         } else {
             CHECK(true, "open FlashRT Pi0 runtime from JSON");
             const auto* plan = llama_cpp_generic_plan(model);
-            // Pi0 publishes a single `infer` stage. The backend
-            // jetson_pi_pi0_context()/action() pair is a cached result handoff,
-            // not a real encode/decode boundary, so `context -> action` is not
-            // advertised (see pi0_runtime.cpp and the linked Jetson-PI-Edge PR).
-            // Re-enable the 2-stage plan once the backend exposes a genuine
-            // pending-context/decode split and PI0.5 state parity is proven.
+            // Pi0 remains on a single `infer` stage until the real split from
+            // PKU-SEC-Lab/Jetson-PI-Edge#1 lands in the backend dependency.
             CHECK(model->n_stages == 0 && plan && plan->n_stages == 1,
                   "FlashRT Pi0 runtime exposes a single infer stage");
 

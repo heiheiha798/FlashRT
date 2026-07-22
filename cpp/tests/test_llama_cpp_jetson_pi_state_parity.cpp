@@ -1,13 +1,11 @@
 // PI0.5 reference-policy state-parity scaffold.
 //
-// This test guards the PI0.5 proprioceptive-state contract that the narrow
-// Jetson-PI C API does NOT yet honor: for PI0.5 the policy consumes the
-// discretized state inside the `Task: ..., State: ...;\nAction:` prompt, not
-// the legacy llama_set_pi0_state tensor (which the PI0.5 graph never reads).
-// Until the Jetson-PI-Edge backend wires that serialization in, this test
-// SKIPS. Once it lands, the test asserts that varying state while holding
-// images/task fixed changes the action chunk — the regression that LiangSu
-// reported on FlashRT #148 (zeros-vs-ones produced bit-identical actions).
+// PKU-SEC-Lab/Jetson-PI-Edge#1 implements the PI0.5 contract: the policy
+// consumes discretized state inside the `Task: ..., State: ...;\nAction:`
+// prompt rather than the legacy llama_set_pi0_state tensor. FlashRT can still
+// be built against the earlier Jetson-PI-flashrt baseline, so this real-model
+// test remains opt-in and asserts the fix only when that companion change is
+// present.
 //
 // Boundary-region coverage matters: the openpi discretizer maps x<-1 to a
 // literal -1 token (distinct from bin 0), x in [-1,1) to floor((x+1)*128),
@@ -24,9 +22,8 @@
 //   FLASHRT_PI0_ACTION_STEPS (optional) override; default 50 (LIBERO base).
 //   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
 //   FLASHRT_PI0_BACKEND      (optional) "cpu" (default) or "cuda".
-//   FLASHRT_PI0_STATE_PARITY_READY  must be set to "1" to opt in. Until the
-//                            backend PI0.5 state serialization lands, this is
-//                            intentionally unset so the test skips.
+//   FLASHRT_PI0_STATE_PARITY_READY  set to "1" only when the backend build
+//                            includes PI0.5 prompt-state serialization.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
 #include "llama_cpp_generic_plan.h"
@@ -46,8 +43,9 @@
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
-    if (!(cond)) { std::printf("FAIL: %s\n", (msg)); g_fail = 1; } \
-    else { std::printf("ok  : %s\n", (msg)); } \
+    const std::string check_msg = (msg); \
+    if (!(cond)) { std::printf("FAIL: %s\n", check_msg.c_str()); g_fail = 1; } \
+    else { std::printf("ok  : %s\n", check_msg.c_str()); } \
 } while (0)
 
 namespace {
@@ -68,9 +66,9 @@ std::string read_file(const std::string & path, bool * ok) {
 int main() {
     const char * ready = std::getenv("FLASHRT_PI0_STATE_PARITY_READY");
     if (!ready || ready[0] != '1') {
-        std::printf("SKIP - PI0.5 state parity awaits the Jetson-PI-Edge "
-                    "backend serialization (set FLASHRT_PI0_STATE_PARITY_READY=1 "
-                    "once it lands)\n");
+        std::printf("SKIP - PI0.5 state parity requires companion backend PR #1 "
+                    "(set FLASHRT_PI0_STATE_PARITY_READY=1 when this build "
+                    "includes it)\n");
         return 0;
     }
     const char * model_env   = std::getenv("FLASHRT_PI0_MODEL");
@@ -204,9 +202,8 @@ int main() {
             max_diff = std::max(max_diff, std::fabs(a[i] - actions_zero[i]));
         }
         std::printf("    %s: max abs diff vs zero-state = %.9g\n", c.name, max_diff);
-        // Until the backend lands, this diff is 0 (state is a no-op for PI0.5),
-        // so the check is intentionally NOT asserted here — it activates when
-        // FLASHRT_PI0_STATE_PARITY_READY=1 implies the backend is fixed.
+        // This assertion is reached only after the READY gate above confirms
+        // that the build includes PI0.5 prompt-state serialization.
         CHECK(max_diff > 0.0f,
               std::string("state in prompt changes actions: ") + c.name);
     }

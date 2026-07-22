@@ -271,11 +271,9 @@ class Pi0JetsonPiFrontend:
         if state is None:
             raise ValueError("observation['state'] is required for the Jetson-PI Pi0 frontend")
         state = np.asarray(state, dtype=np.float32).reshape(-1)
-        if state.size > self.action_dim:
-            raise ValueError(
-                f"state has {state.size} values, more than action_dim={self.action_dim}")
-        state_padded = np.zeros(self.action_dim, dtype=np.float32)
-        state_padded[:state.size] = state
+        if state.size == 0:
+            raise ValueError("observation['state'] must contain at least one value")
+        state = np.ascontiguousarray(state)
 
         verbs = self._model.verbs
         self_ = self._model.self
@@ -286,8 +284,8 @@ class Pi0JetsonPiFrontend:
         rc = verbs.set_input(self_, PORT_PROMPT, self._prompt,
                           len(self._prompt), -1)
         self._check(rc, "set_input prompt")
-        rc = verbs.set_input(self_, PORT_STATE, state_padded.ctypes.data,
-                          state_padded.nbytes, -1)
+        rc = verbs.set_input(self_, PORT_STATE, state.ctypes.data,
+                          state.nbytes, -1)
         self._check(rc, "set_input state")
 
         rc = verbs.step(self_)
@@ -324,11 +322,9 @@ class Pi0JetsonPiFrontend:
             raise ValueError(
                 "observation['state'] is required for the Jetson-PI Pi0 frontend")
         state = np.asarray(state, dtype=np.float32).reshape(-1)
-        if state.size > self.action_dim:
-            raise ValueError(
-                f"state has {state.size} values, more than action_dim={self.action_dim}")
-        state_padded = np.zeros(self.action_dim, dtype=np.float32)
-        state_padded[:state.size] = state
+        if state.size == 0:
+            raise ValueError("observation['state'] must contain at least one value")
+        state = np.ascontiguousarray(state)
         views = self._make_image_views(images)
         verbs = self._model.verbs
         self_ = self._model.self
@@ -340,8 +336,8 @@ class Pi0JetsonPiFrontend:
             self_, PORT_PROMPT, self._prompt, len(self._prompt), -1),
             "set_input prompt")
         self._check(verbs.set_input(
-            self_, PORT_STATE, state_padded.ctypes.data,
-            state_padded.nbytes, -1), "set_input state")
+            self_, PORT_STATE, state.ctypes.data,
+            state.nbytes, -1), "set_input state")
         self._check(_run_generic_stage(self._model, "context"),
                     "generic stage context")
 

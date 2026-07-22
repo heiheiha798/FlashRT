@@ -142,15 +142,11 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
     if (!owner) return -5;
     std::memcpy(&owner->engine, engine,
                 std::min<size_t>(engine->struct_size, sizeof(owner->engine)));
-    // The backend jetson_pi_pi0_context()/action() pair is currently a cached
-    // result handoff, not a real encode/decode boundary: context() runs the
-    // full mtmd_helper_eval_chunks_pi0 and caches the final action, while
-    // action() only copies the cache. Advertising `context -> action` would
-    // misrepresent that as a compute split. Publish a single `infer` stage
-    // until the backend exposes a genuine pending-context/decode boundary
-    // (mtmd_helper_prepare_chunks_pi0_for_model + mtmd_helper_decode_pi0) and
-    // PI0.5 reference-policy state parity is proven. See the linked
-    // Jetson-PI-Edge PR and FlashRT #148 follow-up notes.
+    // The Jetson-PI-flashrt baseline consumed by this PR still exposes a cached
+    // context()/action() handoff. PKU-SEC-Lab/Jetson-PI-Edge#1 implements the
+    // real prepare/decode boundary and PI0.5 prompt-state serialization, but
+    // FlashRT must not advertise that split before the companion change lands
+    // in the backend dependency. Publish a single `infer` stage until then.
     owner->staged_context_action = false;
     if (owner->engine.retain) owner->engine.retain(owner->engine.self);
 
