@@ -119,9 +119,16 @@ int main() {
     CHECK(wrist != nullptr && ww == 224 && wh == 224, "load wrist_image.png 224x224");
     bool state_ok = false;
     std::string state_bytes = read_file(state_path, &state_ok);
-    CHECK(state_ok && state_bytes.size() ==
-                      static_cast<size_t>(action_dim) * sizeof(float),
-          "state.bin matches action_dim float32");
+    // State width is policy-specific and independent of action_dim: PI0.5
+    // discretizes up to 8 proprioception values into the prompt (openpi width
+    // 8), while legacy Pi0 consumes an action_dim tensor. Accept any nonzero
+    // float-multiple fixture; the backend enforces the per-model bound
+    // (n_state <= 8 for PI0.5, n_state <= action_dim for legacy Pi0).
+    const size_t state_count =
+        state_bytes.size() / sizeof(float);
+    CHECK(state_ok && state_bytes.size() % sizeof(float) == 0 &&
+              state_count > 0 && state_count <= 8,
+          "state.bin is 1..8 float32 values (PI0.5 proprioception width)");
     bool prompt_ok = false;
     std::string prompt = read_file(prompt_path, &prompt_ok);
     CHECK(prompt_ok && !prompt.empty(), "prompt.txt non-empty");
