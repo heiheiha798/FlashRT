@@ -448,6 +448,11 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
         !engine.self || !engine.retain || !engine.release ||
         !engine.set_input || !engine.run_infer || !engine.get_output ||
         !engine.last_error) {
+        if (engine.struct_size >=
+                offsetof(frt_llama_cpp_engine_v1, release) + sizeof(engine.release) &&
+            engine.self && engine.release) {
+            engine.release(engine.self);
+        }
         flashrt::providers::llama_cpp::set_runtime_open_error(
             "factory returned an invalid Pi0 engine");
         return -1;

@@ -634,8 +634,8 @@ int main() {
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               open_json.c_str(), &invalid_factory_api, &missing) == -1 &&
               missing == nullptr &&
-              factory_engine.releases == releases_before_invalid_engine,
-          "open rejects factory engines missing hot-path hooks without release");
+              factory_engine.releases == releases_before_invalid_engine + 1,
+          "open releases owned factory engines missing hot-path hooks");
     invalid_factory = factory;
     invalid_factory.engine = &factory_engine;
     invalid_factory.fail_after_engine = true;
@@ -643,7 +643,7 @@ int main() {
     CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
               open_json.c_str(), &invalid_factory_api, &missing) == -7 &&
               missing == nullptr &&
-              factory_engine.releases == releases_before_invalid_engine,
+              factory_engine.releases == releases_before_invalid_engine + 1,
           "open ignores out_engine when factory create fails");
 
     std::remove(identity_model.c_str());
