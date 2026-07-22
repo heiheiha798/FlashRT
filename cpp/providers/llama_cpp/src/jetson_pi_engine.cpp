@@ -1060,6 +1060,11 @@ frt_llama_cpp_default_engine_factory(void) {
 
             out->struct_size = sizeof(*out);
             out->reserved    = 0;
+#if defined(JETSON_PI_PI0_HAS_REAL_CONTEXT_ACTION) && \
+    JETSON_PI_PI0_HAS_REAL_CONTEXT_ACTION
+            out->reserved |=
+                FRT_LLAMA_CPP_ENGINE_CAP_PI0_REAL_CONTEXT_ACTION;
+#endif
             out->self        = e;
             out->retain      = engine_retain;
             out->release     = engine_release;

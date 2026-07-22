@@ -152,8 +152,9 @@ extern "C" int frt_llama_cpp_mllm_runtime_create_with_engine(
     if (!owner) return -5;
     std::memcpy(&owner->engine, engine,
                 std::min<size_t>(engine->struct_size, sizeof(owner->engine)));
-    owner->staged_decode = engine->struct_size >= sizeof(*engine) &&
-                           owner->engine.run_stage;
+    owner->staged_decode =
+        engine->struct_size >= FRT_LLAMA_CPP_ENGINE_V1_RUN_STAGE_SIZE &&
+        owner->engine.run_stage;
     if (owner->engine.retain) owner->engine.retain(owner->engine.self);
 
     frt_runtime_builder b = frt_model_runtime_builder_create_metadata();

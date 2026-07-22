@@ -324,13 +324,13 @@ int main() {
     model->release(model->owner);
     CHECK(engine.releases == 1, "engine released once");
 
-    // Even when the engine provides run_stage, the Pi0 runtime publishes a
-    // single `infer` stage until the real split from
-    // PKU-SEC-Lab/Jetson-PI-Edge#1 lands in the backend dependency.
+    // A callback without the explicit capability may be the old cached-action
+    // shim, so it must not publish a staged plan.
     FakeEngine staged_engine;
     frt_llama_cpp_engine_v1 staged_engine_api = engine_api;
     staged_engine_api.self = &staged_engine;
     staged_engine_api.run_stage = run_stage;
+    staged_engine_api.struct_size = FRT_LLAMA_CPP_ENGINE_V1_RUN_STAGE_SIZE;
     frt_model_runtime_v1* staged_model = nullptr;
     CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(
               &cfg, &staged_engine_api, &staged_model) == 0 && staged_model,
@@ -339,11 +339,42 @@ int main() {
     CHECK(staged_plan && staged_plan->n_stages == 1 &&
               std::strcmp(staged_plan->stages[0].name, "infer") == 0 &&
               staged_plan->stages[0].executor_ref == 37,
-          "staged Pi0 runtime publishes a single infer authority");
+          "uncapable Pi0 runtime publishes a single infer authority");
     CHECK(staged_model->verbs.step(staged_model->self) == 0 &&
               staged_engine.infer == 1,
           "whole-model step delegates to infer (run_stage not used)");
     if (staged_model) staged_model->release(staged_model->owner);
+
+    FakeEngine capable_engine;
+    frt_llama_cpp_engine_v1 capable_engine_api = staged_engine_api;
+    capable_engine_api.self = &capable_engine;
+    capable_engine_api.reserved =
+        FRT_LLAMA_CPP_ENGINE_CAP_PI0_REAL_CONTEXT_ACTION;
+    frt_model_runtime_v1* capable_model = nullptr;
+    CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(
+              &cfg, &capable_engine_api, &capable_model) == 0 && capable_model,
+          "create real-split Pi0 runtime");
+    const auto* capable_plan = generic_plan(capable_model);
+    CHECK(capable_plan && capable_plan->n_stages == 2 &&
+              std::strcmp(capable_plan->stages[0].name, "context") == 0 &&
+              std::strcmp(capable_plan->stages[1].name, "action") == 0 &&
+              capable_plan->stages[1].n_after == 1 &&
+              capable_plan->stages[1].after[0] == 0,
+          "capable Pi0 runtime publishes context then action");
+    CHECK(capable_plan->run_opaque(
+              capable_plan->stage_self,
+              capable_plan->stages[0].executor_ref) == 0 &&
+              capable_engine.last_stage == FRT_LLAMA_CPP_PI0_STAGE_INDEX_CONTEXT,
+          "context authority delegates to the real split callback");
+    CHECK(capable_plan->run_opaque(
+              capable_plan->stage_self,
+              capable_plan->stages[1].executor_ref) == 0 &&
+              capable_engine.last_stage == FRT_LLAMA_CPP_PI0_STAGE_INDEX_ACTION,
+          "action authority delegates to the real split callback");
+    CHECK(capable_model->verbs.step(capable_model->self) == 0 &&
+              capable_engine.last_stage == FRT_LLAMA_CPP_PI0_STAGE_INDEX_INFER,
+          "whole-model step remains available on a split-capable engine");
+    if (capable_model) capable_model->release(capable_model->owner);
 
     FakeEngine null_error_engine;
     frt_llama_cpp_engine_v1 null_error_api = engine_api;

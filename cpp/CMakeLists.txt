@@ -712,9 +712,8 @@ if(BUILD_TESTING)
         add_test(NAME llama_cpp_jetson_pi_parity
           COMMAND test_llama_cpp_jetson_pi_parity)
 
-        # PI0.5 reference-policy state-parity scaffold. Skips until the
-        # Jetson-PI-Edge backend serializes PI0.5 proprioceptive state into
-        # the Task/State/Action prompt (see #148 and the test header).
+        # Opt-in PI0.5 reference-policy state-parity test. CI skips it when the
+        # external checkpoint and fixture environment are unavailable.
         add_executable(test_llama_cpp_jetson_pi_state_parity
           tests/test_llama_cpp_jetson_pi_state_parity.cpp)
         target_include_directories(test_llama_cpp_jetson_pi_state_parity PRIVATE

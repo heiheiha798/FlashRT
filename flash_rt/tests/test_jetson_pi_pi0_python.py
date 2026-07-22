@@ -13,12 +13,9 @@ Env:
   FLASHRT_PI0_LIB          (optional) path to libflashrt_cpp_llama_cpp_provider_c.so
   FLASHRT_PI0_ACTION_STEPS (optional) override; default 10 (pi0_base).
   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
-  FLASHRT_PI0_BACKEND      (optional) backend for the Jetson-PI engine; default
-                            "cpu" (byte-identical to the original test). Set to
-                            "cuda" to run the real forward pass on the GPU
-                            (the engine maps backend=="cuda" to n_gpu_layers=9999
-                            and use_gpu for the mmproj). CUDA_VISIBLE_DEVICES
-                            selects the physical card.
+  FLASHRT_PI0_BACKEND      required backend for the Jetson-PI engine, e.g.
+                            "cpu" or "cuda". CUDA_VISIBLE_DEVICES selects the
+                            physical card for a CUDA run.
 
 Run from the repository root after installing the provider or adding its
 install directory to the platform dynamic-loader search path.
@@ -37,12 +34,15 @@ def main():
     model_env = os.environ.get("FLASHRT_PI0_MODEL")
     mmproj_env = os.environ.get("FLASHRT_PI0_MMPROJ")
     fixture_env = os.environ.get("FLASHRT_PI0_FIXTURE_DIR")
+    backend = os.environ.get("FLASHRT_PI0_BACKEND")
     if not model_env or not os.path.exists(model_env):
         return _skip("FLASHRT_PI0_MODEL not set or missing")
     if not mmproj_env or not os.path.exists(mmproj_env):
         return _skip("FLASHRT_PI0_MMPROJ not set or missing")
     if not fixture_env or not os.path.isdir(fixture_env):
         return _skip("FLASHRT_PI0_FIXTURE_DIR not set or missing")
+    if not backend:
+        return _skip("FLASHRT_PI0_BACKEND not set")
     for name in ("image.png", "wrist_image.png", "state.bin", "prompt.txt"):
         if not os.path.exists(os.path.join(fixture_env, name)):
             return _skip(f"fixture {name} missing in {fixture_env}")
@@ -52,9 +52,6 @@ def main():
 
     action_steps = int(os.environ.get("FLASHRT_PI0_ACTION_STEPS", "10"))
     action_dim = int(os.environ.get("FLASHRT_PI0_ACTION_DIM", "32"))
-    # Default "cpu" keeps the original behavior; set FLASHRT_PI0_BACKEND=cuda to
-    # exercise the real GPU forward pass through the Jetson-PI engine.
-    backend = os.environ.get("FLASHRT_PI0_BACKEND", "cpu") or "cpu"
 
     import flash_rt
     model = flash_rt.load_model(
@@ -96,9 +93,10 @@ def main():
         check(False, "actions contain NaN/Inf")
     check(bool(np.any(actions != 0)), "actions are not all zero")
 
-    # Pi0 remains on a single `infer` stage until the real split from
-    # PKU-SEC-Lab/Jetson-PI-Edge#1 lands in the backend dependency. The
-    # `context`/`action` frontend helpers are therefore not exercised here.
+    model._pipe.context({"images": [image, wrist], "state": state})
+    split_actions = model._pipe.action()
+    check(np.array_equal(split_actions, actions),
+          "context/action stages are bit-identical to predict")
 
     del model
 

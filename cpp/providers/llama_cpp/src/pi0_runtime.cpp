@@ -142,12 +142,11 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
     if (!owner) return -5;
     std::memcpy(&owner->engine, engine,
                 std::min<size_t>(engine->struct_size, sizeof(owner->engine)));
-    // The Jetson-PI-flashrt baseline consumed by this PR still exposes a cached
-    // context()/action() handoff. PKU-SEC-Lab/Jetson-PI-Edge#1 implements the
-    // real prepare/decode boundary and PI0.5 prompt-state serialization, but
-    // FlashRT must not advertise that split before the companion change lands
-    // in the backend dependency. Publish a single `infer` stage until then.
-    owner->staged_context_action = false;
+    owner->staged_context_action =
+        engine->struct_size >= FRT_LLAMA_CPP_ENGINE_V1_RUN_STAGE_SIZE &&
+        owner->engine.run_stage &&
+        (owner->engine.reserved &
+         FRT_LLAMA_CPP_ENGINE_CAP_PI0_REAL_CONTEXT_ACTION) != 0;
     if (owner->engine.retain) owner->engine.retain(owner->engine.self);
 
     owner->image_shape[0] = static_cast<int64_t>(config->n_views);

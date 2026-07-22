@@ -160,7 +160,7 @@ extern "C" int frt_llama_cpp_llm_runtime_create_with_engine(
     std::memcpy(&owner->engine, engine,
                 std::min<size_t>(engine->struct_size, sizeof(owner->engine)));
     owner->staged_decode =
-        engine->struct_size >= sizeof(frt_llama_cpp_engine_v1) &&
+        engine->struct_size >= FRT_LLAMA_CPP_ENGINE_V1_RUN_STAGE_SIZE &&
         owner->engine.run_stage;
     if (owner->engine.retain) owner->engine.retain(owner->engine.self);
 

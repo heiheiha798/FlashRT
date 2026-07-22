@@ -1,11 +1,11 @@
 // PI0.5 reference-policy state-parity scaffold.
 //
-// PKU-SEC-Lab/Jetson-PI-Edge#1 implements the PI0.5 contract: the policy
+// Merged PKU-SEC-Lab/Jetson-PI-Edge#1 implements the PI0.5 contract: the policy
 // consumes discretized state inside the `Task: ..., State: ...;\nAction:`
-// prompt rather than the legacy llama_set_pi0_state tensor. FlashRT can still
-// be built against the earlier Jetson-PI-flashrt baseline, so this real-model
-// test remains opt-in and asserts the fix only when that companion change is
-// present.
+// prompt rather than the legacy llama_set_pi0_state tensor. This real-model
+// test remains opt-in because CI does not carry the multi-gigabyte checkpoint;
+// it also verifies the fixture is detected as PI0.5 before inference. Follow-up
+// #2 completes the capability contract across legacy Pi0 and PI0.5.
 //
 // Boundary-region coverage matters: the openpi discretizer maps x<-1 to a
 // literal -1 token (distinct from bin 0), x in [-1,1) to floor((x+1)*128),
@@ -29,6 +29,7 @@
 #include "flashrt/providers/llama_cpp/c_api.h"
 #include "llama_cpp_generic_plan.h"
 #include "flashrt/providers/llama_cpp/jetson_pi_engine.h"
+#include "pi-model-detect.h"
 
 #include <cmath>
 #include <cstdint>
@@ -59,9 +60,8 @@ bool file_exists(const char * p) {
 int main() {
     const char * ready = std::getenv("FLASHRT_PI0_STATE_PARITY_READY");
     if (!ready || ready[0] != '1') {
-        std::printf("SKIP - PI0.5 state parity requires companion backend PR #1 "
-                    "(set FLASHRT_PI0_STATE_PARITY_READY=1 when this build "
-                    "includes it)\n");
+        std::printf("SKIP - PI0.5 state parity requires an explicit real-model "
+                    "run (set FLASHRT_PI0_STATE_PARITY_READY=1)\n");
         return 0;
     }
     const char * model_env   = std::getenv("FLASHRT_PI0_MODEL");
@@ -74,6 +74,15 @@ int main() {
                     "FLASHRT_PI0_FIXTURE_DIR / FLASHRT_PI0_BACKEND not set "
                     "or files missing\n");
         return 0;
+    }
+    const pi_model_detect_result detected =
+        pi_model_detect_gguf_pair(model_env, mmproj_env);
+    CHECK(detected.kind == PI_MODEL_PI05,
+          "state parity GGUF is detected as PI0.5");
+    if (detected.kind != PI_MODEL_PI05) {
+        std::printf("    detected=%s reason=%s\n",
+                    pi_model_kind_name(detected.kind), detected.reason.c_str());
+        return 1;
     }
     const std::string fixture_dir = fixture_env;
     const std::string img_path    = fixture_dir + "/image.png";

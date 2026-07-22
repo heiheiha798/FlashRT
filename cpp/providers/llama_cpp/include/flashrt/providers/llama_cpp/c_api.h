@@ -128,6 +128,7 @@ typedef struct frt_llama_cpp_mllm_config {
 
 typedef struct frt_llama_cpp_engine_v1 {
     uint32_t struct_size;
+    /* Capability bits. Older engines initialize this reserved word to zero. */
     uint32_t reserved;
 
     void* self;
@@ -154,6 +155,13 @@ typedef struct frt_llama_cpp_engine_v1 {
 
 #define FRT_LLAMA_CPP_ENGINE_V1_BASE_SIZE \
     (offsetof(frt_llama_cpp_engine_v1, run_stage))
+#define FRT_LLAMA_CPP_ENGINE_V1_RUN_STAGE_SIZE \
+    (offsetof(frt_llama_cpp_engine_v1, run_stage) + \
+     sizeof(((frt_llama_cpp_engine_v1*)0)->run_stage))
+
+/* Stored in frt_llama_cpp_engine_v1::reserved. A callback alone is
+ * insufficient to distinguish a real boundary from cached-result shims. */
+#define FRT_LLAMA_CPP_ENGINE_CAP_PI0_REAL_CONTEXT_ACTION UINT32_C(1)
 
 typedef struct frt_llama_cpp_engine_factory_v1 {
     uint32_t struct_size;

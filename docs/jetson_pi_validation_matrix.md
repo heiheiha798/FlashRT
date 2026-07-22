@@ -16,7 +16,7 @@ details.
 | DSO surface | Dynamic exports equal `frt_model_runtime_open_v1` plus the version node. |
 | Lifecycle | Open, retain/release, repeated instances, and all failure paths are leak-free. |
 | Identity | Checkpoint bytes, backend, port schema, and selected plan affect the fingerprint. |
-| VLA | Whole-step `infer` output matches the direct provider path. A `context -> action` split is not yet advertised until the implementation in [Jetson-PI-Edge#1](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge/pull/1) lands in the backend dependency. |
+| VLA | Whole-step `infer`, split `context -> action`, and the direct provider path produce identical action buffers. The split is published only when the backend declares a real context/action capability. |
 | LLM | Whole generation and host-driven `reset -> prefill -> decode` match exactly under deterministic sampling. |
 | MLLM | Whole generation and staged decode match exactly under deterministic sampling. |
 | Install tree | An out-of-tree consumer loads the installed DSO without source-tree headers or build-tree RPATH. |
@@ -46,14 +46,19 @@ At least one supported device for each advertised backend must run:
 
 | Model face | Whole request | Selected plan | Direct parity | Repeated session |
 |---|---:|---:|---:|---:|
-| VLA | required | single `infer` | required | required |
+| VLA | required | `context -> action` | required | required |
 | Text LLM | required | required | required | required |
 | Multimodal LLM | required | required | required | required |
 
-VLA "Selected plan" is the single `infer` stage until companion backend change
+VLA qualification uses a backend that explicitly declares the real
+context/action capability. The merged backend change
 [Jetson-PI-Edge#1](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge/pull/1)
-lands in the dependency. That change provides the real encode/decode boundary
-and PI0.5 prompt-state serialization covered by the opt-in parity test.
+provides the PI0.5 encode/decode boundary and prompt-state serialization. The
+follow-up [Jetson-PI-Edge#2](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge/pull/2)
+extends the real boundary to legacy Pi0 with owned VIT embeddings and publishes
+the cross-model capability contract. The opt-in parity tests also require
+actual GGUF model-kind detection, one-shot pending-context semantics, and
+whole/split byte equality.
 
 For deterministic paths, text/token outputs are exact and VLA action buffers
 are byte-identical unless the provider documents a backend-specific numerical

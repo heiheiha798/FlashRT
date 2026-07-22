@@ -54,17 +54,22 @@ The returned object always uses model-runtime v1:
 - outputs use ordinary STAGED `get_output`; no provider-specific buffer ABI is
   required.
 
-VLA (Pi0) engines publish a single `infer` stage. Autoregressive LLM/MLLM
-engines with staged capability publish `reset -> prefill -> decode`; engines
-without that capability publish a single `infer` stage. The plan uses OPAQUE
-executors, so a generic host never sees llama.cpp or GGML types.
+VLA (Pi0) engines that declare the real context/action capability publish
+`context -> action`; `step()` remains the whole-request `infer` entry point.
+Older engine vtables that do not declare the capability publish their original
+single `infer` plan. Autoregressive LLM/MLLM engines with staged capability
+publish `reset -> prefill -> decode`; engines without that capability publish a
+single `infer` stage. All plans use OPAQUE executors, so a generic host never
+sees llama.cpp or GGML types.
 
-> Pi0 does **not** currently advertise a `context -> action` split. Companion
-> backend PR [PKU-SEC-Lab/Jetson-PI-Edge#1](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge/pull/1)
-> implements both the real prepare/decode boundary and PI0.5
-> `Task: ..., State: ...;\nAction:` serialization. FlashRT keeps the selected
-> plan on single `infer` until that change lands in the backend dependency;
-> the staged plan and frontend helpers are re-enabled afterward.
+[PKU-SEC-Lab/Jetson-PI-Edge#1](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge/pull/1)
+is merged and provides the real PI0.5 prepare/decode boundary plus
+`Task: ..., State: ...;\nAction:` serialization. The follow-up
+[Jetson-PI-Edge#2](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge/pull/2)
+adds the legacy Pi0 prepare path with owned VIT embeddings, fixes persistent
+GPU encoded-KV lifetime, and declares the capability only when the boundary is
+valid for both detected Pi0 model kinds. FlashRT does not infer capability from
+the presence of a callback alone.
 
 ## Python
 
@@ -93,10 +98,11 @@ PI0.5 accepts at most 8 `float32` values, while legacy Pi0 accepts at most
 `action_dim` and lets the backend zero-pad shorter input. The result is a
 copied `float32[action_steps, action_dim]` array.
 
-> The `model._pipe.context()` / `model._pipe.action()` staged helpers exist on
-> the frontend but will raise against the selected single-infer plan. Use
-> `model.predict(...)` until the companion backend split is merged and the
-> staged plan is re-enabled.
+`model.predict(...)` runs one whole request. With a split-capable backend,
+`model._pipe.context(...)` prepares and retains one encoded context and
+`model._pipe.action()` consumes it exactly once. Replacing or rejecting an
+input invalidates any pending context. A backend without the explicit
+capability exposes only `predict(...)`.
 
 ### Text LLM
 
