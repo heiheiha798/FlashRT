@@ -88,8 +88,8 @@ actions = model.predict(images, prompt=prompt, state=state)
 ```
 
 `images` is an ordered list of contiguous RGB `uint8` HWC arrays. `state` is
-the non-empty policy proprioception vector, passed without padding; PI0.5
-accepts at most 8 `float32` values, while legacy Pi0 accepts at most
+the non-empty, finite policy proprioception vector, passed without padding;
+PI0.5 accepts at most 8 `float32` values, while legacy Pi0 accepts at most
 `action_dim` and lets the backend zero-pad shorter input. The result is a
 copied `float32[action_steps, action_dim]` array.
 

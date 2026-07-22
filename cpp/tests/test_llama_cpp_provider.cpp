@@ -282,8 +282,8 @@ int main() {
                       "state") == 0 &&
               model->ports[FRT_LLAMA_CPP_PI0_PORT_STATE].dtype ==
                   FRT_RT_DTYPE_F32 &&
-              model->ports[FRT_LLAMA_CPP_PI0_PORT_STATE].shape[0] == 8,
-          "state port schema");
+              model->ports[FRT_LLAMA_CPP_PI0_PORT_STATE].shape[0] == -1,
+          "state port schema is model-variable");
     CHECK(std::strcmp(model->ports[FRT_LLAMA_CPP_PI0_PORT_ACTIONS].name,
                       "actions") == 0 &&
               model->ports[FRT_LLAMA_CPP_PI0_PORT_ACTIONS].direction ==

@@ -154,16 +154,10 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
     owner->image_shape[1] = static_cast<int64_t>(config->image_height);
     owner->image_shape[2] = static_cast<int64_t>(config->image_width);
     owner->image_shape[3] = static_cast<int64_t>(config->image_channels);
-    // Pi0 state shape is policy-specific and independent of action_dim:
-    // PI0.5 discretizes up to 8 proprioception values into the
-    // `Task: ..., State: ...;\nAction:` prompt (openpi proprioception width 8),
-    // while legacy Pi0 consumes an action_dim tensor via llama_set_pi0_state.
-    // The backend enforces the per-model bound; expose the larger of the two
-    // (PI0.5's 8) as the host-visible state width so a PI0.5 caller can pass a
-    // full proprio vector. Legacy Pi0 callers pass fewer values (zero-padded
-    // by the backend). A fixed shape keeps the generic plan's port schema stable
-    // across model kinds; the runtime accepts any nonzero float count.
-    owner->state_shape[0] = 8;
+    // State width is model-specific: PI0.5 accepts 1..8 values, while legacy
+    // Pi0 accepts 1..action_dim. Publish a bucket-variable dimension and let
+    // the backend enforce the selected model's bound.
+    owner->state_shape[0] = -1;
     owner->action_shape[0] = static_cast<int64_t>(config->action_steps);
     owner->action_shape[1] = static_cast<int64_t>(config->action_dim);
 

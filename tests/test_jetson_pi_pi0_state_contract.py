@@ -63,3 +63,10 @@ def test_pi0_frontend_passes_policy_state_without_action_padding(monkeypatch):
 
     with pytest.raises(ValueError, match="at least one value"):
         frontend.infer({**observation, "state": np.empty(0, dtype=np.float32)})
+    with pytest.raises(ValueError, match="must be finite"):
+        frontend.infer({**observation, "state": np.array([np.nan], dtype=np.float32)})
+    with pytest.raises(ValueError, match="must be finite"):
+        frontend.context({
+            **observation,
+            "state": np.array([np.inf], dtype=np.float32),
+        })

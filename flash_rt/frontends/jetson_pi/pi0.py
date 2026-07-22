@@ -273,6 +273,8 @@ class Pi0JetsonPiFrontend:
         state = np.asarray(state, dtype=np.float32).reshape(-1)
         if state.size == 0:
             raise ValueError("observation['state'] must contain at least one value")
+        if not np.all(np.isfinite(state)):
+            raise ValueError("observation['state'] values must be finite")
         state = np.ascontiguousarray(state)
 
         verbs = self._model.verbs
@@ -324,6 +326,8 @@ class Pi0JetsonPiFrontend:
         state = np.asarray(state, dtype=np.float32).reshape(-1)
         if state.size == 0:
             raise ValueError("observation['state'] must contain at least one value")
+        if not np.all(np.isfinite(state)):
+            raise ValueError("observation['state'] values must be finite")
         state = np.ascontiguousarray(state)
         views = self._make_image_views(images)
         verbs = self._model.verbs

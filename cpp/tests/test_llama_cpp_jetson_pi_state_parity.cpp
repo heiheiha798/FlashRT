@@ -12,8 +12,9 @@
 // and x>=1 to 255. A wrong binning formula still passes a naive "changes when
 // state changes" check, so each region is exercised explicitly.
 //
-// The caller is responsible for passing state already normalized into [-1,1]
-// (matching the Jetson-PI server path, which bins pi0_req.state directly).
+// Production callers pass finite policy-normalized state. The test also covers
+// finite outliers because the server contract defines explicit bins below -1
+// and at or above 1.
 //
 // Env:
 //   FLASHRT_PI0_MODEL        path to PI0.5 policy GGUF
@@ -21,7 +22,7 @@
 //   FLASHRT_PI0_FIXTURE_DIR  dir with image.png, wrist_image.png, prompt.txt
 //   FLASHRT_PI0_ACTION_STEPS (optional) override; default 50 (LIBERO base).
 //   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
-//   FLASHRT_PI0_BACKEND      (optional) "cpu" (default) or "cuda".
+//   FLASHRT_PI0_BACKEND      required explicit backend, e.g. "cpu" or "cuda".
 //   FLASHRT_PI0_STATE_PARITY_READY  set to "1" only when the backend build
 //                            includes PI0.5 prompt-state serialization.
 
@@ -53,14 +54,6 @@ bool file_exists(const char * p) {
     std::ifstream f(p);
     return f.good();
 }
-std::string read_file(const std::string & path, bool * ok) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) { if (ok) *ok = false; return {}; }
-    std::string s((std::istreambuf_iterator<char>(f)),
-                  std::istreambuf_iterator<char>());
-    if (ok) *ok = true;
-    return s;
-}
 } // namespace
 
 int main() {
@@ -74,10 +67,12 @@ int main() {
     const char * model_env   = std::getenv("FLASHRT_PI0_MODEL");
     const char * mmproj_env  = std::getenv("FLASHRT_PI0_MMPROJ");
     const char * fixture_env = std::getenv("FLASHRT_PI0_FIXTURE_DIR");
-    if (!model_env || !mmproj_env || !fixture_env ||
+    const char * be_env = std::getenv("FLASHRT_PI0_BACKEND");
+    if (!model_env || !mmproj_env || !fixture_env || !be_env || !be_env[0] ||
         !file_exists(model_env) || !file_exists(mmproj_env)) {
         std::printf("SKIP - FLASHRT_PI0_MODEL / FLASHRT_PI0_MMPROJ / "
-                    "FLASHRT_PI0_FIXTURE_DIR not set or files missing\n");
+                    "FLASHRT_PI0_FIXTURE_DIR / FLASHRT_PI0_BACKEND not set "
+                    "or files missing\n");
         return 0;
     }
     const std::string fixture_dir = fixture_env;
@@ -92,9 +87,7 @@ int main() {
 
     const char * steps_env = std::getenv("FLASHRT_PI0_ACTION_STEPS");
     const char * dim_env   = std::getenv("FLASHRT_PI0_ACTION_DIM");
-    const char * be_env    = std::getenv("FLASHRT_PI0_BACKEND");
-    const std::string backend = (be_env && be_env[0]) ? std::string(be_env)
-                                                      : std::string("cpu");
+    const std::string backend = be_env;
     long action_steps = steps_env ? std::atol(steps_env) : 50;
     long action_dim   = dim_env   ? std::atol(dim_env)   : 32;
     if (action_steps <= 0 || action_dim <= 0) {
@@ -108,8 +101,10 @@ int main() {
     int ww = 0, wh = 0, wc = 0;
     unsigned char * wrist = stbi_load(wrist_path.c_str(), &ww, &wh, &wc, 3);
     CHECK(wrist != nullptr && ww == 224 && wh == 224, "load wrist_image.png 224x224");
-    bool prompt_ok = false;
-    std::string prompt = read_file(prompt_path, &prompt_ok);
+    std::ifstream prompt_file(prompt_path, std::ios::binary);
+    std::string prompt((std::istreambuf_iterator<char>(prompt_file)),
+                       std::istreambuf_iterator<char>());
+    const bool prompt_ok = prompt_file.good() || prompt_file.eof();
     CHECK(prompt_ok && !prompt.empty(), "prompt.txt non-empty");
     if (!prompt.empty() && prompt.back() == '\n') prompt.pop_back();
 
@@ -125,7 +120,7 @@ int main() {
     const size_t n_bytes = n_elems * sizeof(float);
     // PI0.5 proprioception width is 8 (openpi libero), independent of
     // action_dim. The backend discretizes up to 8 state values into the
-    // prompt and rejects wider state. The state port exposes shape 8.
+    // prompt and rejects wider state. The state port is bucket-variable.
     const long state_dim = 8;
 
     const frt_llama_cpp_engine_factory_v1 * factory =
@@ -185,7 +180,7 @@ int main() {
 
     // Boundary-region states exercising every openpi bin branch. Each must
     // differ from the zero-state baseline once PI0.5 state is serialized into
-    // the prompt. States are pre-normalized to [-1,1] (caller contract).
+    // the prompt. The outer cases intentionally exercise defined outlier bins.
     struct Case { const char * name; float value; };
     const Case cases[] = {
         {"x<-1 (literal -1 token)", -2.0f},
