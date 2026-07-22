@@ -11,8 +11,8 @@ Env:
                           state.bin contains policy proprioception values
                           (8 floats for PI0.5), not action_dim padding
   FLASHRT_PI0_LIB          (optional) path to libflashrt_cpp_llama_cpp_provider_c.so
-  FLASHRT_PI0_ACTION_STEPS (optional) override; default 10 (pi0_base).
-  FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
+  FLASHRT_PI0_ACTION_STEPS required model action horizon (pi0_base is 50).
+  FLASHRT_PI0_ACTION_DIM   required model action width (pi0_base is 32).
   FLASHRT_PI0_BACKEND      required backend for the Jetson-PI engine, e.g.
                             "cpu" or "cuda". CUDA_VISIBLE_DEVICES selects the
                             physical card for a CUDA run.
@@ -35,6 +35,8 @@ def main():
     mmproj_env = os.environ.get("FLASHRT_PI0_MMPROJ")
     fixture_env = os.environ.get("FLASHRT_PI0_FIXTURE_DIR")
     backend = os.environ.get("FLASHRT_PI0_BACKEND")
+    action_steps_env = os.environ.get("FLASHRT_PI0_ACTION_STEPS")
+    action_dim_env = os.environ.get("FLASHRT_PI0_ACTION_DIM")
     if not model_env or not os.path.exists(model_env):
         return _skip("FLASHRT_PI0_MODEL not set or missing")
     if not mmproj_env or not os.path.exists(mmproj_env):
@@ -43,6 +45,8 @@ def main():
         return _skip("FLASHRT_PI0_FIXTURE_DIR not set or missing")
     if not backend:
         return _skip("FLASHRT_PI0_BACKEND not set")
+    if not action_steps_env or not action_dim_env:
+        return _skip("FLASHRT_PI0_ACTION_STEPS/ACTION_DIM not set")
     for name in ("image.png", "wrist_image.png", "state.bin", "prompt.txt"):
         if not os.path.exists(os.path.join(fixture_env, name)):
             return _skip(f"fixture {name} missing in {fixture_env}")
@@ -50,8 +54,8 @@ def main():
     import numpy as np
     from PIL import Image
 
-    action_steps = int(os.environ.get("FLASHRT_PI0_ACTION_STEPS", "10"))
-    action_dim = int(os.environ.get("FLASHRT_PI0_ACTION_DIM", "32"))
+    action_steps = int(action_steps_env)
+    action_dim = int(action_dim_env)
 
     import flash_rt
     model = flash_rt.load_model(

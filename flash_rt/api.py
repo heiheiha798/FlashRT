@@ -462,7 +462,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
 
     # Drives the Jetson-PI provider through frt_model_runtime_v1 via ctypes.
     # No torch/jax or GPU architecture detection is involved. The action chunk
-    # shape is passed explicitly by the caller (e.g. 10x32 for pi0_base).
+    # shape is passed explicitly by the caller (the verified pi0_base is 50x32).
     if framework == "jetson_pi":
         if config == "llm":
             from flash_rt.frontends.jetson_pi.llm import LlmJetsonPiFrontend

@@ -26,10 +26,10 @@
 //   FLASHRT_PI0_MODEL        path to Pi0 policy GGUF
 //   FLASHRT_PI0_MMPROJ       path to VIT mmproj GGUF
 //   FLASHRT_PI0_FIXTURE_DIR  dir with image.png, wrist_image.png, state.bin, prompt.txt
-//   FLASHRT_PI0_ACTION_STEPS (optional) override; default 50 (LIBERO base).
-//                            pi0_base is 10 — set FLASHRT_PI0_ACTION_STEPS=10
-//                            or the open fails with an action-shape mismatch.
-//   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
+//   FLASHRT_PI0_ACTION_STEPS required model-specific action horizon
+//                            (the verified pi0_base checkpoint uses 50).
+//   FLASHRT_PI0_ACTION_DIM   required model-specific action width
+//                            (the verified pi0_base checkpoint uses 32).
 //   FLASHRT_PI0_BACKEND      required explicit backend, e.g. "cpu" or "cuda".
 //                            CUDA may have ULP drift from atomics/warp reductions;
 //                            the 1e-5 tolerance is headroom. CPU expects ~0.
@@ -104,9 +104,13 @@ int main() {
 
     const char * steps_env = std::getenv("FLASHRT_PI0_ACTION_STEPS");
     const char * dim_env   = std::getenv("FLASHRT_PI0_ACTION_DIM");
+    if (!steps_env || !dim_env) {
+        std::printf("SKIP - FLASHRT_PI0_ACTION_STEPS/ACTION_DIM not set\n");
+        return 0;
+    }
     const std::string backend = be_env;
-    long action_steps = steps_env ? std::atol(steps_env) : 50;
-    long action_dim   = dim_env   ? std::atol(dim_env)   : 32;
+    long action_steps = std::atol(steps_env);
+    long action_dim   = std::atol(dim_env);
     if (action_steps <= 0 || action_dim <= 0 || action_steps > 10000 ||
         action_dim > 10000) {
         std::printf("SKIP - bad FLASHRT_PI0_ACTION_STEPS/DIM\n");

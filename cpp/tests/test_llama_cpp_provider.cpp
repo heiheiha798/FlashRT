@@ -221,6 +221,13 @@ int main() {
     cfg.action_steps = 2;
     cfg.action_dim = 2;
 
+    cfg.n_views = 4;
+    bad = nullptr;
+    CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(
+              &cfg, &old_engine_api, &bad) == -1 && bad == nullptr,
+          "create rejects more than three Pi0 views");
+    cfg.n_views = 2;
+
     CHECK(frt_llama_cpp_pi0_runtime_create_with_engine(
               &cfg, &old_engine_api, &old_pi0) == 0 && old_pi0 &&
               generic_plan(old_pi0) &&
@@ -573,6 +580,15 @@ int main() {
               &factory_api, &missing) == -1 &&
               missing == nullptr,
           "open rejects zero-sized numeric config fields");
+    CHECK(frt_llama_cpp_pi0_runtime_open_with_engine_factory(
+              "{\"model_family\":\"pi0\",\"model_path\":\"/models/pi0.gguf\","
+              "\"mmproj_path\":\"/models/pi0-mmproj.gguf\","
+              "\"backend\":\"cpu\",\"n_views\":4,\"image_height\":224,"
+              "\"image_width\":224,\"image_channels\":3,"
+              "\"action_steps\":2,\"action_dim\":2}",
+              &factory_api, &missing) == -1 &&
+              missing == nullptr,
+          "open rejects more than three Pi0 views");
     FakeFactory borrowed_factory = factory;
     borrowed_factory.engine = &factory_engine;
     borrowed_factory.return_borrowed = true;

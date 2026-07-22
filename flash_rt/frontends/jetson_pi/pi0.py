@@ -187,9 +187,12 @@ class Pi0JetsonPiFrontend:
             raise ValueError("mmproj_path is required for the Jetson-PI Pi0 frontend")
         if action_steps is None or action_dim is None:
             raise ValueError(
-                "action_steps and action_dim must be set explicitly (e.g. 10x32 "
-                "for pi0_base, 50x32 for pi0_libero_base)")
+                "action_steps and action_dim must be set explicitly (the "
+                "verified pi0_base checkpoint is 50x32; use the selected "
+                "checkpoint's model-specific shape)")
         self.num_views = int(num_views)
+        if self.num_views < 1 or self.num_views > 3:
+            raise ValueError("num_views must be in [1, 3] for Jetson-PI Pi0")
         self.image_height = int(image_height)
         self.image_width = int(image_width)
         self.action_steps = int(action_steps)
@@ -207,7 +210,7 @@ class Pi0JetsonPiFrontend:
             "model_path": str(checkpoint),
             "mmproj_path": str(mmproj_path),
             "backend": backend,
-            "n_views": int(num_views),
+            "n_views": self.num_views,
             "image_height": int(image_height),
             "image_width": int(image_width),
             "image_channels": 3,

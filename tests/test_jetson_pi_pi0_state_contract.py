@@ -6,6 +6,17 @@ import pytest
 from flash_rt.frontends.jetson_pi import pi0
 
 
+def test_pi0_frontend_rejects_more_than_three_views():
+    with pytest.raises(ValueError, match=r"num_views must be in \[1, 3\]"):
+        pi0.Pi0JetsonPiFrontend(
+            "/models/pi0.gguf",
+            mmproj_path="/models/pi0-mmproj.gguf",
+            num_views=4,
+            action_steps=50,
+            action_dim=32,
+        )
+
+
 def test_pi0_frontend_passes_policy_state_without_action_padding(monkeypatch):
     received_states = []
 

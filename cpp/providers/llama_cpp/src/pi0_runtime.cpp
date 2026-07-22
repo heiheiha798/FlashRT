@@ -125,6 +125,7 @@ extern "C" int frt_llama_cpp_pi0_runtime_create_with_engine(
         !config->model_path || !config->model_path[0] ||
         !config->mmproj_path || !config->mmproj_path[0] ||
         !config->backend || !config->backend[0] || !config->n_views ||
+        config->n_views > 3 ||
         !config->image_height || !config->image_width ||
         !config->image_channels ||
         !config->action_steps || !config->action_dim) {
@@ -418,7 +419,7 @@ extern "C" int frt_llama_cpp_pi0_runtime_open_with_engine_factory(
     if (!seen_model_family || model_family != "pi0" || !seen_model_path ||
         !seen_mmproj_path || !seen_backend || !seen_n_views ||
         !seen_image_height || !seen_image_width || !seen_image_channels ||
-        !seen_action_steps || !seen_action_dim) {
+        !seen_action_steps || !seen_action_dim || config.n_views > 3) {
         return -1;
     }
     config.model_path = model_path.c_str();

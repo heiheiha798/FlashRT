@@ -20,8 +20,8 @@
 //   FLASHRT_PI0_MODEL        path to PI0.5 policy GGUF
 //   FLASHRT_PI0_MMPROJ       path to VIT mmproj GGUF
 //   FLASHRT_PI0_FIXTURE_DIR  dir with image.png, wrist_image.png, prompt.txt
-//   FLASHRT_PI0_ACTION_STEPS (optional) override; default 50 (LIBERO base).
-//   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
+//   FLASHRT_PI0_ACTION_STEPS required model-specific action horizon.
+//   FLASHRT_PI0_ACTION_DIM   required model-specific action width.
 //   FLASHRT_PI0_BACKEND      required explicit backend, e.g. "cpu" or "cuda".
 //   FLASHRT_PI0_STATE_PARITY_READY  set to "1" only when the backend build
 //                            includes PI0.5 prompt-state serialization.
@@ -96,9 +96,13 @@ int main() {
 
     const char * steps_env = std::getenv("FLASHRT_PI0_ACTION_STEPS");
     const char * dim_env   = std::getenv("FLASHRT_PI0_ACTION_DIM");
+    if (!steps_env || !dim_env) {
+        std::printf("SKIP - FLASHRT_PI0_ACTION_STEPS/ACTION_DIM not set\n");
+        return 0;
+    }
     const std::string backend = be_env;
-    long action_steps = steps_env ? std::atol(steps_env) : 50;
-    long action_dim   = dim_env   ? std::atol(dim_env)   : 32;
+    long action_steps = std::atol(steps_env);
+    long action_dim   = std::atol(dim_env);
     if (action_steps <= 0 || action_dim <= 0) {
         std::printf("SKIP - bad FLASHRT_PI0_ACTION_STEPS/DIM\n");
         return 0;

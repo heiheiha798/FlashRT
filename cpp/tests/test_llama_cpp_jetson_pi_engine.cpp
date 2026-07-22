@@ -17,8 +17,8 @@
 //   FLASHRT_PI0_MMPROJ       path to VIT mmproj GGUF
 //   FLASHRT_PI0_FIXTURE_DIR  dir containing image.png, wrist_image.png,
 //                            state.bin (action_dim float32), prompt.txt
-//   FLASHRT_PI0_ACTION_STEPS (optional) override; default 50 (LIBERO base).
-//   FLASHRT_PI0_ACTION_DIM   (optional) override; default 32.
+//   FLASHRT_PI0_ACTION_STEPS required model-specific action horizon.
+//   FLASHRT_PI0_ACTION_DIM   required model-specific action width.
 
 #include "flashrt/providers/llama_cpp/c_api.h"
 #include "llama_cpp_generic_plan.h"
@@ -106,9 +106,14 @@ int main() {
           "open with bogus model path fails without crashing");
 
     // ---- sub-test B: end-to-end Pi0 tick -----------------------------------
-    // Action dims come from env (default 50x32 for LIBERO base; pi0_base is 10x32).
+    // Action dims come from env (verified pi0_base is 50x32; other checkpoints
+    // may differ and must provide their model-specific shape explicitly).
     const char * steps_env = std::getenv("FLASHRT_PI0_ACTION_STEPS");
     const char * dim_env   = std::getenv("FLASHRT_PI0_ACTION_DIM");
+    if (!steps_env || !dim_env) {
+        std::printf("SKIP - FLASHRT_PI0_ACTION_STEPS/ACTION_DIM not set\n");
+        return 0;
+    }
     // Backend is "cpu" by default (byte-identical to the original test). Set
     // FLASHRT_PI0_BACKEND=cuda to run the real forward pass on the GPU (the
     // Jetson-PI engine maps backend=="cuda" to n_gpu_layers=9999 and use_gpu
@@ -119,8 +124,8 @@ int main() {
     const char * be_env = std::getenv("FLASHRT_PI0_BACKEND");
     const std::string backend = (be_env && be_env[0]) ? std::string(be_env)
                                                      : std::string("cpu");
-    long action_steps = steps_env ? std::atol(steps_env) : 50;
-    long action_dim   = dim_env   ? std::atol(dim_env)   : 32;
+    long action_steps = std::atol(steps_env);
+    long action_dim   = std::atol(dim_env);
     if (action_steps <= 0 || action_dim <= 0 || action_steps > 10000 ||
         action_dim > 10000) {
         std::printf("SKIP - bad FLASHRT_PI0_ACTION_STEPS/DIM\n");
@@ -128,7 +133,7 @@ int main() {
     }
 
     // ---- sub-test C: config vs model action_dim mismatch fails cleanly ----
-    // Real model is 10x32 (or whatever env says); claim a wrong action_dim
+    // The selected model uses the configured shape; claim a wrong action_dim
     // and expect create_pi0 to reject without leaking the opened engine.
     // Backend is hardcoded "cpu" here on purpose: this path only exercises the
     // action_dim rejection, so paying for a full GPU model load + 37-layer

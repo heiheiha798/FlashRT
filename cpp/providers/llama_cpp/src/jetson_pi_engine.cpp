@@ -1000,12 +1000,23 @@ frt_llama_cpp_default_engine_factory(void) {
             if (!config->model_path || !config->model_path[0] ||
                 !config->mmproj_path || !config->mmproj_path[0] ||
                 !config->backend || !config->backend[0] ||
-                !config->n_views || !config->image_height ||
+                !config->n_views || config->n_views > 3 ||
+                !config->image_height ||
                 !config->image_width || !config->image_channels ||
                 !config->action_steps || !config->action_dim) {
-                set_create_error("create_pi0 config has empty/zero fields");
+                set_create_error("create_pi0 config has invalid fields");
                 return -1;
             }
+#if defined(JETSON_PI_PI0_HAS_CAPABILITIES_API) && \
+    JETSON_PI_PI0_HAS_CAPABILITIES_API
+            const uint32_t pi0_capabilities = jetson_pi_pi0_capabilities();
+            if ((pi0_capabilities &
+                 JETSON_PI_PI0_CAP_REAL_CONTEXT_ACTION) == 0) {
+                set_create_error(
+                    "loaded Jetson-PI runtime does not provide real Pi0 context/action split");
+                return -1;
+            }
+#endif
             jetson_pi_pi0_config jc{};
             jc.struct_size   = sizeof(jc);
             jc.model_path    = config->model_path;
@@ -1061,7 +1072,9 @@ frt_llama_cpp_default_engine_factory(void) {
             out->struct_size = sizeof(*out);
             out->reserved    = 0;
 #if defined(JETSON_PI_PI0_HAS_REAL_CONTEXT_ACTION) && \
-    JETSON_PI_PI0_HAS_REAL_CONTEXT_ACTION
+    JETSON_PI_PI0_HAS_REAL_CONTEXT_ACTION && \
+    defined(JETSON_PI_PI0_HAS_CAPABILITIES_API) && \
+    JETSON_PI_PI0_HAS_CAPABILITIES_API
             out->reserved |=
                 FRT_LLAMA_CPP_ENGINE_CAP_PI0_REAL_CONTEXT_ACTION;
 #endif
