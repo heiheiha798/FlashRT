@@ -125,7 +125,10 @@ int main() {
 
     const size_t n_elems = static_cast<size_t>(action_steps) * action_dim;
     const size_t n_bytes = n_elems * sizeof(float);
-    const long state_dim = action_dim;  // backend exposes state on action_dim today
+    // PI0.5 proprioception width is 8 (openpi libero), independent of
+    // action_dim. The backend discretizes up to 8 state values into the
+    // prompt and rejects wider state. The state port exposes shape 8.
+    const long state_dim = 8;
 
     const frt_llama_cpp_engine_factory_v1 * factory =
         frt_llama_cpp_default_engine_factory();
