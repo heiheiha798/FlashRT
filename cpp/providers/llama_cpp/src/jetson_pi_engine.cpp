@@ -45,7 +45,7 @@ struct Engine {
     std::vector<uint8_t> rgb_scratch;        // packed RGB per view, concatenated
     std::vector<const uint8_t*> image_ptrs;  // n_views pointers into rgb_scratch
     std::string prompt;
-    std::vector<float> state;                // input proprioception, size == action_dim
+    std::vector<float> state;                // input proprioception (any width)
     std::vector<float> actions_buf;          // output action chunk, size == action_steps*action_dim
     bool images_set = false;
     bool prompt_set = false;
@@ -238,14 +238,17 @@ int engine_set_input(void * self, uint32_t port, const void * data,
                 e->set_error("null state");
                 return -1;
             }
-            const uint64_t expect_bytes =
-                static_cast<uint64_t>(e->action_dim) * sizeof(float);
-            if (bytes != expect_bytes) {
-                e->set_error("state bytes != action_dim*sizeof(float)");
+            if (bytes == 0 || bytes % sizeof(float) != 0) {
+                e->set_error("state bytes is not a nonzero multiple of sizeof(float)");
                 return -1;
             }
+            // State width is policy-specific and independent of action_dim:
+            // PI0.5 discretizes up to 8 proprioception values into the prompt,
+            // while legacy Pi0 consumes an action_dim tensor. Accept any
+            // float count here; the backend enforces the per-model bound.
+            const size_t n = bytes / sizeof(float);
             e->state.assign(static_cast<const float*>(data),
-                            static_cast<const float*>(data) + e->action_dim);
+                            static_cast<const float*>(data) + n);
             e->state_set = true;
             return 0;
         }
