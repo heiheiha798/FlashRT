@@ -142,6 +142,20 @@ option(FLASHRT_ENABLE_NATIVE_CPP
 option(FLASHRT_BUILD_FA2_PYTHON_ADAPTER
        "Build the vendored FA2 Python adapter when FA2 is available" ON)
 
+# Cosmos3 deployment kernels are model- and architecture-specific. Keep them
+# out of the shared modules unless the corresponding Thor path is requested.
+option(FLASHRT_ENABLE_COSMOS3_EDGE
+       "Build Cosmos3-Edge AV kernels and bindings for Jetson AGX Thor" OFF)
+option(FLASHRT_ENABLE_COSMOS3_REASONER
+       "Build Cosmos3 Reasoner kernels and bindings for Jetson AGX Thor" OFF)
+if((FLASHRT_ENABLE_COSMOS3_EDGE OR FLASHRT_ENABLE_COSMOS3_REASONER) AND
+   NOT GPU_ARCH STREQUAL "110")
+  message(FATAL_ERROR
+    "Cosmos3 kernels require GPU_ARCH=110; current GPU_ARCH=${GPU_ARCH}. "
+    "Disable FLASHRT_ENABLE_COSMOS3_EDGE/FLASHRT_ENABLE_COSMOS3_REASONER "
+    "for non-Thor builds.")
+endif()
+
 # Motus beta integration. Motus-specific kernels are additive and must keep
 # their symbols prefixed with ``motus_``. Keeping a build tag lets the public
 # package compile without Motus kernels when debugging unrelated model paths.
@@ -242,7 +256,8 @@ if(MSVC)
 endif()
 
 # ── Paths ──
-set(CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass)
+set(CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass" CACHE PATH
+    "Path to the CUTLASS source tree")
 set(CUTLASS_INCLUDE ${CUTLASS_DIR}/include)
 
 # Fail fast if CUTLASS isn't vendored — the main FP8/FP4 GEMM kernels
@@ -629,13 +644,13 @@ endif()
 
 # ── Dedicated M=1 decode GEMV (FP8 + BF16) ──
 # Origin sm_120a, but neither kernel uses an SM120-specific instruction, so both
-# compile for Ada (sm89) too — built for the FP8-capable consumer RTX arches
-# (sm89 / sm120). Independent of FLASHRT_ENABLE_MOTUS: the bindings are gated by
+# compile for Thor (sm110) and Ada (sm89) too. Independent of
+# FLASHRT_ENABLE_MOTUS: the bindings are gated by
 # ENABLE_DECODE_GEMV_M1 (set alongside this object below), so the object must
 # link whenever it is built — otherwise the binding would reference an unlinked
 # symbol when MOTUS is OFF. (FP8 still needs the SM120 prefill GEMM in MOTUS, so
 # the FP8 path is SM120-only; the BF16 path runs wherever this object is built.)
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+if(GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
    GPU_ARCH STREQUAL "89")
   add_library(decode_gemv_m1_obj OBJECT
     csrc/gemm/fp8_gemv_m1_sm120.cu
@@ -1318,6 +1333,24 @@ set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 
+if(FLASHRT_ENABLE_COSMOS3_EDGE)
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/cosmos3_edge_misc.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  message(STATUS "Cosmos3-Edge AV kernels: ENABLED (sm_110)")
+else()
+  message(STATUS "Cosmos3-Edge AV kernels: DISABLED")
+endif()
+
+if(FLASHRT_ENABLE_COSMOS3_REASONER)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/cosmos3_reasoner_attn.cu
+    csrc/kernels/cosmos3_reasoner_gemv.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_COSMOS3_REASONER=1)
+  message(STATUS "Cosmos3 Reasoner kernels: ENABLED (sm_110)")
+else()
+  message(STATUS "Cosmos3 Reasoner kernels: DISABLED")
+endif()
+
 if(FLASHRT_ENABLE_AUDIO_CODEBOOK)
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/delayed_codebook_kernels.cu)
@@ -1508,9 +1541,9 @@ if(GPU_ARCH STREQUAL "120")
 endif()
 
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the
-# object is built (sm89 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
+# object is built (sm89 / sm110 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
 # resolve, independent of FLASHRT_ENABLE_MOTUS.
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+if(GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
    GPU_ARCH STREQUAL "89")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:decode_gemv_m1_obj>)
@@ -1560,6 +1593,17 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
     $<TARGET_OBJECTS:qwen36_flashinfer_xqa_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_QWEN36_FLASHINFER_XQA=1)
+endif()
+
+if(GPU_ARCH STREQUAL "110")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/conv/fp8_conv3d_sm120_v17.cu
+    csrc/conv/fp8_conv3d_sm120_v18.cu
+    csrc/conv/bf16_conv3d_v0_sm110.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_FP8_CONV3D_V17=1
+    ENABLE_FP8_CONV3D_V18=1
+    ENABLE_BF16_CONV3D_V0=1)
 endif()
 
 if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
@@ -1636,6 +1680,12 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/silu_mul_two_fp4_to_fp4.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_fp4out.cu
   )
+  if(FLASHRT_ENABLE_COSMOS3_EDGE)
+    target_sources(fp4_kernels_obj PRIVATE
+      csrc/fused_fp4/cosmos3_edge_fp4.cu
+      csrc/gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cu)
+    target_compile_definitions(fp4_kernels_obj PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
   set_target_properties(fp4_kernels_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -1667,6 +1717,9 @@ if(ENABLE_SM100_CUTLASS)
   target_include_directories(flash_rt_fp4 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   )
+  if(FLASHRT_ENABLE_COSMOS3_EDGE)
+    target_compile_definitions(flash_rt_fp4 PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
   target_link_libraries(flash_rt_fp4 PRIVATE CUDA::cudart)
   install(TARGETS flash_rt_fp4 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 endif()
