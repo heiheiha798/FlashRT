@@ -93,10 +93,12 @@ actions = model.predict(images, prompt=prompt, state=state)
 ```
 
 `images` is an ordered list of contiguous RGB `uint8` HWC arrays. `state` is
-the non-empty, finite policy proprioception vector, passed without padding;
-PI0.5 accepts at most 8 `float32` values, while legacy Pi0 accepts at most
-`action_dim` and lets the backend zero-pad shorter input. The result is a
-copied `float32[action_steps, action_dim]` array.
+the non-empty, finite, policy-normalized proprioception vector, passed without
+padding. The provider does not load checkpoint normalization statistics or
+normalize raw physical observations. PI0.5 accepts at most 8 `float32` values,
+while legacy Pi0 accepts at most `action_dim` and lets the backend zero-pad
+shorter input. The result is a copied
+`float32[action_steps, action_dim]` array.
 
 `model.predict(...)` runs one whole request. With a split-capable backend,
 `model._pipe.context(...)` prepares and retains one encoded context and
